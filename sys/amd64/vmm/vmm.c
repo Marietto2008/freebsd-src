@@ -1369,6 +1369,12 @@ vm_handle_inst_emul(struct vcpu *vcpu, bool *retu)
 		mread = lapic_mmio_read;
 		mwrite = lapic_mmio_write;
 	} else if (gpa >= VIOAPIC_BASE && gpa < VIOAPIC_BASE + VIOAPIC_SIZE) {
+		if (vcpu->vm->flags & VM_OP_F_QEMU) {
+			/* In QEMU mode, IOAPIC MMIO goes to userspace so QEMU's
+			 * own IOAPIC model handles RTE programming */
+			*retu = true;
+			return (0);
+		}
 		mread = vioapic_mmio_read;
 		mwrite = vioapic_mmio_write;
 	} else if (vcpu->vm->flags & VM_OP_F_QEMU) {
@@ -1590,7 +1596,7 @@ vm_run(struct vcpu *vcpu)
 	struct pcb *pcb;
 	uint64_t tscval;
 	struct vm_exit *vme;
-	bool retu, intr_disabled;
+	bool retu, intr_disabled __unused;
 	pmap_t pmap;
 
 	vcpuid = vcpu->vcpuid;
@@ -1646,8 +1652,11 @@ restart:
 			error = vm_handle_rendezvous(vcpu);
 			break;
 		case VM_EXITCODE_HLT:
-			intr_disabled = ((vme->u.hlt.rflags & PSL_I) == 0);
-			error = vm_handle_hlt(vcpu, intr_disabled, &retu);
+			/*
+			 * Return HLT to userspace so QEMU can handle
+			 * timer ticks and re-inject interrupts.
+			 */
+			retu = true;
 			break;
 		case VM_EXITCODE_PAGING:
 			error = vm_handle_paging(vcpu, &retu);
