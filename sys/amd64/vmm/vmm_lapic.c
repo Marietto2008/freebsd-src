@@ -193,8 +193,14 @@ lapic_set_intr(struct vcpu *vcpu, int vector, bool level)
 		return (EINVAL);
 
 	vlapic = vm_lapic(vcpu);
-	if (vlapic_set_intr_ready(vlapic, vector, level))
+	if (vlapic_set_intr_ready(vlapic, vector, level)) {
+		/*
+		 * Ensure IRR write is globally visible before kicking
+		 * the vcpu thread which will read it in vmx_inject_interrupts.
+		 */
+		mb();
 		vcpu_notify_event(vcpu, true);
+	}
 	return (0);
 }
 

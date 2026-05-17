@@ -1468,6 +1468,14 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 	uint64_t rflags, entryinfo;
 	uint32_t gi, info;
 
+	/*
+	 * Full memory barrier to ensure visibility of vlapic IRR/ISR
+	 * updates from the userspace (QEMU) side before we check for
+	 * pending interrupts. Without this, a race condition causes
+	 * timer interrupts to never be seen as pending.
+	 */
+	mb();
+
 	if (vcpu->cap.set & (1 << VM_CAP_MASK_HWINTR)) {
 		return;
 	}
@@ -1602,13 +1610,6 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 
 	info = vmcs_read(VMCS_ENTRY_INTR_INFO);
 	if (info & VMCS_INTR_VALID) {
-		/*
-		 * This is expected and could happen for multiple reasons:
-		 * - A vectoring VM-entry was aborted due to astpending
-		 * - A VM-exit happened during event injection.
-		 * - An exception was injected above.
-		 * - An NMI was injected above or after "NMI window exiting"
-		 */
 		VMX_CTR2(vcpu, "Cannot inject vector %d due to "
 		    "VM-entry intr info %#x", vector, info);
 		goto cantinject;
