@@ -114,6 +114,27 @@ static int num_pptdevs;
 SYSCTL_INT(_hw_vmm_ppt, OID_AUTO, devices, CTLFLAG_RD, &num_pptdevs, 0,
     "number of pci passthru devices");
 
+/* Debug counters for MSI interrupt tracing — safe to read via sysctl */
+static u_long ppt_intr_count;
+static u_long ppt_intr_last_addr;
+static u_long ppt_intr_last_data;
+static u_long ppt_intr_novm;
+static u_long ppt_msi_setup_count;
+static u_long ppt_msi_teardown_count;
+
+SYSCTL_ULONG(_hw_vmm_ppt, OID_AUTO, intr_count, CTLFLAG_RD,
+    &ppt_intr_count, 0, "total pptintr calls");
+SYSCTL_ULONG(_hw_vmm_ppt, OID_AUTO, intr_last_addr, CTLFLAG_RD,
+    &ppt_intr_last_addr, 0, "last MSI addr");
+SYSCTL_ULONG(_hw_vmm_ppt, OID_AUTO, intr_last_data, CTLFLAG_RD,
+    &ppt_intr_last_data, 0, "last MSI data");
+SYSCTL_ULONG(_hw_vmm_ppt, OID_AUTO, intr_novm, CTLFLAG_RD,
+    &ppt_intr_novm, 0, "pptintr with NULL vm");
+SYSCTL_ULONG(_hw_vmm_ppt, OID_AUTO, msi_setup_count, CTLFLAG_RD,
+    &ppt_msi_setup_count, 0, "MSI setup calls");
+SYSCTL_ULONG(_hw_vmm_ppt, OID_AUTO, msi_teardown_count, CTLFLAG_RD,
+    &ppt_msi_teardown_count, 0, "MSI teardown calls");
+
 static TAILQ_HEAD(, pptdev) pptdev_list = TAILQ_HEAD_INITIALIZER(pptdev_list);
 
 static int
@@ -258,6 +279,8 @@ ppt_teardown_msi(struct pptdev *ppt)
 	if (ppt->msi.num_msgs == 0)
 		return;
 
+	atomic_add_long(&ppt_msi_teardown_count, 1);
+
 	for (i = 0; i < ppt->msi.num_msgs; i++) {
 		rid = ppt->msi.startrid + i;
 		res = ppt->msi.res[i];
@@ -389,6 +412,93 @@ ppt_pci_reset(device_t dev)
 
 	pci_power_reset(dev);
 }
+
+/*
+ * ppt_sbr_device - Secondary Bus Reset for a passthrough device.
+ *
+ * Must be called when the device is NOT assigned to any VM (ppt->vm == NULL).
+ * Safe sequence: disable DMA → mask bridge AER/SERR → assert SBR →
+ * deassert SBR → wait for link training → restore bridge → re-save state.
+ *
+ * This is the kernel equivalent of what Linux VFIO does in pci_reset_bus().
+ * Userspace SBR (via pciconf) crashes the host because AER is unmasked.
+ */
+int
+ppt_sbr_device(int bus, int slot, int func)
+{
+	struct pptdev *ppt;
+	device_t dev, pcibus, bridge;
+	uint16_t dev_cmd, bridge_cmd, bcr;
+	uint32_t aer_uc_mask;
+	int aer_cap, error;
+
+	/* Device must be unowned */
+	error = ppt_find(NULL, bus, slot, func, &ppt);
+	if (error != 0)
+		return (error);
+
+	dev = ppt->dev;
+
+	/* Step 1: stop DMA and SERR forwarding from the device */
+	dev_cmd = pci_read_config(dev, PCIR_COMMAND, 2);
+	pci_write_config(dev, PCIR_COMMAND,
+	    dev_cmd & ~(PCIM_CMD_BUSMASTEREN | PCIM_CMD_SERRESPEN), 2);
+
+	/*
+	 * Step 2: get the upstream bridge.
+	 * device_get_parent(endpoint) = PCI bus device
+	 * device_get_parent(PCI bus) = bridge / root port
+	 */
+	pcibus = device_get_parent(dev);
+	bridge = device_get_parent(pcibus);
+
+	/* Step 3: save bridge SERR enable, then clear it to suppress NMI */
+	bridge_cmd = pci_read_config(bridge, PCIR_COMMAND, 2);
+	pci_write_config(bridge, PCIR_COMMAND,
+	    bridge_cmd & ~PCIM_CMD_SERRESPEN, 2);
+
+	/* Step 4: mask AER Uncorrectable errors on bridge (prevents AERI NMI) */
+	aer_cap = pci_find_extcap(bridge, PCIZ_AER, NULL);
+	if (aer_cap != 0) {
+		aer_uc_mask = pci_read_config(bridge,
+		    aer_cap + PCIR_AER_UC_MASK, 4);
+		pci_write_config(bridge, aer_cap + PCIR_AER_UC_MASK,
+		    0xFFFFFFFF, 4);
+	}
+
+	/* Step 5: read current Bridge Control Register */
+	bcr = pci_read_config(bridge, PCIR_BRIDGECTL_1, 2);
+
+	/* Step 6: assert Secondary Bus Reset (bit 6) */
+	pci_write_config(bridge, PCIR_BRIDGECTL_1,
+	    bcr | PCIB_BCR_SECBUS_RESET, 2);
+
+	/* Step 7: hold for 500ms (PCIe spec min 1ms, practical min ~100ms) */
+	pause("ppt_sbr", hz / 2);
+
+	/* Step 8: deassert SBR */
+	pci_write_config(bridge, PCIR_BRIDGECTL_1, bcr, 2);
+
+	/* Step 9: wait for link re-training (Trhfa + margin) */
+	pause("ppt_lnk", hz / 4);
+
+	/* Step 10: restore bridge AER mask and SERR */
+	if (aer_cap != 0) {
+		pci_write_config(bridge, aer_cap + PCIR_AER_UC_MASK,
+		    aer_uc_mask, 4);
+	}
+	pci_write_config(bridge, PCIR_COMMAND, bridge_cmd, 2);
+
+	/* Step 11: restore device command register */
+	pci_write_config(dev, PCIR_COMMAND, dev_cmd, 2);
+
+	/* Step 12: save fresh post-reset config state */
+	pci_save_state(dev);
+
+	return (0);
+}
+
+
 
 static uint16_t
 ppt_bar_enables(struct pptdev *ppt)
@@ -563,13 +673,14 @@ pptintr(void *arg)
 	pptarg = arg;
 	ppt = pptarg->pptdev;
 
+	atomic_add_long(&ppt_intr_count, 1);
+	ppt_intr_last_addr = pptarg->addr;
+	ppt_intr_last_data = pptarg->msg_data;
+
 	if (ppt->vm != NULL)
 		lapic_intr_msi(ppt->vm, pptarg->addr, pptarg->msg_data);
 	else {
-		/*
-		 * XXX
-		 * This is not expected to happen - panic?
-		 */
+		atomic_add_long(&ppt_intr_novm, 1);
 	}
 
 	/*
@@ -609,10 +720,14 @@ ppt_setup_msi(struct vm *vm, int bus, int slot, int func,
 
 	flags = RF_ACTIVE;
 	msi_count = pci_msi_count(ppt->dev);
+	printf("ppt: MSI full-setup %d/%d/%d msi_count=%d numvec=%d addr=0x%lx data=0x%lx\n",
+	    bus, slot, func, msi_count, numvec, (unsigned long)addr, (unsigned long)msg);
 	if (msi_count == 0) {
 		startrid = 0;		/* legacy interrupt */
 		msi_count = 1;
 		flags |= RF_SHAREABLE;
+		printf("ppt: WARNING %d/%d/%d msi_count=0, falling back to LEGACY IRQ!\n",
+		    bus, slot, func);
 	} else
 		startrid = 1;		/* MSI */
 
@@ -630,6 +745,8 @@ ppt_setup_msi(struct vm *vm, int bus, int slot, int func,
 	if (startrid == 1) {
 		tmp = numvec;
 		error = pci_alloc_msi(ppt->dev, &tmp);
+		printf("ppt: pci_alloc_msi %d/%d/%d error=%d tmp=%d\n",
+		    bus, slot, func, error, tmp);
 		if (error)
 			return (error);
 		else if (tmp != numvec) {
@@ -672,6 +789,7 @@ ppt_setup_msi(struct vm *vm, int bus, int slot, int func,
 		return (ENXIO);
 	}
 
+	atomic_add_long(&ppt_msi_setup_count, 1);
 	return (0);
 }
 
@@ -704,6 +822,50 @@ ppt_setup_msix(struct vm *vm, int bus, int slot, int func,
 	 */
 	if (ppt->msix.num_msgs == 0) {
 		numvec = pci_msix_count(ppt->dev);
+		printf("ppt: setup_msix bus=%d slot=%d func=%d "
+		    "msix_location=0x%x msix_count=%d\n",
+		    bus, slot, func,
+		    dinfo->cfg.msix.msix_location, numvec);
+		/*
+		 * PPT_MSIX_ORPHAN_FIX: Some NVIDIA GPUs (TU102/RTX 2080 Ti)
+		 * have the MSI-X cap at 0xC8 disconnected from the standard
+		 * PCI cap chain. The kernel PCI enumeration misses it, leaving
+		 * msix_location=0 and pci_msix_count()=0. Fix up cfg.msix by
+		 * scanning for cap ID 0x11 at known offsets.
+		 */
+		if (numvec <= 0 && dinfo->cfg.msix.msix_location == 0) {
+			uint8_t scan;
+			for (scan = 0x40; scan <= 0xF0; scan += 4) {
+				uint8_t cap_id = pci_read_config(ppt->dev,
+				    scan, 1);
+				if (cap_id == PCIY_MSIX) {
+					uint16_t ctrl = pci_read_config(
+					    ppt->dev, scan + 2, 2);
+					uint32_t tbl = pci_read_config(
+					    ppt->dev, scan + 4, 4);
+					uint32_t pba = pci_read_config(
+					    ppt->dev, scan + 8, 4);
+					dinfo->cfg.msix.msix_location = scan;
+					dinfo->cfg.msix.msix_ctrl = ctrl;
+					/* pci.c stores msix_table_bar as
+					 * PCIR_BAR(BIR), not raw BIR */
+					dinfo->cfg.msix.msix_table_bar =
+					    PCIR_BAR(tbl & PCIM_MSIX_BIR_MASK);
+					dinfo->cfg.msix.msix_table_offset =
+					    tbl & ~PCIM_MSIX_BIR_MASK;
+					dinfo->cfg.msix.msix_pba_bar =
+					    PCIR_BAR(pba & PCIM_MSIX_BIR_MASK);
+					dinfo->cfg.msix.msix_pba_offset =
+					    pba & ~PCIM_MSIX_BIR_MASK;
+					printf("ppt: fixed orphan MSI-X cap "
+					    "at 0x%02x: %d vectors\n",
+					    scan,
+					    PCI_MSIX_MSGNUM(ctrl));
+					numvec = pci_msix_count(ppt->dev);
+					break;
+				}
+			}
+		}
 		if (numvec <= 0)
 			return (EINVAL);
 
@@ -720,13 +882,17 @@ ppt_setup_msix(struct vm *vm, int bus, int slot, int func,
 		ppt->msix.arg = malloc(arg_size, M_PPTMSIX, M_WAITOK | M_ZERO);
 
 		rid = dinfo->cfg.msix.msix_table_bar;
+		printf("ppt: msix_table_bar=0x%x rid=0x%x\n",
+		    dinfo->cfg.msix.msix_table_bar, rid);
 		ppt->msix.msix_table_res = bus_alloc_resource_any(ppt->dev,
 					       SYS_RES_MEMORY, &rid, RF_ACTIVE);
 
 		if (ppt->msix.msix_table_res == NULL) {
+			printf("ppt: bus_alloc_resource msix_table FAILED\n");
 			ppt_teardown_msix(ppt);
 			return (ENOSPC);
 		}
+		printf("ppt: bus_alloc_resource msix_table OK rid=0x%x\n", rid);
 		ppt->msix.msix_table_rid = rid;
 
 		if (dinfo->cfg.msix.msix_table_bar !=
@@ -736,14 +902,16 @@ ppt_setup_msix(struct vm *vm, int bus, int slot, int func,
 			    ppt->dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
 
 			if (ppt->msix.msix_pba_res == NULL) {
+				printf("ppt: bus_alloc_resource msix_pba FAILED\n");
 				ppt_teardown_msix(ppt);
 				return (ENOSPC);
 			}
-			ppt->msix.msix_pba_rid = rid;
 		}
 
 		alloced = numvec;
 		error = pci_alloc_msix(ppt->dev, &alloced);
+		printf("ppt: pci_alloc_msix error=%d alloced=%d numvec=%d\n",
+		    error, alloced, numvec);
 		if (error || alloced != numvec) {
 			ppt_teardown_msix(ppt);
 			return (error == 0 ? ENOSPC: error);
@@ -762,8 +930,12 @@ ppt_setup_msix(struct vm *vm, int bus, int slot, int func,
 		rid = ppt->msix.startrid + idx;
 		ppt->msix.res[idx] = bus_alloc_resource_any(ppt->dev, SYS_RES_IRQ,
 							    &rid, RF_ACTIVE);
-		if (ppt->msix.res[idx] == NULL)
+		if (ppt->msix.res[idx] == NULL) {
+			printf("ppt: bus_alloc_resource IRQ idx=%d rid=%d FAILED\n",
+			    idx, rid);
 			return (ENXIO);
+		}
+		printf("ppt: bus_alloc_resource IRQ idx=%d rid=%d OK\n", idx, rid);
 
 		ppt->msix.arg[idx].pptdev = ppt;
 		ppt->msix.arg[idx].addr = addr;
@@ -776,11 +948,15 @@ ppt_setup_msix(struct vm *vm, int bus, int slot, int func,
 				       &ppt->msix.cookie[idx]);
 
 		if (error != 0) {
+			printf("ppt: bus_setup_intr idx=%d error=%d FAILED\n",
+			    idx, error);
 			bus_release_resource(ppt->dev, SYS_RES_IRQ, rid, ppt->msix.res[idx]);
 			ppt->msix.cookie[idx] = NULL;
 			ppt->msix.res[idx] = NULL;
 			return (ENXIO);
 		}
+		printf("ppt: bus_setup_intr idx=%d OK addr=0x%lx data=0x%x\n",
+		    idx, addr, (uint32_t)msg);
 	} else {
 		/* Masked, tear it down if it's already been set up */
 		ppt_teardown_msix_intr(ppt, idx);
