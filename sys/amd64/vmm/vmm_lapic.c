@@ -193,8 +193,33 @@ lapic_set_intr(struct vcpu *vcpu, int vector, bool level)
 		return (EINVAL);
 
 	vlapic = vm_lapic(vcpu);
-	if (vlapic_set_intr_ready(vlapic, vector, level))
+	if (vlapic_set_intr_ready(vlapic, vector, level)) {
+		/*
+		 * Ensure IRR write is globally visible before kicking
+		 * the vcpu thread which will read it in vmx_inject_interrupts.
+		 */
+		mb();
 		vcpu_notify_event(vcpu, true);
+	}
+	return (0);
+}
+
+int
+lapic_clear_irr(struct vcpu *vcpu, struct vm_lapic_clear_irr *ci)
+{
+	struct LAPIC *lapic;
+	uint32_t *irrptr;
+	int i;
+
+	lapic = vlapic_page(vm_lapic(vcpu));
+	if (lapic == NULL)
+		return (EINVAL);
+
+	irrptr = &lapic->irr0;
+	for (i = 0; i < 8; i++) {
+		if (ci->irr_mask[i] != 0)
+			atomic_clear_int(&irrptr[i * 4], ci->irr_mask[i]);
+	}
 	return (0);
 }
 
@@ -257,9 +282,6 @@ lapic_intr_msi(struct vm *vm, uint64_t addr, uint64_t msg)
 	    (MSI_X86_ADDR_RH | MSI_X86_ADDR_LOG));
 	delmode = msg & APIC_DELMODE_MASK;
 	vec = msg & 0xff;
-
-	VM_CTR3(vm, "lapic MSI %s dest %#x, vec %d",
-	    phys ? "physical" : "logical", dest, vec);
 
 	vlapic_deliver_intr(vm, LAPIC_TRIG_EDGE, dest, phys, delmode, vec);
 	return (0);

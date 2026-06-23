@@ -46,6 +46,10 @@ void pci_host_write_config(const struct pcisel *sel, long reg, int width,
 
 int passthru_cfgread_emulate(struct passthru_softc *sc, struct pci_devinst *pi,
     int coff, int bytes, uint32_t *rv);
+int passthru_cfgread_virt(struct passthru_softc *sc, struct pci_devinst *pi,
+    int coff, int bytes, uint32_t *rv);
+int passthru_cfgwrite_default(struct passthru_softc *sc, struct pci_devinst *pi,
+    int coff, int bytes, uint32_t val);
 int passthru_cfgwrite_emulate(struct passthru_softc *sc, struct pci_devinst *pi,
     int coff, int bytes, uint32_t val);
 struct passthru_mmio_mapping *passthru_get_mmio(struct passthru_softc *sc,

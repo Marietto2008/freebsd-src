@@ -689,6 +689,14 @@ struct vm_lapic_state {
     } fields[256];
 };
 
+/*
+ * Atomic IRR clearing: clears specific bits from LAPIC IRR registers
+ * without the TOCTOU race of GET_STATE/SET_STATE.
+ */
+struct vm_lapic_clear_irr {
+	uint32_t irr_mask[8];	/* bits to clear from IRR[0]-IRR[7] */
+};
+
 #define VM_IOAPIC_STATE_REDIR_ENTRIES 32
 struct vm_ioapic_state {
 	uint32_t	id;

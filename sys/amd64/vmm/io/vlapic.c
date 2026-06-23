@@ -55,9 +55,24 @@
 #include "vlapic_priv.h"
 #include "vioapic.h"
 
+#include <sys/sysctl.h>
+
 #define	PRIO(x)			((x) >> 4)
 
 #define VLAPIC_VERSION		(0x14)
+
+/* Debug counters for MSI delivery tracking */
+SYSCTL_DECL(_hw_vmm);
+static u_long vlapic_deliver_msi_count;
+static u_long vlapic_deliver_msi_nomatch;
+static u_long vlapic_setintr_vec33;
+
+SYSCTL_ULONG(_hw_vmm, OID_AUTO, deliver_msi_count, CTLFLAG_RD,
+    &vlapic_deliver_msi_count, 0, "vlapic_deliver_intr calls for vec>=33");
+SYSCTL_ULONG(_hw_vmm, OID_AUTO, deliver_msi_nomatch, CTLFLAG_RD,
+    &vlapic_deliver_msi_nomatch, 0, "vlapic_deliver_intr with empty dmask");
+SYSCTL_ULONG(_hw_vmm, OID_AUTO, setintr_vec33, CTLFLAG_RD,
+    &vlapic_setintr_vec33, 0, "lapic_set_intr calls for vec==33");
 
 #define	x2apic(vlapic)	(((vlapic)->msr_apicbase & APICBASE_X2APIC) ? 1 : 0)
 
@@ -284,6 +299,11 @@ vlapic_set_intr_ready(struct vlapic *vlapic, int vector, bool level)
 		VLAPIC_CTR1(vlapic, "vlapic ignoring interrupt to vector %d",
 		    vector);
 		return (1);
+	}
+
+	if (vector < 32) {
+		printf("VLAPIC_IRR: LOW VECTOR %d set in IRR! "
+		    "svr=0x%x\n", vector, lapic->svr);
 	}
 
 	if (vlapic->ops.set_intr_ready)
@@ -1131,6 +1151,21 @@ vlapic_icrlo_write_handler(struct vlapic *vlapic, bool *retu)
 			break;
 		}
 
+		/*
+		 * With ipi_exit, INIT/SIPI targets must include non-active
+		 * CPUs so userland (QEMU) can handle AP startup.  The
+		 * broadcast shortcuts (ALLESELF/ALLISELF) normally use
+		 * vm_active_cpus which excludes unstarted APs.  Override
+		 * dmask to include all allocated vCPUs for these modes.
+		 */
+		if (shorthand == APIC_DEST_ALLESELF ||
+		    shorthand == APIC_DEST_ALLISELF) {
+			CPU_ZERO(&dmask);
+			for (i = 0; i < vm_get_maxcpus(vlapic->vm); i++)
+				CPU_SET(i, &dmask);
+			if (shorthand == APIC_DEST_ALLESELF)
+				CPU_CLR(vlapic->vcpuid, &dmask);
+		}
 		CPU_COPY(&dmask, &ipimask);
 		break;
 	default:
@@ -1170,11 +1205,22 @@ vm_handle_ipi(struct vcpu *vcpu, struct vm_exit *vme, bool *retu)
 	case APIC_DELMODE_INIT: {
 		cpuset_t active, reinit;
 
-		active = vm_active_cpus(vcpu_vm(vcpu));
-		CPU_AND(&reinit, &active, dmask);
-		if (!CPU_EMPTY(&reinit)) {
-			vm_smp_rendezvous(vcpu, reinit, vlapic_handle_init,
-			    NULL);
+		/*
+		 * When ipi_exit is set, INIT is handled by userland (QEMU).
+		 * Skip the rendezvous because the target AP may be halted
+		 * in userspace (kernel state IDLE), which would deadlock
+		 * vm_smp_rendezvous — the BSP waits in mtx_sleep for the
+		 * AP to participate but vcpu_notify_event does nothing for
+		 * IDLE vCPUs.  QEMU performs the equivalent reset via
+		 * do_cpu_init → apic_init_reset.
+		 */
+		if (!vlapic->ipi_exit) {
+			active = vm_active_cpus(vcpu_vm(vcpu));
+			CPU_AND(&reinit, &active, dmask);
+			if (!CPU_EMPTY(&reinit)) {
+				vm_smp_rendezvous(vcpu, reinit,
+				    vlapic_handle_init, NULL);
+			}
 		}
 		vm_await_start(vcpu_vm(vcpu), dmask);
 
@@ -1698,11 +1744,18 @@ vlapic_deliver_intr(struct vm *vm, bool level, uint32_t dest, bool phys,
 	 */
 	vlapic_calcdest(vm, &dmask, dest, phys, lowprio, false);
 
+	if (vec >= 33)
+		atomic_add_long(&vlapic_deliver_msi_count, 1);
+	if (vec >= 33 && CPU_EMPTY(&dmask))
+		atomic_add_long(&vlapic_deliver_msi_nomatch, 1);
+
 	CPU_FOREACH_ISSET(vcpuid, &dmask) {
 		vcpu = vm_vcpu(vm, vcpuid);
 		if (delmode == IOART_DELEXINT) {
 			vm_inject_extint(vcpu);
 		} else {
+			if (vec == 33)
+				atomic_add_long(&vlapic_setintr_vec33, 1);
 			lapic_set_intr(vcpu, vec, level);
 		}
 	}

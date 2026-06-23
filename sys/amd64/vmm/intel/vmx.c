@@ -218,6 +218,26 @@ static u_int vpid_alloc_failed;
 SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, vpid_alloc_failed, CTLFLAG_RD,
 	    &vpid_alloc_failed, 0, NULL);
 
+/* Debug counters for trap 30 investigation */
+static int vmx_dbg_last_inject_vec = -1;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, dbg_last_inject_vec, CTLFLAG_RD,
+    &vmx_dbg_last_inject_vec, 0, "Last injected vector");
+static int vmx_dbg_last_reinject_vec = -1;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, dbg_last_reinject_vec, CTLFLAG_RD,
+    &vmx_dbg_last_reinject_vec, 0, "Last re-injected vector");
+static uint64_t vmx_dbg_inject_count = 0;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, dbg_inject_count, CTLFLAG_RD,
+    &vmx_dbg_inject_count, 0, "Total interrupt injections");
+static uint64_t vmx_dbg_vec30_count = 0;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, dbg_vec30_count, CTLFLAG_RD,
+    &vmx_dbg_vec30_count, 0, "Vector 30 injection count");
+static uint64_t vmx_dbg_extint_count = 0;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, dbg_extint_count, CTLFLAG_RD,
+    &vmx_dbg_extint_count, 0, "ExtINT injection count");
+static int vmx_dbg_last_extint_vec = -1;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, dbg_last_extint_vec, CTLFLAG_RD,
+    &vmx_dbg_last_extint_vec, 0, "Last ExtINT vector");
+
 int guest_l1d_flush;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, l1d_flush, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
     &guest_l1d_flush, 0, NULL);
@@ -1194,6 +1214,11 @@ vmx_vcpu_init(void *vmi, struct vcpu *vcpu1, int vcpuid)
 		exc_bitmap = 0xffffffff;
 	else
 		exc_bitmap = 1 << IDT_MC;
+
+	/* Always intercept vector 30 (reserved) for debugging */
+	exc_bitmap |= (1 << 30);
+	printf("VMX_SETUP: exc_bitmap=0x%x (intercepting MC+#30)\n",
+	    exc_bitmap);
 	error += vmwrite(VMCS_EXCEPTION_BITMAP, exc_bitmap);
 
 	vcpu->ctx.guest_dr6 = DBREG_DR6_RESERVED1;
@@ -1468,8 +1493,32 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 	uint64_t rflags, entryinfo;
 	uint32_t gi, info;
 
+	/*
+	 * Full memory barrier to ensure visibility of vlapic IRR/ISR
+	 * updates from the userspace (QEMU) side before we check for
+	 * pending interrupts. Without this, a race condition causes
+	 * timer interrupts to never be seen as pending.
+	 */
+	mb();
+
 	if (vcpu->cap.set & (1 << VM_CAP_MASK_HWINTR)) {
 		return;
+	}
+
+	/*
+	 * MASK_HWINTR is OFF. Log when IRR has vector 50 (PIT/IOAPIC)
+	 * to track exactly when it gets injected.
+	 */
+	{
+		static int v50_log_count = 0;
+		struct LAPIC *lapic = vlapic_page(vlapic);
+		if ((lapic->irr1 & 0x00040000) && v50_log_count < 50) {
+			printf("VMX_VEC50_PENDING: vcpu=%d guestrip=0x%lx "
+			    "IRR1=0x%08x cap=0x%x #%d\n",
+			    vcpu->vcpuid, guestrip,
+			    lapic->irr1, vcpu->cap.set, v50_log_count);
+			v50_log_count++;
+		}
 	}
 
 	if (vcpu->state.nextrip != guestrip) {
@@ -1493,6 +1542,13 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 
 		info = entryinfo;
 		vector = info & 0xff;
+		vmx_dbg_last_reinject_vec = vector;
+		if (vector == 30) vmx_dbg_vec30_count++;
+		if (vector < 32) {
+			uint64_t guest_rip = vmcs_read(VMCS_GUEST_RIP);
+			printf("VMX_REINJECT: LOW VECTOR %d (0x%x) entryinfo=0x%lx "
+			    "at RIP=0x%lx\n", vector, vector, entryinfo, guest_rip);
+		}
 		if (vector == IDT_BP || vector == IDT_OF) {
 			/*
 			 * VT-x requires #BP and #OF to be injected as software
@@ -1560,8 +1616,22 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 
 	if (!extint_pending) {
 		/* Ask the local apic for a vector to inject */
-		if (!vlapic_pending_intr(vlapic, &vector))
+		if (!vlapic_pending_intr(vlapic, &vector)) {
+			/* Diagnostic: check if IRR has ATA vectors but pending_intr missed them */
+			{
+				struct LAPIC *dbg_lapic = vlapic_page(vlapic);
+				uint32_t irr1 = dbg_lapic->irr1; /* vectors 32-63 */
+				if (irr1 & 0x0F) { /* bits 0-3 = vectors 32-35 */
+					static int missed_log = 0;
+					if (missed_log < 30) {
+						missed_log++;
+						printf("VMX_MISSED_ATA: vcpu=%d irr1=0x%x ppr=0x%x #%d\n",
+						    vcpu->vcpuid, irr1, dbg_lapic->ppr, missed_log);
+					}
+				}
+			}
 			return;
+		}
 
 		/*
 		 * From the Intel SDM, Volume 3, Section "Maskable
@@ -1602,19 +1672,64 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 
 	info = vmcs_read(VMCS_ENTRY_INTR_INFO);
 	if (info & VMCS_INTR_VALID) {
-		/*
-		 * This is expected and could happen for multiple reasons:
-		 * - A vectoring VM-entry was aborted due to astpending
-		 * - A VM-exit happened during event injection.
-		 * - An exception was injected above.
-		 * - An NMI was injected above or after "NMI window exiting"
-		 */
 		VMX_CTR2(vcpu, "Cannot inject vector %d due to "
 		    "VM-entry intr info %#x", vector, info);
 		goto cantinject;
 	}
 
+	/*
+	 * In QEMU mode, block injection of vectors < 32.
+	 * These are x86 exception vectors and injecting them as external
+	 * interrupts causes the guest to see "reserved fault" panics
+	 * (e.g. trap 30 from a stale LAPIC timer vector set by UEFI firmware).
+	 */
+	{
+		int vmflags = 0;
+		vm_get_flags(vcpu->vmx->vm, &vmflags);
+		if ((vmflags & VM_OP_F_QEMU) && vector < 32) {
+			printf("VMX_INJECT: BLOCKED low vector %d (0x%x) in QEMU mode "
+			    "extint=%d\n", vector, vector, extint_pending);
+			if (!extint_pending) {
+				/* Consume the vector from LAPIC to prevent re-delivery */
+				vlapic_intr_accepted(vlapic, vector);
+			} else {
+				vm_extint_clear(vcpu->vcpu);
+				vatpic_intr_accepted(vcpu->vmx->vm, vector);
+			}
+			goto cantinject;
+		}
+	}
+
 	/* Inject the interrupt */
+	vmx_dbg_inject_count++;
+	vmx_dbg_last_inject_vec = vector;
+	if (extint_pending) {
+		vmx_dbg_extint_count++;
+		vmx_dbg_last_extint_vec = vector;
+	}
+	if (vector == 30) {
+		vmx_dbg_vec30_count++;
+	}
+	if (vector < 32) {
+		uint64_t guest_rip = vmcs_read(VMCS_GUEST_RIP);
+		printf("VMX_INJECT: LOW VECTOR %d (0x%x) at RIP=0x%lx "
+		    "extint=%d\n", vector, vector, guest_rip, extint_pending);
+	}
+	/*
+	 * Log ANY vector injected when guest is in cpu_idle_acpi
+	 * (0xffffffff8103cba0 - 0xffffffff8103cbfa) to identify which
+	 * vector causes trap 30.
+	 */
+	{
+		uint64_t inj_rip = vmcs_read(VMCS_GUEST_RIP);
+		if (inj_rip >= 0xffffffff8103cba0UL &&
+		    inj_rip <= 0xffffffff8103cbfaUL) {
+			printf("VMX_IDLE_INJECT: vec=%d (0x%x) at RIP=0x%lx "
+			    "extint=%d vcpu=%d\n",
+			    vector, vector, inj_rip, extint_pending,
+			    vcpu->vcpuid);
+		}
+	}
 	info = VMCS_INTR_T_HWINTR | VMCS_INTR_VALID;
 	info |= vector;
 	vmcs_write(VMCS_ENTRY_INTR_INFO, info);
@@ -2584,6 +2699,20 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 			    vmcs_read(VMCS_GUEST_INTR_STATUS);
 		else
 			vmexit->u.hlt.intr_status = 0;
+		/* HLT IRR dump - rate-limited to 5 */
+		{
+			static int hlt_log_count = 0;
+			if (hlt_log_count < 5) {
+				struct LAPIC *_lapic = vlapic_page(vm_lapic(vcpu->vcpu));
+				uint32_t *_irr = &_lapic->irr0;
+				printf("VMX_HLT[%d]: vcpu=%d RIP=0x%lx "
+				    "IRR0=0x%08x IRR1=0x%08x\n",
+				    hlt_log_count, vcpu->vcpuid,
+				    (unsigned long)vmcs_read(VMCS_GUEST_RIP),
+				    _irr[0], _irr[4]);
+				hlt_log_count++;
+			}
+		}
 		break;
 	case EXIT_REASON_MTF:
 		vmm_stat_incr(vcpu->vcpu, VMEXIT_MTRAP, 1);
@@ -2741,6 +2870,64 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		if (intr_info & VMCS_INTR_DEL_ERRCODE) {
 			errcode_valid = 1;
 			errcode = vmcs_read(VMCS_EXIT_INTR_ERRCODE);
+		}
+
+		/*
+		 * DEBUG: For QEMU mode, dump detailed VMCS state on
+		 * vector 30 and other intercepted exceptions, then
+		 * bounce to userspace instead of reflecting.
+		 */
+		{
+			if (intr_vec == 30) {
+				uint64_t guest_rip = vmcs_read(VMCS_GUEST_RIP);
+				uint64_t guest_rsp = vmcs_read(VMCS_GUEST_RSP);
+				uint64_t guest_rfl = vmcs_read(VMCS_GUEST_RFLAGS);
+				uint64_t guest_cr0 = vmcs_read(VMCS_GUEST_CR0);
+				uint64_t guest_cr3 = vmcs_read(VMCS_GUEST_CR3);
+				uint64_t guest_cr4 = vmcs_read(VMCS_GUEST_CR4);
+				uint64_t guest_efer = vmcs_read(VMCS_GUEST_IA32_EFER);
+				uint64_t idt_vec = vmcs_read(VMCS_IDT_VECTORING_INFO);
+				uint64_t idt_err = vmcs_read(VMCS_IDT_VECTORING_ERROR);
+				uint64_t entry_intr = vmcs_read(VMCS_ENTRY_INTR_INFO);
+				uint64_t guest_activ = vmcs_read(VMCS_GUEST_ACTIVITY);
+				uint64_t guest_intr = vmcs_read(VMCS_GUEST_INTERRUPTIBILITY);
+				uint64_t pin_ctl = vmcs_read(VMCS_PIN_BASED_CTLS);
+				uint64_t exit_qual2 = vmcs_read(VMCS_EXIT_QUALIFICATION);
+				uint64_t guest_cs = vmcs_read(VMCS_GUEST_CS_SELECTOR);
+				uint64_t guest_ss = vmcs_read(VMCS_GUEST_SS_SELECTOR);
+				uint64_t guest_idtr_base = vmcs_read(VMCS_GUEST_IDTR_BASE);
+				uint64_t guest_idtr_limit = vmcs_read(VMCS_GUEST_IDTR_LIMIT);
+
+				printf("\n@@@ VMX_VEC30_TRAP: INTERCEPTED @@@\n");
+				printf("intr_info=0x%x intr_type=0x%x errcode_valid=%d errcode=0x%x\n",
+				    intr_info, intr_type, errcode_valid, errcode);
+				printf("exit_qual=0x%lx\n", exit_qual2);
+				printf("GUEST: RIP=0x%lx RSP=0x%lx RFLAGS=0x%lx\n",
+				    guest_rip, guest_rsp, guest_rfl);
+				printf("GUEST: CR0=0x%lx CR3=0x%lx CR4=0x%lx EFER=0x%lx\n",
+				    guest_cr0, guest_cr3, guest_cr4, guest_efer);
+				printf("GUEST: CS=0x%lx SS=0x%lx\n", guest_cs, guest_ss);
+				printf("GUEST: IDTR base=0x%lx limit=0x%lx\n",
+				    guest_idtr_base, guest_idtr_limit);
+				printf("GUEST: activity=%lu interruptibility=0x%lx\n",
+				    guest_activ, guest_intr);
+				printf("IDT_VECTORING: info=0x%lx error=0x%lx\n",
+				    idt_vec, idt_err);
+				printf("ENTRY_INTR_INFO=0x%lx PIN_CTLS=0x%lx\n",
+				    entry_intr, pin_ctl);
+				printf("idtvec_info=0x%x (from exit)\n", idtvec_info);
+				printf("=== END VECTOR 30 DUMP ===\n\n");
+
+				/* Bounce to userspace as VM_EXITCODE_VMX */
+				vmexit->exitcode = VM_EXITCODE_VMX;
+				vmexit->u.vmx.status = 0;
+				vmexit->u.vmx.inst_error = 0;
+				vmexit->u.vmx.exit_reason = EXIT_REASON_EXCEPTION;
+				vmexit->u.vmx.exit_qualification = exit_qual2;
+				break;
+			}
+
+			/* #UD and #GP are not intercepted, only logged here */
 		}
 		VMX_CTR2(vcpu, "Reflecting exception %d/%#x into "
 		    "the guest", intr_vec, errcode);
@@ -3190,6 +3377,83 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		vmx_pmap_activate(vmx, pmap);
 
 		vmx_run_trace(vcpu);
+		{
+			uint32_t _ei = vmcs_read(VMCS_ENTRY_INTR_INFO);
+			uint64_t _rip = vmcs_read(VMCS_GUEST_RIP);
+			if ((_ei & VMCS_INTR_VALID) && (_ei & 0xff) < 32) {
+				printf("VMX_PRE_ENTER: LOW VECTOR %d (entry_info=0x%x) "
+				    "RIP=0x%lx\n", _ei & 0xff, _ei, _rip);
+			}
+			/* Log ANY vector injection into cpu_idle_acpi on ANY vcpu */
+			if ((_ei & VMCS_INTR_VALID) &&
+			    _rip >= 0xffffffff8103cba0UL &&
+			    _rip <= 0xffffffff8103cbfaUL) {
+				printf("VMX_IDLE_ENTRY: vcpu=%d vec=%d (0x%x) "
+				    "entry_info=0x%x RIP=0x%lx\n",
+				    vcpu->vcpuid, _ei & 0xff, _ei & 0xff,
+				    _ei, _rip);
+			}
+			/*
+			 * Track last injected vector per vcpu.
+			 * Dump when RIP is in kernel and a vector >= 32
+			 * is being injected (potential Xrsvd candidate).
+			 */
+			if ((_ei & VMCS_INTR_VALID) &&
+			    _rip >= 0xffffffff80000000UL) {
+				int vec = _ei & 0xff;
+				uint32_t type = (_ei >> 8) & 7;
+				/* Log MSI vectors (>=33) — skip timer noise */
+				if (vec >= 33) {
+					static int msi_inj_log = 0;
+					if (msi_inj_log < 50) {
+						printf("VMX_INJECT_MSI: vcpu=%d vec=%d "
+						    "type=%d RIP=0x%lx\n",
+						    vcpu->vcpuid, vec, type, _rip);
+						msi_inj_log++;
+					}
+				}
+			}
+			/* Direct IRR0 check: vectors 0-31 on the vLAPIC page */
+			{
+				struct LAPIC *lapic = vlapic_page(vlapic);
+				uint32_t irr0 = lapic->irr0;
+				if (irr0 & 0xFFFF0000) { /* any bit 16-31 set */
+					printf("VMX_IRR0_ALERT: irr0=0x%08x "
+					    "entry_info=0x%x RIP=0x%lx\n",
+					    irr0, _ei, _rip);
+				}
+			}
+			/*
+			 * Dump full VMCS state when guest RIP is at
+			 * intr_init_final (0xffffffff810411f0-0xffffffff810411f7)
+			 * This captures the last few VM entries before the crash.
+			 */
+			if (_rip >= 0xffffffff810411f0UL &&
+			    _rip <= 0xffffffff810411f7UL) {
+				uint64_t cr0 = vmcs_read(VMCS_GUEST_CR0);
+				uint64_t cr4 = vmcs_read(VMCS_GUEST_CR4);
+				uint64_t rfl = vmcs_read(VMCS_GUEST_RFLAGS);
+				uint64_t ebi = vmcs_read(VMCS_EXCEPTION_BITMAP);
+				uint64_t idt_base = vmcs_read(VMCS_GUEST_IDTR_BASE);
+				uint64_t idt_lim = vmcs_read(VMCS_GUEST_IDTR_LIMIT);
+				uint64_t pin = vmcs_read(VMCS_PIN_BASED_CTLS);
+				uint64_t proc1 = vmcs_read(VMCS_PRI_PROC_BASED_CTLS);
+				uint64_t proc2 = vmcs_read(VMCS_SEC_PROC_BASED_CTLS);
+				uint64_t entry_ctl = vmcs_read(VMCS_ENTRY_CTLS);
+				uint64_t interruptibility = vmcs_read(VMCS_GUEST_INTERRUPTIBILITY);
+				uint64_t activity = vmcs_read(VMCS_GUEST_ACTIVITY);
+				printf("\n=== VMX_INTR_INIT_FINAL: RIP=0x%lx ===\n", _rip);
+				printf("ENTRY_INTR_INFO=0x%x RFLAGS=0x%lx\n", _ei, rfl);
+				printf("CR0=0x%lx CR4=0x%lx\n", cr0, cr4);
+				printf("EXC_BITMAP=0x%lx IDTR=0x%lx/0x%lx\n",
+				    ebi, idt_base, idt_lim);
+				printf("PIN_CTL=0x%lx PROC1=0x%lx PROC2=0x%lx\n",
+				    pin, proc1, proc2);
+				printf("ENTRY_CTL=0x%lx INTERRUPTIBILITY=0x%lx "
+				    "ACTIVITY=%lu\n",
+				    entry_ctl, interruptibility, activity);
+			}
+		}
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
 
 		vmx_pmap_deactivate(vmx, pmap);
@@ -3205,6 +3469,38 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		vmexit->inst_length = vmexit_instruction_length();
 		vmexit->u.vmx.exit_reason = exit_reason = vmcs_exit_reason();
 		vmexit->u.vmx.exit_qualification = vmcs_exit_qualification();
+
+		/*
+		 * Dump the first 5 VM exits after entering at intr_init_final.
+		 * This captures what happens right after STI enables interrupts.
+		 */
+		{
+			static int iif_armed = 0;
+			static int iif_count = 0;
+
+			/* Arm on entry at intr_init_final */
+			if (rip >= 0xffffffff810411f0UL &&
+			    rip <= 0xffffffff810411f7UL && !iif_armed) {
+				iif_armed = 1;
+				iif_count = 0;
+			}
+
+			if (iif_armed && iif_count < 5) {
+				uint32_t post_ei = vmcs_read(VMCS_EXIT_INTR_INFO);
+				uint32_t post_idtvec = vmcs_read(VMCS_IDT_VECTORING_INFO);
+				uint64_t post_rfl = vmcs_read(VMCS_GUEST_RFLAGS);
+				uint64_t post_cr4 = vmcs_read(VMCS_GUEST_CR4);
+				printf("VMX_AFTER_STI[%d]: RIP=0x%lx exit=%u "
+				    "rc=%d exit_intr=0x%x "
+				    "idtvec=0x%x qual=0x%lx "
+				    "RFLAGS=0x%lx CR4=0x%lx\n",
+				    iif_count, rip, exit_reason,
+				    rc, post_ei, post_idtvec,
+				    vmexit->u.vmx.exit_qualification,
+				    post_rfl, post_cr4);
+				iif_count++;
+			}
+		}
 
 		/* Update 'nextrip' */
 		vcpu->state.nextrip = rip;

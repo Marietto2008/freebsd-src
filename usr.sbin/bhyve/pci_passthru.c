@@ -77,6 +77,10 @@
 
 static int pcifd = -1;
 
+/* Forward declaration for orphan MSI-X chain-link cfgread override */
+static int msix_chain_link_cfgread(struct passthru_softc *sc,
+    struct pci_devinst *pi, int coff, int bytes, uint32_t *rv);
+
 SET_DECLARE(passthru_dev_set, struct passthru_dev);
 
 struct passthru_bar_handler {
@@ -191,15 +195,13 @@ passthru_read_config(const struct pcisel *sel, long reg, int width)
 uint32_t
 pci_host_read_config(const struct pcisel *sel, long reg, int width)
 {
-	uint32_t ret;
-	int fd;
-
-	fd = pcifd_open();
-	if (fd < 0)
+	/*
+	 * Use the pre-opened pcifd so this works after capsicum sandbox entry.
+	 * pcifd has PCIOCREAD in its allowed ioctl set.
+	 */
+	if (pcifd < 0)
 		return (0);
-	ret = host_read_config(fd, sel, reg, width);
-	(void)close(fd);
-	return (ret);
+	return (host_read_config(pcifd, sel, reg, width));
 }
 
 static void
@@ -325,6 +327,93 @@ cfginitmsi(struct passthru_softc *sc)
 		}
 	}
 
+	/*
+	 * NVIDIA orphan MSI-X fix: some GPUs (e.g. RTX 2080 Ti / TU102) have
+	 * the MSI-X cap at 0xC8 disconnected from the standard cap chain.
+	 * Scan the full config space for it if not found via chain walk.
+	 * DISABLED for testing: use MSI-only mode (Corvin's approach).
+	 */
+	if (sc->psc_msix.capoff == 0) {
+		int scan, cap_id;
+		for (scan = 0x40; scan <= 0xF0; scan += 4) {
+			cap_id = passthru_read_config(&sel, scan, 1);
+			if (cap_id == PCIY_MSIX) {
+				sc->psc_msix.capoff = scan;
+				caplen = 12;
+				msixcap_ptr = (char *)&msixcap;
+				capptr = scan;
+				while (caplen > 0) {
+					u32 = passthru_read_config(&sel,
+					    capptr, 4);
+					memcpy(msixcap_ptr, &u32, 4);
+					pci_set_cfgdata32(pi, capptr, u32);
+					caplen -= 4;
+					capptr += 4;
+					msixcap_ptr += 4;
+				}
+				{
+					int lp, np;
+					uint32_t tailcap;
+					/*
+					 * Walk the HARDWARE chain (not the
+					 * emulated copy) to find the true last
+					 * cap. PM (0x60) and PCIe (0x78) are
+					 * not copied into emulated space, so
+					 * an emulated-space walk stops at 0x60
+					 * immediately and links MSI-X there,
+					 * overriding the cap ID byte with 0x00
+					 * and breaking guest enumeration.
+					 */
+					lp = passthru_read_config(&sel,
+					    PCIR_CAP_PTR, 1);
+					if (lp != 0 && lp != 0xff) {
+						while (1) {
+							np = passthru_read_config(
+							    &sel,
+							    lp + PCICAP_NEXTPTR,
+							    1);
+							if (np == 0 || np == 0xff)
+								break;
+							lp = np;
+						}
+						/*
+						 * Copy the tail cap's first
+						 * 4 bytes into emulated space so
+						 * that cfgread returns correct
+						 * cap ID and version fields when
+						 * the guest reads the full dword.
+						 */
+						tailcap = passthru_read_config(
+						    &sel, lp, 4);
+						pci_set_cfgdata32(pi, lp,
+						    tailcap);
+						/* Patch NEXTPTR → orphan MSI-X */
+						pci_set_cfgdata8(pi,
+						    lp + PCICAP_NEXTPTR, scan);
+						/*
+						 * Override reads at [lp, lp+2):
+						 * covers 1-, 2-, and 4-byte reads
+						 * whose coff == lp or lp+1, so
+						 * the guest always sees cap ID
+						 * and NEXTPTR from emulated space.
+						 */
+						set_pcir_handler(sc, lp, 2,
+						    msix_chain_link_cfgread,
+						    NULL);
+					}
+					/* Terminate orphan's own next-ptr */
+					pci_set_cfgdata8(pi,
+					    scan + PCICAP_NEXTPTR, 0x00);
+				}
+				warnx("passthru: found orphan MSI-X cap "
+				    "at 0x%02x for %d/%d/%d (linked into chain)",
+				    scan, sel.pc_bus, sel.pc_dev,
+				    sel.pc_func);
+				break;
+			}
+		}
+	}
+
 	if (sc->psc_msix.capoff != 0) {
 		pi->pi_msix.pba_bar =
 		    msixcap.pba_info & PCIM_MSIX_BIR_MASK;
@@ -446,6 +535,28 @@ msix_table_read(struct passthru_softc *sc, uint64_t offset, int size)
 	return (data);
 }
 
+/*
+ * cfgread handler: return virtual config values (not physical).
+ * Used to expose the orphan MSI-X chain-link patch to the guest.
+ */
+static int
+msix_chain_link_cfgread(struct passthru_softc *sc __unused,
+    struct pci_devinst *pi, int coff, int bytes, uint32_t *rv)
+{
+	switch (bytes) {
+	case 1:
+		*rv = pci_get_cfgdata8(pi, coff);
+		break;
+	case 2:
+		*rv = pci_get_cfgdata16(pi, coff);
+		break;
+	default:
+		*rv = pci_get_cfgdata32(pi, coff);
+		break;
+	}
+	return (0);
+}
+
 static void
 msix_table_write(struct passthru_softc *sc, uint64_t offset, int size,
     uint64_t data)
@@ -494,9 +605,26 @@ msix_table_write(struct passthru_softc *sc, uint64_t offset, int size,
 	entry = &pi->pi_msix.table[index];
 	entry_offset = offset % MSIX_TABLE_ENTRY_SIZE;
 
-	/* Only 4 byte naturally-aligned writes are supported */
-	assert(size == 4);
-	assert(entry_offset % 4 == 0);
+	/* Only 4 byte naturally-aligned writes are supported natively.
+	 * Handle 8 byte writes (e.g. OVMF clearing the address field) by
+	 * splitting into two 4-byte writes and recursing.
+	 */
+	if (size == 8) {
+		if (entry_offset % 8 != 0)
+			errx(4, "msix_table_write: size=8 unaligned entry_off=0x%zx",
+			    entry_offset);
+		msix_table_write(sc, offset + table_offset, 4,
+		    data & 0xffffffffU);
+		msix_table_write(sc, offset + table_offset + 4, 4,
+		    data >> 32);
+		return;
+	}
+	if (size != 4)
+		errx(4, "msix_table_write: unsupported size=%d entry_off=0x%zx"
+		    " off=0x%lx", size, entry_offset, offset);
+	if (entry_offset % 4 != 0)
+		errx(4, "msix_table_write: unaligned size=4 entry_off=0x%zx",
+		    entry_offset);
 
 	vector_control = entry->vector_control;
 	dest32 = (uint32_t *)((uint8_t *)entry + entry_offset);
@@ -710,6 +838,29 @@ cfginit(struct pci_devinst *pi, int bus, int slot, int func)
 			    "failed to initialize MSI-X table for PCI %d/%d/%d: %d",
 			    bus, slot, func, error);
 			goto done;
+		}
+
+		/*
+		 * Register a dummy bar handler (NULL read/write) for the MSI-X
+		 * table region.  passthru_mmio_addr() skips all bar-handler
+		 * pages, so this creates an EPT hole there causing VMEXITs into
+		 * passthru_write/read() which dispatch to msix_table_write/read.
+		 * This must happen after cfginitbar() sets psc_bar[].size.
+		 */
+		{
+			int tbl_bar = pi->pi_msix.table_bar;
+			uint64_t tbl_off = pi->pi_msix.table_offset;
+			uint64_t tbl_size = (uint64_t)pi->pi_msix.table_count *
+			    MSIX_TABLE_ENTRY_SIZE;
+
+			if (passthru_set_bar_handler(sc, tbl_bar,
+			    tbl_off, tbl_size, NULL, NULL) != 0) {
+				warnx("failed to register MSI-X table bar "
+				    "handler for PCI %d/%d/%d",
+				    bus, slot, func);
+				error = -1;
+				goto done;
+			}
 		}
 	}
 
@@ -1109,6 +1260,35 @@ passthru_cfgread_emulate(struct passthru_softc *sc __unused,
 	return (-1);
 }
 
+/*
+ * Like the internal passthru_cfgread() pe_cfgread callback, but resolves the
+ * -1 "use emulated data" sentinel so callers outside pci_emul.c can obtain
+ * the virtual PCI config view (emulated overrides + hardware fallback).
+ * Used by BAR-region PCI config mirrors (e.g. NVIDIA BAR0+0x88000) so that
+ * the GPU's RM sees the same capability chain the guest OS sees.
+ */
+int
+passthru_cfgread_virt(struct passthru_softc *sc, struct pci_devinst *pi,
+    int coff, int bytes, uint32_t *rv)
+{
+	int error;
+
+	if (sc->psc_pcir_rhandler[coff] != NULL)
+		error = sc->psc_pcir_rhandler[coff](sc, pi, coff, bytes, rv);
+	else
+		error = passthru_cfgread_default(sc, pi, coff, bytes, rv);
+
+	if (error == -1) {
+		/* Handler signalled "use emulated config data" */
+		switch (bytes) {
+		case 1:  *rv = pci_get_cfgdata8(pi, coff);  break;
+		case 2:  *rv = pci_get_cfgdata16(pi, coff); break;
+		default: *rv = pci_get_cfgdata32(pi, coff); break;
+		}
+	}
+	return (0);
+}
+
 static int
 passthru_cfgread(struct pci_devinst *pi, int coff, int bytes, uint32_t *rv)
 {
@@ -1122,7 +1302,7 @@ passthru_cfgread(struct pci_devinst *pi, int coff, int bytes, uint32_t *rv)
 	return (passthru_cfgread_default(sc, pi, coff, bytes, rv));
 }
 
-static int
+int
 passthru_cfgwrite_default(struct passthru_softc *sc, struct pci_devinst *pi,
     int coff, int bytes, uint32_t val)
 {
@@ -1225,9 +1405,37 @@ passthru_write(struct pci_devinst *pi, int baridx, uint64_t offset, int size,
 	sc = pi->pi_arg;
 
 	if (baridx == pci_msix_table_bar(pi)) {
+		/*
+		 * Check bar handlers first so that sub-region handlers on the
+		 * MSI-X table BAR (e.g. Corvin's NVIDIA config mirror at
+		 * BAR0+0x88000) are invoked before msix_table_write().
+		 * A dummy handler (NULL write) marks the actual MSI-X table
+		 * region — break and fall through to msix_table_write().
+		 */
+		TAILQ_FOREACH(handler, &sc->psc_bar_handler[baridx], chain) {
+			if (offset >= handler->off + handler->size)
+				continue;
+			else if (offset < handler->off)
+				break;
+			assert(offset + size <= handler->off + handler->size);
+			if (handler->write != NULL)
+				handler->write(pi, baridx,
+				    offset - handler->off, size, value);
+			else
+				msix_table_write(sc, offset, size, value);
+			return;
+		}
 		msix_table_write(sc, offset, size, value);
 	} else {
-		assert(size == 1 || size == 2 || size == 4);
+		if (size != 1 && size != 2 && size != 4 && size != 8)
+			errx(4, "passthru_write: bad size=%d bar=%d off=0x%lx",
+			    size, baridx, offset);
+		if (size == 8) {
+			/* Split 8-byte write into two 4-byte ops */
+			passthru_write(pi, baridx, offset, 4, value & 0xffffffffU);
+			passthru_write(pi, baridx, offset + 4, 4, value >> 32);
+			return;
+		}
 
 		TAILQ_FOREACH(handler, &sc->psc_bar_handler[baridx], chain) {
 			if (offset >= handler->off + handler->size) {
@@ -1272,9 +1480,35 @@ passthru_read(struct pci_devinst *pi, int baridx, uint64_t offset, int size)
 	sc = pi->pi_arg;
 
 	if (baridx == pci_msix_table_bar(pi)) {
+		/*
+		 * Check bar handlers first so that sub-region handlers on the
+		 * MSI-X table BAR (e.g. Corvin's NVIDIA config mirror at
+		 * BAR0+0x88000) are invoked before msix_table_read().
+		 * A dummy handler (NULL read) marks the actual MSI-X table
+		 * region — break and fall through to msix_table_read().
+		 */
+		TAILQ_FOREACH(handler, &sc->psc_bar_handler[baridx], chain) {
+			if (offset >= handler->off + handler->size)
+				continue;
+			else if (offset < handler->off)
+				break;
+			assert(offset + size <= handler->off + handler->size);
+			if (handler->read != NULL)
+				return (handler->read(pi, baridx,
+				    offset - handler->off, size));
+			break; /* NULL read: fall through to msix_table_read */
+		}
 		val = msix_table_read(sc, offset, size);
 	} else {
-		assert(size == 1 || size == 2 || size == 4);
+		if (size != 1 && size != 2 && size != 4 && size != 8)
+			errx(4, "passthru_read: bad size=%d bar=%d off=0x%lx",
+			    size, baridx, offset);
+		if (size == 8) {
+			/* Split 8-byte read into two 4-byte ops */
+			uint64_t lo = passthru_read(pi, baridx, offset, 4);
+			uint64_t hi = passthru_read(pi, baridx, offset + 4, 4);
+			return (lo | (hi << 32));
+		}
 
 		TAILQ_FOREACH(handler, &sc->psc_bar_handler[baridx], chain) {
 			if (offset >= handler->off + handler->size) {
@@ -1310,7 +1544,7 @@ passthru_read(struct pci_devinst *pi, int baridx, uint64_t offset, int size)
 	return (val);
 }
 
-static void
+static void __attribute__((__unused__))
 passthru_msix_addr(struct pci_devinst *pi, int baridx, int enabled,
     uint64_t address)
 {
@@ -1456,10 +1690,13 @@ passthru_addr(struct pci_devinst *pi, int baridx, int enabled, uint64_t address)
 		break;
 	case PCIBAR_MEM32:
 	case PCIBAR_MEM64:
-		if (baridx == pci_msix_table_bar(pi))
-			passthru_msix_addr(pi, baridx, enabled, address);
-		else
-			passthru_mmio_addr(pi, baridx, enabled, address);
+		/*
+		 * Always use passthru_mmio_addr so that BAR sub-region handlers
+		 * (e.g. Corvin's NVIDIA config-mirror at BAR0+0x88000, or the
+		 * MSI-X table dummy handler) are honoured and their pages are
+		 * left unmapped in EPT (causing VMEXITs into passthru_write/read).
+		 */
+		passthru_mmio_addr(pi, baridx, enabled, address);
 		break;
 	default:
 		errx(4, "%s: invalid BAR type %d", __func__,

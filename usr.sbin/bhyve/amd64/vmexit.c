@@ -85,11 +85,34 @@ vmexit_inout(struct vmctx *ctx, struct vcpu *vcpu, struct vm_run *vmrun)
 
 	error = emulate_inout(ctx, vcpu, vme);
 	if (error) {
-		EPRINTLN("Unhandled %s%c 0x%04x at 0x%lx",
-		    in ? "in" : "out",
-		    bytes == 1 ? 'b' : (bytes == 2 ? 'w' : 'l'),
-		    port, vme->rip);
-		return (VMEXIT_ABORT);
+		/*
+		 * Unhandled I/O port: log it and continue like QEMU does.
+		 * For reads, return all-ones (open bus). Advance RIP past
+		 * the I/O instruction so the guest doesn't loop.
+		 */
+		static uint32_t last_unhandled_port;
+		if (port != (int)last_unhandled_port) {
+			EPRINTLN("Unhandled %s%c 0x%04x at 0x%lx (continuing)",
+			    in ? "in" : "out",
+			    bytes == 1 ? 'b' : (bytes == 2 ? 'w' : 'l'),
+			    port, vme->rip);
+			last_unhandled_port = port;
+		}
+		if (in) {
+			/* Return all-ones for reads (device not present) */
+			uint64_t rax = 0;
+			vm_get_register(vcpu, VM_REG_GUEST_RAX, &rax);
+			switch (bytes) {
+			case 1: rax = (rax & ~0xffUL) | 0xff; break;
+			case 2: rax = (rax & ~0xffffUL) | 0xffff; break;
+			case 4: rax = 0xffffffff; break;
+			}
+			vm_set_register(vcpu, VM_REG_GUEST_RAX, rax);
+		}
+		/* Advance RIP past the I/O instruction */
+		vm_set_register(vcpu, VM_REG_GUEST_RIP,
+		    vme->rip + vme->inst_length);
+		return (VMEXIT_CONTINUE);
 	} else {
 		return (VMEXIT_CONTINUE);
 	}
@@ -295,19 +318,15 @@ vmexit_svm(struct vmctx *ctx __unused, struct vcpu *vcpu, struct vm_run *vmrun)
 
 static int
 vmexit_bogus(struct vmctx *ctx __unused, struct vcpu *vcpu __unused,
-    struct vm_run *vmrun)
+    struct vm_run *vmrun __unused)
 {
-	assert(vmrun->vm_exit->inst_length == 0);
-
 	return (VMEXIT_CONTINUE);
 }
 
 static int
 vmexit_reqidle(struct vmctx *ctx __unused, struct vcpu *vcpu __unused,
-    struct vm_run *vmrun)
+    struct vm_run *vmrun __unused)
 {
-	assert(vmrun->vm_exit->inst_length == 0);
-
 	return (VMEXIT_CONTINUE);
 }
 

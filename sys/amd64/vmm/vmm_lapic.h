@@ -73,4 +73,6 @@ int	lapic_set_local_intr(struct vm *vm, struct vcpu *vcpu, int vector);
 
 int	lapic_intr_msi(struct vm *vm, uint64_t addr, uint64_t msg);
 
+int	lapic_clear_irr(struct vcpu *vcpu, struct vm_lapic_clear_irr *ci);
+
 #endif

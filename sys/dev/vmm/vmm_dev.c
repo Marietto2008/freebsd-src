@@ -289,10 +289,20 @@ alloc_memseg(struct vmmdev_softc *sc, struct vm_memseg *mseg, size_t len,
 	 * by stripped off when devfs processes the full string.
 	 */
 	if (VM_MEMSEG_NAME(mseg)) {
-        /* QEMU mode gives system memory a name */
-        if(mseg->segid > 0) {
-            sysmem = false;
-        }
+		/*
+		 * In stock bhyve, named segments are devmem (not system memory).
+		 * In QEMU mode, ALL segments (including named ones like "pc.ram")
+		 * are system memory and must be treated as sysmem so that
+		 * vm_iommu_map() creates IOMMU mappings for GPU passthrough DMA.
+		 * Keep sysmem = true (the default) for QEMU mode.
+		 */
+		{
+			int vmflags = 0;
+			vm_get_flags(sc->vm, &vmflags);
+			if (!(vmflags & VM_OP_F_QEMU)) {
+				sysmem = false;
+			}
+		}
 		name = malloc(len, M_VMMDEV, M_WAITOK);
 		error = copystr(mseg->name, name, len, NULL);
 		if (error)

@@ -1,6 +1,6 @@
 .include <kmod.opts.mk>
 
-KMOD=	vmm
+KMOD=	vmm-restore
 
 .if ${MACHINE_CPUARCH} == "amd64"
 .endif

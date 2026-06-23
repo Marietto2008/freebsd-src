@@ -55,7 +55,7 @@ static SYSCTL_NODE(_hw_vmm, OID_AUTO, topology, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
 /* Features advertised in CPUID_BHYVE_FEATURES %eax */
 #define CPUID_BHYVE_FEAT_EXT_DEST_ID	(1UL << 0) /* MSI Extended Dest ID */
 
-static const char bhyve_id[12] = "bhyve bhyve ";
+static const char bhyve_id[12] = "KVMKVMKVM\0\0\0";
 
 static uint64_t bhyve_xcpuids;
 SYSCTL_ULONG(_hw_vmm, OID_AUTO, bhyve_xcpuids, CTLFLAG_RW, &bhyve_xcpuids, 0,

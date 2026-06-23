@@ -306,6 +306,7 @@ enum {
 	IOCNUM_PPTDEV_MSIX = 46,
 	IOCNUM_PPTDEV_DISABLE_MSIX = 47,
 	IOCNUM_UNMAP_PPTDEV_MMIO = 48,
+	IOCNUM_PPT_SBR_DEVICE = 123,
 
 	/* statistics */
 	IOCNUM_VM_STATS = 50,
@@ -347,6 +348,8 @@ enum {
 	IOCNUM_SET_FLAGS = 121,
     IOCNUM_GET_FLAGS = 122,
 
+	/* Atomic LAPIC IRR clearing (no TOCTOU race) */
+	IOCNUM_LAPIC_CLEAR_IRR = 130,
 };
 
 #define	VM_RUN		\
@@ -388,7 +391,7 @@ enum {
 #define	VM_LAPIC_SET_STATE 		\
 	_IOW('v', IOCNUM_LAPIC_SET_STATE, struct vm_lapic_state)
 #define	VM_LAPIC_GET_STATE 		\
-	_IOR('v', IOCNUM_LAPIC_GET_STATE, struct vm_lapic_state)
+	_IOWR('v', IOCNUM_LAPIC_GET_STATE, struct vm_lapic_state)
 #define	VM_LAPIC_IRQ 		\
 	_IOW('v', IOCNUM_LAPIC_IRQ, struct vm_lapic_irq)
 #define	VM_LAPIC_LOCAL_IRQ 	\
@@ -429,6 +432,8 @@ enum {
 	_IOW('v', IOCNUM_PPTDEV_DISABLE_MSIX, struct vm_pptdev)
 #define	VM_UNMAP_PPTDEV_MMIO \
 	_IOW('v', IOCNUM_UNMAP_PPTDEV_MMIO, struct vm_pptdev_mmio)
+#define	VM_PPT_SBR_DEVICE \
+	_IOW('v', IOCNUM_PPT_SBR_DEVICE, struct vm_pptdev)
 #define VM_INJECT_NMI \
 	_IOW('v', IOCNUM_INJECT_NMI, struct vm_nmi)
 #define	VM_STATS \
@@ -481,4 +486,6 @@ enum {
 	_IOWR('v', IOCNUM_SNAPSHOT_REQ, struct vm_snapshot_meta)
 #define VM_RESTORE_TIME \
 	_IOWR('v', IOCNUM_RESTORE_TIME, int)
+#define	VM_LAPIC_CLEAR_IRR \
+	_IOW('v', IOCNUM_LAPIC_CLEAR_IRR, struct vm_lapic_clear_irr)
 #endif

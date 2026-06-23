@@ -126,6 +126,7 @@ const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 
 	VMMDEV_IOCTL(VM_BIND_PPTDEV,
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
+	VMMDEV_IOCTL(VM_PPT_SBR_DEVICE, 0),
 	VMMDEV_IOCTL(VM_UNBIND_PPTDEV,
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
 
@@ -147,6 +148,7 @@ const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 
 	VMMDEV_IOCTL(VM_LAPIC_SET_STATE, VMMDEV_IOCTL_LOCK_ONE_VCPU),
 	VMMDEV_IOCTL(VM_LAPIC_GET_STATE, VMMDEV_IOCTL_LOCK_ONE_VCPU),
+	VMMDEV_IOCTL(VM_LAPIC_CLEAR_IRR, VMMDEV_IOCTL_LOCK_ONE_VCPU),
 
 	VMMDEV_IOCTL(VM_GET_X2APIC_STATE, VMMDEV_IOCTL_LOCK_ONE_VCPU),
 
@@ -203,6 +205,7 @@ vmmdev_machdep_ioctl(struct vm *vm, struct vcpu *vcpu, u_long cmd, caddr_t data,
 	struct vm_rtc_time *rtctime;
 	struct vm_rtc_data *rtcdata;
 	struct vm_readwrite_kernemu_device *kernemu;
+	struct vm_lapic_clear_irr *clear_irr;
 #ifdef BHYVE_SNAPSHOT
 	struct vm_snapshot_meta *snapshot_meta;
 #ifdef COMPAT_FREEBSD13
@@ -326,6 +329,10 @@ vmmdev_machdep_ioctl(struct vm *vm, struct vcpu *vcpu, u_long cmd, caddr_t data,
 		error = vm_assign_pptdev(vm, pptdev->bus, pptdev->slot,
 					 pptdev->func);
 		break;
+	case VM_PPT_SBR_DEVICE:
+		pptdev = (struct vm_pptdev *)data;
+		error = ppt_sbr_device(pptdev->bus, pptdev->slot, pptdev->func);
+		break;
 	case VM_UNBIND_PPTDEV:
 		pptdev = (struct vm_pptdev *)data;
 		error = vm_unassign_pptdev(vm, pptdev->bus, pptdev->slot,
@@ -347,6 +354,10 @@ vmmdev_machdep_ioctl(struct vm *vm, struct vcpu *vcpu, u_long cmd, caddr_t data,
 	case VM_LAPIC_GET_STATE:
 		lapic_state = (struct vm_lapic_state *)data;
 		error = lapic_get_state(vcpu, lapic_state);
+		break;
+	case VM_LAPIC_CLEAR_IRR:
+		clear_irr = (struct vm_lapic_clear_irr *)data;
+		error = lapic_clear_irr(vcpu, clear_irr);
 		break;
 	case VM_LAPIC_IRQ:
 		vmirq = (struct vm_lapic_irq *)data;

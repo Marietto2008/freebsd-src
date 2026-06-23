@@ -361,6 +361,12 @@ vm_lapic_set_state(struct vcpu *vcpu, struct vm_lapic_state* apic_page)
 	return (vcpu_ioctl(vcpu, VM_LAPIC_SET_STATE, apic_page));
 }
 
+int
+vm_lapic_get_state(struct vcpu *vcpu, struct vm_lapic_state* apic_page)
+{
+	return (vcpu_ioctl(vcpu, VM_LAPIC_GET_STATE, apic_page));
+}
+
 
 int
 vm_lapic_irq(struct vcpu *vcpu, int vector)
