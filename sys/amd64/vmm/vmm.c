@@ -395,6 +395,42 @@ vm_create(const char *name, struct vm **retvm)
 	return (0);
 }
 
+/*
+ * ⚠ claude 13/10/2026 -- vm_get_topology/vm_get_maxcpus/vm_set_topology che
+ * stavano qui sono migrate a monte in sys/dev/vmm/vmm_vm.c: riportarle
+ * darebbe definizioni doppie.  Restano le tre locali al ramo
+ * vmm-qemu-mods, che a monte non esistono.
+ */
+void
+vm_get_flags(struct vm *vm, int *vflags)
+{
+	*vflags = vm->flags;
+}
+
+static void
+setup_qemu_mode(struct vm *vm)
+{
+	/* Remove everything except vatpic and ioapic */
+	vpmtmr_cleanup(vm->vpmtmr);
+	vm->vpmtmr = NULL;
+	vatpit_cleanup(vm->vatpit);
+	vm->vatpit = NULL;
+	vhpet_cleanup(vm->vhpet);
+	vm->vhpet = NULL;
+	if (vm->vrtc) {
+		vrtc_cleanup(vm->vrtc);
+		vm->vrtc = NULL;
+	}
+}
+
+int
+vm_set_flags(struct vm *vm, int vflags)
+{
+	vm->flags = vflags;
+	if (vm->flags & VM_OP_F_QEMU)
+		setup_qemu_mode(vm);
+	return (0);
+}
 static void
 vm_cleanup(struct vm *vm, bool destroy)
 {
@@ -408,15 +444,18 @@ vm_cleanup(struct vm *vm, bool destroy)
 	if (vm->iommu != NULL)
 		iommu_destroy_domain(vm->iommu);
 
-	if (destroy)
-		vrtc_cleanup(vm->vrtc);
-	else
-		vrtc_reset(vm->vrtc);
-	vpmtmr_cleanup(vm->vpmtmr);
-	vatpit_cleanup(vm->vatpit);
-	vhpet_cleanup(vm->vhpet);
-	vatpic_cleanup(vm->vatpic);
-	vioapic_cleanup(vm->vioapic);
+	// Not created in QEMU mode
+	if (!(vm->flags & VM_OP_F_QEMU)) {
+        if (destroy)
+            vrtc_cleanup(vm->vrtc);
+        else
+            vrtc_reset(vm->vrtc);
+        vpmtmr_cleanup(vm->vpmtmr);
+        vatpit_cleanup(vm->vatpit);
+        vhpet_cleanup(vm->vhpet);
+    }
+    vioapic_cleanup(vm->vioapic);
+    vatpic_cleanup(vm->vatpic);
 
 	for (int i = 0; i < vm->maxcpus; i++) {
 		if (vm->vcpu[i] != NULL)
@@ -476,6 +515,7 @@ vm_iommu_map(struct vm *vm)
 
 	pmap = vmspace_pmap(vm_vmspace(vm));
 	for (i = 0; i < VM_MAX_MEMMAPS; i++) {
+		unsigned long mapped_pages = 0, skipped_nohpa = 0, skipped_nowire = 0;
 		mm = &vm->mem.mem_maps[i];
 		if (!vm_memseg_sysmem(vm, mm->segid))
 			continue;
@@ -488,26 +528,25 @@ vm_iommu_map(struct vm *vm)
 		mm->flags |= VM_MEMMAP_F_IOMMU;
 
 		for (gpa = mm->gpa; gpa < mm->gpa + mm->len; gpa += PAGE_SIZE) {
-			hpa = pmap_extract(pmap, gpa);
+			vm_page_t m;
 
-			/*
-			 * All mappings in the vmm vmspace must be
-			 * present since they are managed by vmm in this way.
-			 * Because we are in pass-through mode, the
-			 * mappings must also be wired.  This implies
-			 * that all pages must be mapped and wired,
-			 * allowing to use pmap_extract() and avoiding the
-			 * need to use vm_gpa_hold_global().
-			 *
-			 * This could change if/when we start
-			 * supporting page faults on IOMMU maps.
-			 */
-			KASSERT(vm_page_wired(PHYS_TO_VM_PAGE(hpa)),
-			    ("vm_iommu_map: vm %p gpa %jx hpa %jx not wired",
-			    vm, (uintmax_t)gpa, (uintmax_t)hpa));
+			hpa = pmap_extract(pmap, gpa);
+			if (hpa == 0) {
+				skipped_nohpa++;
+				continue;
+			}
+			m = PHYS_TO_VM_PAGE(hpa);
+			if (m == NULL || !vm_page_wired(m)) {
+				skipped_nowire++;
+				continue;
+			}
 
 			iommu_create_mapping(vm->iommu, gpa, hpa, PAGE_SIZE);
+			mapped_pages++;
 		}
+		printf("vm_iommu_map: map[%d] gpa=%#lx len=%#lx: mapped=%lu skipped_nohpa=%lu skipped_nowire=%lu\n",
+		    i, (u_long)mm->gpa, (u_long)mm->len,
+		    mapped_pages, skipped_nohpa, skipped_nowire);
 	}
 
 	error = iommu_invalidate_tlb(iommu_host_domain());
@@ -536,10 +575,23 @@ vm_iommu_unmap(struct vm *vm)
 		    mm->gpa, mm->len, mm->flags));
 
 		for (gpa = mm->gpa; gpa < mm->gpa + mm->len; gpa += PAGE_SIZE) {
-			KASSERT(vm_page_wired(PHYS_TO_VM_PAGE(pmap_extract(
-			    vmspace_pmap(vm_vmspace(vm)), gpa))),
-			    ("vm_iommu_unmap: vm %p gpa %jx not wired",
-			    vm, (uintmax_t)gpa));
+			/*
+			 * ⚠ claude 13/10/2026 -- a monte qui c'e' un KASSERT
+			 * che fa PANIC se la pagina non e' ancorata.  La
+			 * versione locale la salta invece di morire: e' la
+			 * protezione anti-blocco del ramo vmm-qemu-mods, nata
+			 * sul passthrough della GPU.  Tenuta.
+			 * ⚠ `vm->vmspace` non esiste piu': struct vm e' migrata
+			 * in <dev/vmm/vmm_vm.h> e si passa da vm_vmspace().
+			 */
+			vm_paddr_t uhpa;
+			vm_page_t m;
+			uhpa = pmap_extract(vmspace_pmap(vm_vmspace(vm)), gpa);
+			if (uhpa == 0)
+				continue;
+			m = PHYS_TO_VM_PAGE(uhpa);
+			if (m == NULL || !vm_page_wired(m))
+				continue;
 			iommu_remove_mapping(vm->iommu, gpa, PAGE_SIZE);
 		}
 	}
@@ -944,8 +996,17 @@ vm_handle_inst_emul(struct vcpu *vcpu, bool *retu)
 		mread = lapic_mmio_read;
 		mwrite = lapic_mmio_write;
 	} else if (gpa >= VIOAPIC_BASE && gpa < VIOAPIC_BASE + VIOAPIC_SIZE) {
+		if (vcpu->vm->flags & VM_OP_F_QEMU) {
+			/* In QEMU mode, IOAPIC MMIO goes to userspace so QEMU's
+			 * own IOAPIC model handles RTE programming */
+			*retu = true;
+			return (0);
+		}
 		mread = vioapic_mmio_read;
 		mwrite = vioapic_mmio_write;
+	} else if (vcpu->vm->flags & VM_OP_F_QEMU) {
+		*retu = true;
+        return (0);
 	} else if (gpa >= VHPET_BASE && gpa < VHPET_BASE + VHPET_SIZE) {
 		mread = vhpet_mmio_read;
 		mwrite = vhpet_mmio_write;
@@ -1135,8 +1196,9 @@ vm_run(struct vcpu *vcpu)
 	struct pcb *pcb;
 	uint64_t tscval;
 	struct vm_exit *vme;
-	bool retu, intr_disabled;
+	bool retu, intr_disabled __unused;
 	pmap_t pmap;
+	int vmexit_count = 0;
 
 	vcpuid = vcpu->vcpuid;
 
@@ -1191,8 +1253,11 @@ restart:
 			error = vm_handle_rendezvous(vcpu);
 			break;
 		case VM_EXITCODE_HLT:
-			intr_disabled = ((vme->u.hlt.rflags & PSL_I) == 0);
-			error = vm_handle_hlt(vcpu, intr_disabled, &retu);
+			/*
+			 * Return HLT to userspace so QEMU can handle
+			 * timer ticks and re-inject interrupts.
+			 */
+			retu = true;
 			break;
 		case VM_EXITCODE_PAGING:
 			error = vm_handle_paging(vcpu, &retu);
@@ -1225,8 +1290,23 @@ restart:
 	if (error == 0 && vme->exitcode == VM_EXITCODE_IPI)
 		error = vm_handle_ipi(vcpu, vme, &retu);
 
-	if (error == 0 && retu == false)
-		goto restart;
+	if (error == 0 && retu == false) {
+		/*
+		 * Anti-freeze: after 64 consecutive in-kernel VMEXITs,
+		 * yield the CPU to prevent host starvation.  Also force
+		 * return to userspace every 4096 exits so QEMU can
+		 * service timers and I/O.
+		 */
+		vmexit_count++;
+		if (vmexit_count >= 4096) {
+			retu = true;
+			vme->exitcode = VM_EXITCODE_BOGUS;
+		} else {
+			if ((vmexit_count & 63) == 0)
+				kern_yield(PRI_USER);
+			goto restart;
+		}
+	}
 
 	vmm_stat_incr(vcpu, VMEXIT_USERSPACE, 1);
 	VMM_CTR2(vcpu, "retu %d/%d", error, vme->exitcode);

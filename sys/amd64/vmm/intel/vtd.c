@@ -68,6 +68,11 @@ struct vtdmap {
 
 #define	VTD_ECAP_DI(ecap)	(((ecap) >> 2) & 0x1)
 #define	VTD_ECAP_COHERENCY(ecap) ((ecap) & 0x1)
+/*
+ * Snoop Control. Not to be confused with COHERENCY above, which is
+ * about the IOMMU's own page-table walks.   [claude 20/9/2026]
+ */
+#define	VTD_ECAP_SC(ecap)	(((ecap) >> 7) & 0x1)
 #define	VTD_ECAP_IRO(ecap)	(((ecap) >> 8) & 0x3FF)
 
 #define	VTD_GCR_WBF		(1 << 27)
@@ -96,6 +101,14 @@ struct vtdmap {
 #define	VTD_PTE_RD		(1UL << 0)
 #define	VTD_PTE_WR		(1UL << 1)
 #define	VTD_PTE_SUPERPAGE	(1UL << 7)
+/*
+ * Snoop Behaviour: forces the IOMMU to treat the transaction as
+ * coherent no matter what the device asked for. Without it a device
+ * that sets No Snoop -- AMD GPUs do, for speed -- updates DRAM while
+ * the CPU's cache line stays stale, and the CPU keeps reading the old
+ * value. Only valid when the unit reports Snoop Control.   [claude 20/9/2026]
+ */
+#define	VTD_PTE_SNP		(1UL << 11)
 #define	VTD_PTE_ADDR_M		(0x000FFFFFFFFFF000UL)
 
 #define VTD_RID2IDX(rid)	(((rid) & 0xff) * 2)
@@ -115,6 +128,11 @@ static SLIST_HEAD(, domain) domhead;
 #define	DRHD_MAX_UNITS	16
 static ACPI_DMAR_HARDWARE_UNIT	*drhds[DRHD_MAX_UNITS];
 static int			drhd_num;
+/*
+ * Set once at init: every remapping unit reports Snoop Control, so
+ * leaf entries may carry VTD_PTE_SNP.   [claude 20/9/2026]
+ */
+static int			vtd_snoop;
 static struct vtdmap		*vtdmaps[DRHD_MAX_UNITS];
 static int			max_domains;
 typedef int			(*drhd_ident_func_t)(void);
@@ -366,6 +384,7 @@ skip_dmar:
 	drhd_num = units;
 
 	max_domains = 64 * 1024; /* maximum valid value */
+	vtd_snoop = 1;
 	for (i = 0; i < drhd_num; i++){
 		vtdmap = vtdmaps[i];
 
@@ -375,7 +394,21 @@ skip_dmar:
 		/* take most compatible (minimum) value */
 		if ((tmp = vtd_max_domains(vtdmap)) < max_domains)
 			max_domains = tmp;
+
+		/*
+		 * Snoop Control must hold for EVERY unit before any leaf entry
+		 * may carry VTD_PTE_SNP: setting a reserved bit on a unit that
+		 * lacks the capability raises a fault. Minimum across units,
+		 * like max_domains just above.   [claude 20/9/2026]
+		 */
+		if (VTD_ECAP_SC(vtdmap->ext_cap) == 0)
+			vtd_snoop = 0;
 	}
+
+	printf("vtd: snoop control %s -- device DMA %s coherent with CPU "
+	    "caches\n", vtd_snoop ? "supported" : "NOT supported",
+	    vtd_snoop ? "forced" : "left as the device asks, which breaks "
+	    "devices that use No Snoop");
 
 	/*
 	 * Set up the root-table to point to the context-entry tables
@@ -594,6 +627,21 @@ vtd_update_mapping(void *arg, vm_paddr_t gpa, vm_paddr_t hpa, uint64_t len,
 		ptp[ptpindex] = 0;
 	} else {
 		ptp[ptpindex] = hpa | VTD_PTE_RD | VTD_PTE_WR;
+
+		/*
+		 * Leaf entry: force coherency when the hardware can.   [claude 20/9/2026]
+		 *
+		 * This is the whole point of the change. Measured with the same
+		 * Vulkan command landing in two different places:
+		 *
+		 *     system RAM (GTT)   0/10 correct, 9 never written
+		 *     VRAM (BAR0)       10/10 correct
+		 *
+		 * The GPU signalled completion every time; the CPU simply never
+		 * saw the writes, because its cache line was never invalidated.
+		 */
+		if (vtd_snoop)
+			ptp[ptpindex] |= VTD_PTE_SNP;
 
 		if (nlevels > 0)
 			ptp[ptpindex] |= VTD_PTE_SUPERPAGE;

@@ -263,8 +263,8 @@ enum {
 	IOCNUM_REINIT = 5,
 
 	/* memory apis */
-	IOCNUM_MAP_MEMORY = 10,			/* deprecated */
-	IOCNUM_GET_MEMORY_SEG = 11,		/* deprecated */
+	IOCNUM_MAP_MEMORY = 10,            /* deprecated */
+	IOCNUM_GET_MEMORY_SEG = 11,        /* deprecated */
 	IOCNUM_GET_GPA_PMAP = 12,
 	IOCNUM_GLA2GPA = 13,
 	IOCNUM_ALLOC_MEMSEG = 14,
@@ -297,6 +297,8 @@ enum {
 	IOCNUM_LAPIC_LOCAL_IRQ = 37,
 	IOCNUM_IOAPIC_PINCOUNT = 38,
 	IOCNUM_RESTART_INSTRUCTION = 39,
+	IOCNUM_LAPIC_SET_STATE = 40,
+	IOCNUM_LAPIC_GET_STATE = 41,
 
 	/* PCI pass-thru */
 	IOCNUM_BIND_PPTDEV = 40,
@@ -307,6 +309,8 @@ enum {
 	IOCNUM_PPTDEV_DISABLE_MSIX = 45,
 	IOCNUM_UNMAP_PPTDEV_MMIO = 46,
 	IOCNUM_RESET_PPTDEV = 47,
+	/* locale al ramo vmm-qemu-mods: reset Secondary Bus */
+	IOCNUM_PPT_SBR_DEVICE = 123,
 
 	/* statistics */
 	IOCNUM_VM_STATS = 50,
@@ -342,7 +346,14 @@ enum {
 	/* checkpoint */
 	IOCNUM_SNAPSHOT_REQ = 113,
 
-	IOCNUM_RESTORE_TIME = 115
+	IOCNUM_RESTORE_TIME = 115,
+
+	/* VM Flags */
+	IOCNUM_SET_FLAGS = 121,
+    IOCNUM_GET_FLAGS = 122,
+
+	/* Atomic LAPIC IRR clearing (no TOCTOU race) */
+	IOCNUM_LAPIC_CLEAR_IRR = 130,
 };
 
 #define	VM_RUN		\
@@ -381,6 +392,10 @@ enum {
 	    struct vm_readwrite_kernemu_device)
 #define	VM_INJECT_EXCEPTION	\
 	_IOW('v', IOCNUM_INJECT_EXCEPTION, struct vm_exception)
+#define	VM_LAPIC_SET_STATE 		\
+	_IOW('v', IOCNUM_LAPIC_SET_STATE, struct vm_lapic_state)
+#define	VM_LAPIC_GET_STATE 		\
+	_IOWR('v', IOCNUM_LAPIC_GET_STATE, struct vm_lapic_state)
 #define	VM_LAPIC_IRQ 		\
 	_IOW('v', IOCNUM_LAPIC_IRQ, struct vm_lapic_irq)
 #define	VM_LAPIC_LOCAL_IRQ 	\
@@ -423,6 +438,8 @@ enum {
 	_IOW('v', IOCNUM_UNMAP_PPTDEV_MMIO, struct vm_pptdev_mmio)
 #define	VM_RESET_PPTDEV \
 	_IOW('v', IOCNUM_RESET_PPTDEV, struct vm_pptdev)
+#define	VM_PPT_SBR_DEVICE \
+	_IOW('v', IOCNUM_PPT_SBR_DEVICE, struct vm_pptdev)
 #define VM_INJECT_NMI \
 	_IOW('v', IOCNUM_INJECT_NMI, struct vm_nmi)
 #define	VM_STATS \
@@ -439,6 +456,10 @@ enum {
 	_IOW('v', IOCNUM_SET_TOPOLOGY, struct vm_cpu_topology)
 #define VM_GET_TOPOLOGY \
 	_IOR('v', IOCNUM_GET_TOPOLOGY, struct vm_cpu_topology)
+#define VM_SET_FLAGS \
+	_IOW('v', IOCNUM_SET_FLAGS, int)
+#define VM_GET_FLAGS \
+	_IOR('v', IOCNUM_GET_FLAGS, int)
 #define	VM_GET_GPA_PMAP \
 	_IOWR('v', IOCNUM_GET_GPA_PMAP, struct vm_gpa_pte)
 #define	VM_GLA2GPA	\
@@ -471,4 +492,6 @@ enum {
 	_IOWR('v', IOCNUM_SNAPSHOT_REQ, struct vm_snapshot_meta)
 #define VM_RESTORE_TIME \
 	_IOWR('v', IOCNUM_RESTORE_TIME, int)
+#define	VM_LAPIC_CLEAR_IRR \
+	_IOW('v', IOCNUM_LAPIC_CLEAR_IRR, struct vm_lapic_clear_irr)
 #endif

@@ -72,7 +72,7 @@ struct atpic {
 	bool		sfn;		/* special fully-nested mode */
 
 	int		irq_base;
-	uint8_t		request;	/* Interrupt Request Register (IIR) */
+	uint8_t		request;	/* Interrupt Request Register (IRR) */
 	uint8_t		service;	/* Interrupt Service (ISR) */
 	uint8_t		mask;		/* Interrupt Mask Register (IMR) */
 	uint8_t		smm;		/* special mask mode */

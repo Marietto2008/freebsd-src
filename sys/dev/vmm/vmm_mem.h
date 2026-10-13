@@ -23,7 +23,7 @@ enum {
         VM_BOOTROM = VM_MAXSYSMEM,
         VM_FRAMEBUFFER,
         VM_PCIROM,
-        VM_MEMSEG_END
+        VM_MEMSEG_END = 15
 };
 
 #define	VM_MAX_MEMSEGS	VM_MEMSEG_END

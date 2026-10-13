@@ -28,13 +28,17 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/_iovec.h>
 
 #include <machine/specialreg.h>
+#include <machine/psl.h>
 #include <machine/vmm.h>
 #include <machine/vmm_dev.h>
 #include <machine/vmm_snapshot.h>
+#include <machine/vmm_instruction_emul.h>
 
 #include <string.h>
+#include <assert.h>
 
 #include "vmmapi.h"
 #include "internal.h"
@@ -59,6 +63,10 @@ const char *vm_capstrmap[] = {
 	VM_GET_SEGMENT_DESCRIPTOR,	\
 	VM_SET_KERNEMU_DEV,		\
 	VM_GET_KERNEMU_DEV,		\
+    VM_SET_FLAGS,	 \
+    VM_GET_FLAGS,    \
+    VM_LAPIC_SET_STATE, \
+    VM_LAPIC_GET_STATE, \
 	VM_LAPIC_IRQ,			\
 	VM_LAPIC_LOCAL_IRQ,		\
 	VM_LAPIC_MSI,			\
@@ -92,6 +100,214 @@ const cap_ioctl_t vm_ioctl_cmds[] = {
 	VM_MD_IOCTLS,
 };
 size_t vm_ioctl_ncmds = nitems(vm_ioctl_cmds);
+
+int
+vm_set_flags(struct vmctx *ctx,
+    int flags)
+{
+	return (ioctl(ctx->fd, VM_SET_FLAGS, &flags));
+}
+
+int
+vm_get_flags(struct vmctx *ctx,
+    int *flags)
+{
+	return (ioctl(ctx->fd, VM_GET_FLAGS, &flags));
+}
+
+static int
+mem_read(struct vcpu *vcpu __unused, uint64_t gpa, uint64_t *rval, int size, void *arg)
+{
+	qmem_callback_t mem_callback = arg;
+	uint8_t temp_data[sizeof(uint64_t)] = {0};
+
+	struct vm_qmem mem_args = {
+		.gpa = gpa,
+		.write = false,
+		.size = size,
+		.data = temp_data
+	};
+
+	mem_callback(&mem_args);
+
+	*rval = 0; // Clear it first
+	memcpy(rval, temp_data, size); // Copy only the 'size' bytes read
+
+	return 0;
+}
+
+static int
+mem_write(struct vcpu *vcpu __unused, uint64_t gpa, uint64_t wval, int size, void *arg)
+{
+	qmem_callback_t mem_callback = arg;
+
+	uint8_t temp_data[sizeof(uint64_t)] = {};
+    memcpy(temp_data, &wval, sizeof(uint64_t));
+
+	struct vm_qmem mem_args = {
+		.gpa = gpa,
+		.write = true,
+		.size = size,
+        .data = temp_data
+	};
+    mem_callback(&mem_args);
+    return 0;
+}
+
+int
+vm_assist_qmem(struct vcpu* vcpu, qmem_callback_t mem_callback, struct vm_exit* vmexit)
+{
+	struct vie *vie;
+	int cs_d;
+	enum vm_cpu_mode mode;
+
+	vie = &vmexit->u.inst_emul.vie;
+	if (!vie->decoded) {
+		/*
+		 * Attempt to decode in userspace as a fallback.  This allows
+		 * updating instruction decode in bhyve without rebooting the
+		 * kernel (rapid prototyping), albeit with much slower
+		 * emulation.
+		 */
+		vie_restart(vie);
+		mode = vmexit->u.inst_emul.paging.cpu_mode;
+		cs_d = vmexit->u.inst_emul.cs_d;
+		if (vmm_decode_instruction(mode, cs_d, vie) != 0)
+			goto fail;
+		if (vm_set_register(vcpu, VM_REG_GUEST_RIP,
+		    vmexit->rip + vie->num_processed) != 0)
+			goto fail;
+	}
+	return (vmm_emulate_instruction(vcpu, vmexit->u.inst_emul.gpa, vie, &vmexit->u.inst_emul.paging, mem_read,
+                                    mem_write, mem_callback));
+fail:
+    return -1;
+}
+
+int
+vm_assist_qio(struct vcpu* vcpu, qio_callback_t io_callback, struct vm_exit* vmexit)
+{
+	int addrsize, bytes, in, port, prot, rep;
+	uint32_t eax, val;
+	int error, fault, retval;
+	enum vm_reg_name idxreg;
+	uint64_t gla, index, iterations, count;
+	struct vm_inout_str *vis;
+	struct iovec iov[2];
+    struct vm_qio io_args;
+
+	bytes = vmexit->u.inout.bytes;
+	in = vmexit->u.inout.in;
+	port = vmexit->u.inout.port;
+
+    // Less than max ports
+	assert(port < (1 << 16));
+	assert(bytes == 1 || bytes == 2 || bytes == 4);
+
+	retval = 0;
+	if (vmexit->u.inout.string) {
+		vis = &vmexit->u.inout_str;
+		rep = vis->inout.rep;
+		addrsize = vis->addrsize;
+		prot = in ? PROT_WRITE : PROT_READ;
+		assert(addrsize == 2 || addrsize == 4 || addrsize == 8);
+
+		/* Index register */
+		idxreg = in ? VM_REG_GUEST_RDI : VM_REG_GUEST_RSI;
+
+        /* Masks bits under full register size. Ex addrsize == 4 bytes: 0xFFFFFFFF */
+		index = vis->index & vie_size2mask(addrsize);
+
+		/* Count register */
+		count = vis->count & vie_size2mask(addrsize);
+
+		/* Limit number of back-to-back in/out emulations to 16 */
+		iterations = MIN(count, 16);
+		while (iterations > 0) {
+			assert(retval == 0);
+			if (vie_calculate_gla(vis->paging.cpu_mode,
+			    vis->seg_name, &vis->seg_desc, index, bytes,
+			    addrsize, prot, &gla)) {
+				vm_inject_gp(vcpu);
+				break;
+			}
+
+			error = vm_copy_setup(vcpu, &vis->paging, gla,
+			    bytes, prot, iov, nitems(iov), &fault);
+			if (error) {
+				retval = -1;  /* Unrecoverable error */
+				break;
+			} else if (fault) {
+				retval = 0;  /* Resume guest to handle fault */
+				break;
+			}
+
+			if (vie_alignment_check(vis->paging.cpl, bytes,
+			    vis->cr0, vis->rflags, gla)) {
+				vm_inject_ac(vcpu, 0);
+				break;
+			}
+
+			val = 0;
+			if (!in)
+				vm_copyin(iov, &val, bytes);
+
+			io_args.port = port;
+			io_args.in = in;
+			io_args.size = bytes;
+            io_args.data = (uint8_t*)&val;
+			retval = io_callback(&io_args);
+
+			if (in)
+				vm_copyout(&val, iov, bytes);
+
+			/* Update index */
+			if (vis->rflags & PSL_D)
+				index -= bytes;
+			else
+				index += bytes;
+
+			count--;
+			iterations--;
+		}
+
+		/* Update index register */
+		error = vie_update_register(vcpu, idxreg, index, addrsize);
+		assert(error == 0);
+
+		/*
+		 * Update count register only if the instruction had a repeat
+		 * prefix.
+		 */
+		if (rep) {
+			error = vie_update_register(vcpu, VM_REG_GUEST_RCX,
+			    count, addrsize);
+			assert(error == 0);
+		}
+
+		/* Restart the instruction if more iterations remain */
+		if (retval == 0 && count != 0) {
+			error = vm_restart_instruction(vcpu);
+			assert(error == 0);
+		}
+	} else {
+		eax = vmexit->u.inout.eax;
+		val = eax & vie_size2mask(bytes);
+        io_args.port = port;
+        io_args.in = in;
+        io_args.size = bytes;
+        io_args.data = (uint8_t*)&val;
+        retval = io_callback(&io_args);
+		if (retval == 0 && in) {
+			eax &= ~vie_size2mask(bytes);
+			eax |= val & vie_size2mask(bytes);
+			error = vm_set_register(vcpu, VM_REG_GUEST_RAX,
+			    eax);
+			assert(error == 0);
+		}
+	}
+	return (retval);
+}
 
 int
 vm_set_desc(struct vcpu *vcpu, int reg,
@@ -138,6 +354,19 @@ vm_get_seg_desc(struct vcpu *vcpu, int reg, struct seg_desc *seg_desc)
 	    &seg_desc->access);
 	return (error);
 }
+
+int
+vm_lapic_set_state(struct vcpu *vcpu, struct vm_lapic_state* apic_page)
+{
+	return (vcpu_ioctl(vcpu, VM_LAPIC_SET_STATE, apic_page));
+}
+
+int
+vm_lapic_get_state(struct vcpu *vcpu, struct vm_lapic_state* apic_page)
+{
+	return (vcpu_ioctl(vcpu, VM_LAPIC_GET_STATE, apic_page));
+}
+
 
 int
 vm_lapic_irq(struct vcpu *vcpu, int vector)
@@ -604,4 +833,17 @@ vcpu_reset(struct vcpu *vcpu)
 	error = 0;
 done:
 	return (error);
+}
+
+void
+vm_inject_fault(struct vcpu *vcpu, int vector, int errcode_valid,
+    int errcode)
+{
+	int error, restart_instruction;
+
+	restart_instruction = 1;
+
+	error = vm_inject_exception(vcpu, vector, errcode_valid, errcode,
+	    restart_instruction);
+	assert(error == 0);
 }

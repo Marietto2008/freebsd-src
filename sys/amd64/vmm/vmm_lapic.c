@@ -49,6 +49,139 @@
 #define	MSI_X86_ADDR_LOG	0x00000004	/* Destination Mode */
 
 int
+lapic_get_state(struct vcpu *vcpu, struct vm_lapic_state *lapic_state)
+{
+    struct LAPIC *klapic = vlapic_page(vm_lapic(vcpu));
+    #define COPY_FIELD(name, index) lapic_state->fields[index].data = klapic->name;
+
+    #define RANGE_COPY_FIELD(name, index, i) COPY_FIELD(name##i, index##i);
+
+
+    COPY_FIELD(id, LAPIC_ID);
+    COPY_FIELD(version, LAPIC_VERSION);
+    COPY_FIELD(tpr, LAPIC_TPR);
+    COPY_FIELD(apr, LAPIC_APR);
+    COPY_FIELD(ppr, LAPIC_PPR);
+    COPY_FIELD(eoi, LAPIC_EOI);
+    COPY_FIELD(ldr, LAPIC_LDR);
+    COPY_FIELD(dfr, LAPIC_DFR);
+    COPY_FIELD(svr, LAPIC_SVR);
+
+    // Manually unroll isr tmr irr
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 0);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 1);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 2);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 3);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 4);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 5);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 6);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 7);
+
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 0);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 1);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 2);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 3);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 4);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 5);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 6);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 7);
+
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 0);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 1);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 2);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 3);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 4);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 5);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 6);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 7);
+
+    COPY_FIELD(esr, LAPIC_ESR);
+    COPY_FIELD(lvt_cmci, LAPIC_LVT_CMCI);
+    COPY_FIELD(icr_lo, LAPIC_ICR_LO);
+    COPY_FIELD(icr_hi, LAPIC_ICR_HI);
+    COPY_FIELD(lvt_timer, LAPIC_LVT_TIMER);
+    COPY_FIELD(lvt_thermal, LAPIC_LVT_THERMAL);
+    COPY_FIELD(lvt_pcint, LAPIC_LVT_PCINT);
+    COPY_FIELD(lvt_lint0, LAPIC_LVT_LINT0);
+    COPY_FIELD(lvt_lint1, LAPIC_LVT_LINT1);
+    COPY_FIELD(lvt_error, LAPIC_LVT_ERROR);
+    COPY_FIELD(icr_timer, LAPIC_ICR_TIMER);
+    COPY_FIELD(ccr_timer, LAPIC_CCR_TIMER);
+    COPY_FIELD(dcr_timer, LAPIC_DCR_TIMER);
+
+    #undef COPY_FIELD
+    #undef RANGE_COPY_FIELD
+    return 0;
+}
+
+int
+lapic_set_state(struct vcpu *vcpu, struct vm_lapic_state *lapic_state)
+{
+    struct LAPIC *klapic = vlapic_page(vm_lapic(vcpu));
+    #define COPY_FIELD(name, index) \
+        klapic->name = lapic_state->fields[index].data;
+
+    #define RANGE_COPY_FIELD(name, index, i) COPY_FIELD(name##i, index##i);
+
+
+    COPY_FIELD(id, LAPIC_ID);
+    COPY_FIELD(version, LAPIC_VERSION);
+    COPY_FIELD(tpr, LAPIC_TPR);
+    COPY_FIELD(apr, LAPIC_APR);
+    COPY_FIELD(ppr, LAPIC_PPR);
+    COPY_FIELD(eoi, LAPIC_EOI);
+    COPY_FIELD(ldr, LAPIC_LDR);
+    COPY_FIELD(dfr, LAPIC_DFR);
+    COPY_FIELD(svr, LAPIC_SVR);
+
+    // Manually unroll isr tmr irr
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 0);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 1);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 2);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 3);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 4);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 5);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 6);
+    RANGE_COPY_FIELD(isr, LAPIC_ISR, 7);
+
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 0);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 1);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 2);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 3);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 4);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 5);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 6);
+    RANGE_COPY_FIELD(tmr, LAPIC_TMR, 7);
+
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 0);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 1);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 2);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 3);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 4);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 5);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 6);
+    RANGE_COPY_FIELD(irr, LAPIC_IRR, 7);
+
+    COPY_FIELD(esr, LAPIC_ESR);
+    COPY_FIELD(lvt_cmci, LAPIC_LVT_CMCI);
+    COPY_FIELD(icr_lo, LAPIC_ICR_LO);
+    COPY_FIELD(icr_hi, LAPIC_ICR_HI);
+    COPY_FIELD(lvt_timer, LAPIC_LVT_TIMER);
+    COPY_FIELD(lvt_thermal, LAPIC_LVT_THERMAL);
+    COPY_FIELD(lvt_pcint, LAPIC_LVT_PCINT);
+    COPY_FIELD(lvt_lint0, LAPIC_LVT_LINT0);
+    COPY_FIELD(lvt_lint1, LAPIC_LVT_LINT1);
+    COPY_FIELD(lvt_error, LAPIC_LVT_ERROR);
+    COPY_FIELD(icr_timer, LAPIC_ICR_TIMER);
+    COPY_FIELD(ccr_timer, LAPIC_CCR_TIMER);
+    COPY_FIELD(dcr_timer, LAPIC_DCR_TIMER);
+
+    #undef COPY_FIELD
+    #undef RANGE_COPY_FIELD
+    return 0;
+}
+
+int
 lapic_set_intr(struct vcpu *vcpu, int vector, bool level)
 {
 	struct vlapic *vlapic;
@@ -61,8 +194,38 @@ lapic_set_intr(struct vcpu *vcpu, int vector, bool level)
 		return (EINVAL);
 
 	vlapic = vm_lapic(vcpu);
-	if (vlapic_set_intr_ready(vlapic, vector, level))
+	if (vlapic_set_intr_ready(vlapic, vector, level)) {
+		/*
+		 * Ensure IRR write is globally visible before kicking
+		 * the vcpu thread which will read it in vmx_inject_interrupts.
+		 *
+		 * ⚠ claude 13/10/2026: a monte `vcpu_notify_event(vcpu, true)`
+		 * non esiste piu' -- ora prende UN argomento e la variante con
+		 * l'interrupt del lapic si chiama `vcpu_notify_lapic()`.  La
+		 * barriera resta: e' il senso della modifica.
+		 */
+		mb();
 		vcpu_notify_lapic(vcpu);
+	}
+	return (0);
+}
+
+int
+lapic_clear_irr(struct vcpu *vcpu, struct vm_lapic_clear_irr *ci)
+{
+	struct LAPIC *lapic;
+	uint32_t *irrptr;
+	int i;
+
+	lapic = vlapic_page(vm_lapic(vcpu));
+	if (lapic == NULL)
+		return (EINVAL);
+
+	irrptr = &lapic->irr0;
+	for (i = 0; i < 8; i++) {
+		if (ci->irr_mask[i] != 0)
+			atomic_clear_int(&irrptr[i * 4], ci->irr_mask[i]);
+	}
 	return (0);
 }
 
@@ -125,9 +288,6 @@ lapic_intr_msi(struct vm *vm, uint64_t addr, uint64_t msg)
 	    (MSI_X86_ADDR_RH | MSI_X86_ADDR_LOG));
 	delmode = msg & APIC_DELMODE_MASK;
 	vec = msg & 0xff;
-
-	VM_CTR3(vm, "lapic MSI %s dest %#x, vec %d",
-	    phys ? "physical" : "logical", dest, vec);
 
 	vlapic_deliver_intr(vm, LAPIC_TRIG_EDGE, dest, phys, delmode, vec);
 	return (0);

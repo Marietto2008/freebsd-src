@@ -30,6 +30,7 @@
 #define	_VLAPIC_H_
 
 struct vm;
+struct LAPIC;
 struct vm_snapshot_meta;
 enum x2apic_state;
 
@@ -37,6 +38,9 @@ int vlapic_write(struct vlapic *vlapic, int mmio_access, uint64_t offset,
     uint64_t data, bool *retu);
 int vlapic_read(struct vlapic *vlapic, int mmio_access, uint64_t offset,
     uint64_t *data, bool *retu);
+
+
+struct LAPIC* vlapic_page(struct vlapic *vlapic);
 
 /*
  * Returns 0 if there is no eligible vector that can be delivered to the

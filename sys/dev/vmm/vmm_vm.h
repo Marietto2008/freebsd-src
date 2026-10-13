@@ -153,6 +153,12 @@ struct vm {
 	uint16_t	maxcpus;		/* (o) max pluggable cpus */
 
 	VMM_VM_MD_FIELDS;
+	/*
+	 * ⚠ Aggiunta locale del ramo vmm-qemu-mods (claude 13/10/2026).
+	 * La leggono vm_get_flags()/vm_set_flags() e vm_cleanup(); il bit
+	 * VM_OP_F_QEMU vive in <machine/vmm.h>.  A monte non esiste.
+	 */
+	int		flags;			/* (o) External flags */
 };
 
 int vm_create(const char *name, struct vm **retvm);

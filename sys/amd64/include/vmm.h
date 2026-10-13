@@ -122,6 +122,14 @@ enum x2apic_state {
 #define	VM_INTINFO_HWEXCEPTION	(3 << 8)
 #define	VM_INTINFO_SWINTR	(4 << 8)
 
+/*
+ * Bandiere d'esercizio della VM.
+ * ⚠ VM_OP_F_QEMU e' una aggiunta locale (ramo vmm-qemu-mods): la usa
+ * vmx.c per instradare a spazio utente cio' che QEMU deve gestire.
+ * A monte non esiste -- se un giorno sparisse da qui, `-accel bhyve`
+ * smette di funzionare senza errori di compilazione.
+ */
+#define VM_OP_F_QEMU (1 << 0)
 #ifdef _KERNEL
 #define	VMM_VCPU_MD_FIELDS						\
 	struct vlapic	*vlapic;	/* (i) APIC device model */	\
@@ -228,6 +236,13 @@ struct vmm_ops {
 extern const struct vmm_ops vmm_ops_intel;
 extern const struct vmm_ops vmm_ops_amd;
 
+/*
+ * ⚠ Le altre dichiarazioni (vm_create, vm_set_topology, ...) a monte sono
+ * migrate in <dev/vmm/vmm_vm.h>: qui resterebbero doppie.  Queste due
+ * invece sono locali al ramo vmm-qemu-mods.
+ */
+void vm_get_flags(struct vm *vm, int *vflags);
+int vm_set_flags(struct vm *vm, int vflags);
 int vm_map_mmio(struct vm *vm, vm_paddr_t gpa, size_t len, vm_paddr_t hpa);
 int vm_unmap_mmio(struct vm *vm, vm_paddr_t gpa, size_t len);
 int vm_assign_pptdev(struct vm *vm, int bus, int slot, int func);
@@ -433,6 +448,20 @@ struct vm_guest_paging {
 	enum vm_paging_mode paging_mode;
 };
 
+struct vm_qmem {
+    vm_paddr_t gpa;
+    int write;
+    size_t size;
+    uint8_t *data;
+};
+
+struct vm_qio {
+	uint16_t port;
+	int in;
+	size_t size;
+    uint8_t *data;
+};
+
 /*
  * The data structures 'vie' and 'vie_op' are meant to be opaque to the
  * consumers of instruction decoding. The only reason why their contents
@@ -564,6 +593,32 @@ enum task_switch_reason {
 	TSR_IRET,
 	TSR_JMP,
 	TSR_IDT_GATE,	/* task gate in IDT */
+};
+
+
+struct vm_lapic_state {
+    struct {
+        uint32_t data;
+        uint32_t padding[3];
+    } fields[256];
+};
+
+/*
+ * Atomic IRR clearing: clears specific bits from LAPIC IRR registers
+ * without the TOCTOU race of GET_STATE/SET_STATE.
+ */
+struct vm_lapic_clear_irr {
+	uint32_t irr_mask[8];	/* bits to clear from IRR[0]-IRR[7] */
+};
+
+#define VM_IOAPIC_STATE_REDIR_ENTRIES 32
+struct vm_ioapic_state {
+	uint32_t	id;
+	uint32_t	ioregsel;
+	struct {
+		uint64_t reg;
+		int	 acnt;	/* sum of pin asserts (+1) and deasserts (-1) */
+	} rtbl[VM_IOAPIC_STATE_REDIR_ENTRIES];
 };
 
 struct vm_task_switch {

@@ -36,6 +36,8 @@
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <sys/proc.h>
+#include <sys/malloc.h>
+#include <sys/types.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
@@ -126,6 +128,14 @@ const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 	VMMDEV_IOCTL(VM_BIND_PPTDEV,
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS |
 	    VMMDEV_IOCTL_PPT),
+	/*
+	 * ⚠ Flag 0 come nel ramo vmm-qemu-mods: il Secondary Bus Reset si
+	 * esegue senza congelare i vcpu.  Le altre ioctl PPT a monte ora
+	 * prendono XLOCK_MEMSEGS|LOCK_ALL_VCPUS|PPT; qui NON si allinea,
+	 * perche' cambiare la disciplina di lock cambierebbe i tempi del
+	 * reset -- ed e' quello che fa ripartire la GPU.
+	 */
+	VMMDEV_IOCTL(VM_PPT_SBR_DEVICE, 0),
 	VMMDEV_IOCTL(VM_UNBIND_PPTDEV,
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS |
 	    VMMDEV_IOCTL_PPT),
@@ -149,6 +159,11 @@ const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 #endif
 	VMMDEV_IOCTL(VM_INJECT_NMI, VMMDEV_IOCTL_LOCK_ONE_VCPU),
 	VMMDEV_IOCTL(VM_LAPIC_IRQ, VMMDEV_IOCTL_LOCK_ONE_VCPU),
+
+	VMMDEV_IOCTL(VM_LAPIC_SET_STATE, VMMDEV_IOCTL_LOCK_ONE_VCPU),
+	VMMDEV_IOCTL(VM_LAPIC_GET_STATE, VMMDEV_IOCTL_LOCK_ONE_VCPU),
+	VMMDEV_IOCTL(VM_LAPIC_CLEAR_IRR, VMMDEV_IOCTL_LOCK_ONE_VCPU),
+
 	VMMDEV_IOCTL(VM_GET_X2APIC_STATE, VMMDEV_IOCTL_LOCK_ONE_VCPU),
 
 	VMMDEV_IOCTL(VM_LAPIC_LOCAL_IRQ, VMMDEV_IOCTL_MAYBE_ALLOC_VCPU),
@@ -171,6 +186,9 @@ const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 	VMMDEV_IOCTL(VM_RTC_WRITE, 0),
 	VMMDEV_IOCTL(VM_RTC_GETTIME, 0),
 	VMMDEV_IOCTL(VM_RTC_SETTIME, 0),
+
+	VMMDEV_IOCTL(VM_GET_FLAGS, 0),
+	VMMDEV_IOCTL(VM_SET_FLAGS, 0),
 };
 const size_t vmmdev_machdep_ioctl_count = nitems(vmmdev_machdep_ioctls);
 
@@ -310,9 +328,15 @@ vmmdev_machdep_ioctl(struct vm *vm, struct vcpu *vcpu, u_long cmd, caddr_t data,
 		    pptdev->func);
 		break;
 	}
-	case VM_UNBIND_PPTDEV: {
+	case VM_PPT_SBR_DEVICE: {
 		struct vm_pptdev *pptdev;
 
+		pptdev = (struct vm_pptdev *)data;
+		error = ppt_sbr_device(pptdev->bus, pptdev->slot, pptdev->func);
+		break;
+	}
+	case VM_UNBIND_PPTDEV: {
+		struct vm_pptdev *pptdev;
 		pptdev = (struct vm_pptdev *)data;
 		error = vm_unassign_pptdev(vm, pptdev->bus, pptdev->slot,
 		    pptdev->func);
@@ -338,9 +362,38 @@ vmmdev_machdep_ioctl(struct vm *vm, struct vcpu *vcpu, u_long cmd, caddr_t data,
 	case VM_INJECT_NMI:
 		error = vm_inject_nmi(vcpu);
 		break;
+	/*
+	 * ⚠ claude 13/10/2026 -- VM_LAPIC_SET_STATE e VM_LAPIC_GET_STATE a
+	 * monte sono state RITIRATE (tolte da tabella e switch), ma le
+	 * funzioni lapic_set_state()/lapic_get_state() ci sono ancora e la
+	 * libvmmapi di questo ramo le chiama: senza questi case bhyve
+	 * prenderebbe ENOTTY a tempo di esecuzione, non in compilazione.
+	 * VM_LAPIC_CLEAR_IRR e' invece tutta locale (serve a QEMU).
+	 * Riscritti nello stile a blocchi adottato a monte.
+	 */
+	case VM_LAPIC_SET_STATE: {
+		struct vm_lapic_state *lapic_state;
+
+		lapic_state = (struct vm_lapic_state *)data;
+		error = lapic_set_state(vcpu, lapic_state);
+		break;
+	}
+	case VM_LAPIC_GET_STATE: {
+		struct vm_lapic_state *lapic_state;
+
+		lapic_state = (struct vm_lapic_state *)data;
+		error = lapic_get_state(vcpu, lapic_state);
+		break;
+	}
+	case VM_LAPIC_CLEAR_IRR: {
+		struct vm_lapic_clear_irr *clear_irr;
+
+		clear_irr = (struct vm_lapic_clear_irr *)data;
+		error = lapic_clear_irr(vcpu, clear_irr);
+		break;
+	}
 	case VM_LAPIC_IRQ: {
 		struct vm_lapic_irq *vmirq;
-
 		vmirq = (struct vm_lapic_irq *)data;
 		error = lapic_intr_edge(vcpu, vmirq->vector);
 		break;
@@ -597,6 +650,18 @@ vmmdev_machdep_ioctl(struct vm *vm, struct vcpu *vcpu, u_long cmd, caddr_t data,
 		error = vm_restore_time(vm);
 		break;
 #endif
+	case VM_SET_FLAGS: {
+        int *vflags;
+        vflags = (int *)data;
+        error = vm_set_flags(vm, *vflags);
+        break;
+	}
+	case VM_GET_FLAGS: {
+		int *vflags;
+		vflags = (int *)data;
+		vm_get_flags(vm, vflags);
+        break;
+	}
 	default:
 		error = ENOTTY;
 		break;

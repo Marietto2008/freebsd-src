@@ -41,8 +41,18 @@
 #include <dev/clk/clk.h>
 
 #include <dev/mmc/host/dwmmc_var.h>
+#include <dev/mmc/host/dwmmc_reg.h>
+
+#include <vm/vm.h>
+#include <vm/pmap.h>
 
 #include "opt_mmccam.h"
+
+/* RK3568 CRU base and SDMMC1 phase registers */
+#define RK3568_CRU_BASE		0xFDD20000
+#define RK3568_CRU_SIZE		0x1000
+#define RK3568_SDMMC1_CON0	0x588	/* drive phase */
+#define RK3568_SDMMC1_CON1	0x58C	/* sample phase */
 
 enum RKTYPE {
 	RK2928 = 1,
@@ -56,6 +66,37 @@ static struct ofw_compat_data compat_data[] = {
 };
 
 static int dwmmc_rockchip_update_ios(struct dwmmc_softc *sc, struct mmc_ios *ios);
+
+/* CRU mapped address (set during attach of sdmmc1) */
+static volatile uint32_t *cru_base;
+static int sdmmc1_sdr104_applied;
+
+static void
+rockchip_dwmmc_set_phase(device_t dev, uint32_t reg_off,
+    int coarse, int fine, int invert)
+{
+	uint32_t val;
+
+	if (cru_base == NULL)
+		return;
+
+	/*
+	 * HIWORD_UPDATE: bits[31:16] = write mask, bits[15:0] = value
+	 * Phase register layout:
+	 *   bit 0:    invert
+	 *   bits 5:1: coarse (0-3 = 0/90/180/270 degrees)
+	 *   bits 11:6: fine delay taps
+	 */
+	val = (invert & 1) | ((coarse & 0x1F) << 1) | ((fine & 0x3F) << 6);
+	/* Mask covers bits 11:0 */
+	val |= (0xFFF << 16);
+
+	*(volatile uint32_t *)((char *)cru_base + reg_off) = val;
+
+	device_printf(dev, "CRU phase reg 0x%x = 0x%08x "
+	    "(coarse=%d fine=%d inv=%d)\n",
+	    reg_off, val, coarse, fine, invert);
+}
 
 static int
 rockchip_dwmmc_probe(device_t dev)
@@ -79,6 +120,7 @@ rockchip_dwmmc_attach(device_t dev)
 	struct dwmmc_softc *sc;
 	int type;
 	int rc;
+	uint64_t freq;
 
 	sc = device_get_softc(dev);
 	sc->hwtype = HWTYPE_ROCKCHIP;
@@ -94,12 +136,56 @@ rockchip_dwmmc_attach(device_t dev)
 	rc = dwmmc_attach(dev);
 
 	/*
-	 * Note: It's not that the controller doesn't support HS200,
-	 *       it's that FreeBSD doesn't support tuning.
-	 *       If someone implemented tuning, this could work.
+	 * Reparent CIU clock for SDMMC1 (WiFi SDIO).
+	 * The default 24MHz oscillator only gives 750kHz CIU.
+	 * Reparent to a PLL to get ~300MHz, allowing up to 150MHz card clock.
 	 */
-	device_printf(dev, "Disabling HS200+ (tuning code not written)\n");
-	sc->host.caps &= ~(MMC_CAP_MMC_HS200 | MMC_CAP_MMC_HS400);
+	if (sc->ciu && sc->bus_hz < 10000000) {
+		clk_t parent;
+
+		device_printf(dev, "CIU clock is only %u Hz, "
+		    "attempting reparent\n", sc->bus_hz);
+
+		if (clk_get_by_name(dev, "clk_sdmmc1", &parent) == 0 ||
+		    clk_get_by_name(dev, "cclk_sdmmc1", &parent) == 0) {
+			/* Try to set the parent clock to ~300 MHz */
+			clk_set_freq(parent, 300000000, CLK_SET_ROUND_DOWN);
+			clk_get_freq(parent, &freq);
+			if (freq >= 100000000) {
+				sc->bus_hz = (uint32_t)freq;
+				device_printf(dev, "CIU clock reparented to "
+				    "~300 MHz (now %u Hz), bus_hz updated\n",
+				    sc->bus_hz);
+			}
+			clk_release(parent);
+		} else {
+			/* Try reparenting ciu directly */
+			clk_set_freq(sc->ciu, 300000000 * 2,
+			    CLK_SET_ROUND_DOWN);
+			clk_get_freq(sc->ciu, &freq);
+			if (freq >= 100000000) {
+				sc->bus_hz = (uint32_t)freq;
+				device_printf(dev, "CIU clock set to %u Hz\n",
+				    sc->bus_hz);
+			}
+		}
+
+		/* Map CRU registers for phase control */
+		if (cru_base == NULL) {
+			cru_base = (volatile uint32_t *)pmap_mapdev(
+			    RK3568_CRU_BASE, RK3568_CRU_SIZE);
+			if (cru_base != NULL)
+				device_printf(dev, "CRU mapped at %p\n",
+				    cru_base);
+		}
+
+		/* Set default phase (0°/0°) for enumeration */
+		rockchip_dwmmc_set_phase(dev, RK3568_SDMMC1_CON0,
+		    0, 0, 0);  /* drive: 0° */
+		rockchip_dwmmc_set_phase(dev, RK3568_SDMMC1_CON1,
+		    0, 0, 0);  /* sample: 0° */
+		sdmmc1_sdr104_applied = 0;
+	}
 
 	return (rc);
 }
@@ -110,11 +196,27 @@ dwmmc_rockchip_update_ios(struct dwmmc_softc *sc, struct mmc_ios *ios)
 	unsigned int clock;
 	int error;
 
+	/*
+	 * For reparented SDMMC1 (CIU at 300MHz), do NOT touch the CIU
+	 * clock or bus_hz.  The CLKDIV divider in dwmmc_setup_bus()
+	 * will divide 300MHz down to the desired card clock.
+	 *
+	 * For non-reparented controllers (SDMMC0), use the original
+	 * behavior: set CIU = 2 * desired_clock, CLKDIV = 0.
+	 */
+	if (sc->bus_hz >= 100000000) {
+		/*
+		 * Reparented SDMMC1 (CIU ~300MHz): let CLKDIV handle it.
+		 * dwmmc_setup_bus() will compute the correct divider.
+		 */
+		return (0);
+	}
+
 	if (ios->clock && ios->clock != sc->bus_hz) {
 		sc->bus_hz = clock = ios->clock;
 		/* Set the MMC clock. */
 		if (sc->ciu) {
-			/* 
+			/*
 			 * Apparently you need to set the ciu clock to
 			 * the double of bus_hz
 			 */
@@ -128,6 +230,7 @@ dwmmc_rockchip_update_ios(struct dwmmc_softc *sc, struct mmc_ios *ios)
 			}
 		}
 	}
+
 	return (0);
 }
 

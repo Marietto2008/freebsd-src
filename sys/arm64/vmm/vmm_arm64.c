@@ -1110,6 +1110,19 @@ vmmops_run(void *vcpui, register_t pc, pmap_t pmap, struct vm_eventinfo *evinfo)
 
 	hypctx_write_sys_reg(hypctx, HOST_ELR_EL2, (uint64_t)pc);
 
+	/*
+	 * Track whether we need a Stage-2 TLB flush for PCI MMIO.
+	 * After an INST_EMUL exit to PCI config space, the Cortex-A55
+	 * may retain a stale TLB entry preventing subsequent accesses
+	 * from trapping.  The flush must happen with interrupts disabled
+	 * and after VTTBR is set.
+	 */
+	bool need_pci_tlbi = (vme->exitcode == VM_EXITCODE_INST_EMUL &&
+	    vme->u.inst_emul.gpa >= 0x10000000 &&
+	    vme->u.inst_emul.gpa < 0x20000000);
+	uint64_t tlbi_ipa = need_pci_tlbi ?
+	    (vme->u.inst_emul.gpa & ~0xFFFUL) : 0;
+
 	for (;;) {
 		if (hypctx->has_exception) {
 			hypctx->has_exception = false;
@@ -1182,6 +1195,13 @@ vmmops_run(void *vcpui, register_t pc, pmap_t pmap, struct vm_eventinfo *evinfo)
 		pmap_activate_vm(pmap);
 		hypctx_write_sys_reg(hypctx, HOST_VTTBR_EL2,
 				     pmap_to_ttbr0(pmap));
+
+		/* Flush stale Stage-2 TLB for PCI MMIO after INST_EMUL */
+		if (need_pci_tlbi) {
+			vmm_s2_tlbi_range(hyp->vttbr_el2, tlbi_ipa,
+			    tlbi_ipa + PAGE_SIZE, true);
+			need_pci_tlbi = false;
+		}
 
 		/*
 		 * TODO: What happens if a timer interrupt is asserted exactly

@@ -105,15 +105,36 @@ emulate_inout_port(struct vcpu *vcpu, struct vm_exit *vmexit, bool *retu)
 	uint32_t mask, val = 0;
 	int error;
 
+	int flags;
+    vm_get_flags(vcpu_vm(vcpu), &flags);
+
 	/*
 	 * If there is no handler for the I/O port then punt to userspace.
 	 */
-	if (vmexit->u.inout.port >= MAX_IOPORTS ||
+    if (flags & VM_OP_F_QEMU) {
+        /* Vatpic handlers */
+	    switch (vmexit->u.inout.port) {
+	    case IO_ICU1:
+        case IO_ICU2:
+        case IO_ICU1 + ICU_IMR_OFFSET:
+        case IO_ICU2 + ICU_IMR_OFFSET:
+        case IO_ELCR1:
+        case IO_ELCR2:
+            if((handler = ioport_handler[vmexit->u.inout.port]) != NULL)
+                goto kernel_handler;
+        default:
+            *retu = true;
+            return (0);
+	    }
+    }
+
+    if (vmexit->u.inout.port >= MAX_IOPORTS ||
 	    (handler = ioport_handler[vmexit->u.inout.port]) == NULL) {
 		*retu = true;
 		return (0);
 	}
 
+ kernel_handler:
 	mask = vie_size2mask(vmexit->u.inout.bytes);
 
 	if (!vmexit->u.inout.in) {

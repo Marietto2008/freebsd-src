@@ -46,6 +46,7 @@ bool	ppt_is_mmio(struct vm *vm, vm_paddr_t gpa);
  * The following functions should never be called directly.
  * Use 'vm_assign_pptdev()' and 'vm_unassign_pptdev()' instead.
  */
+int	ppt_sbr_device(int bus, int slot, int func);
 int	ppt_assign_device(struct vm *vm, int bus, int slot, int func);
 int	ppt_unassign_device(struct vm *vm, int bus, int slot, int func);
 int	ppt_reset_device(struct vm *vm, int bus, int slot, int func);

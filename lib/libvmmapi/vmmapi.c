@@ -67,8 +67,10 @@
 
 #ifdef __amd64__
 #define	VM_LOWMEM_LIMIT	(3 * GB)
+#define	VM_LOWMEM_QEMU_LIMIT	(2 * GB)
 #else
 #define	VM_LOWMEM_LIMIT	0
+#define	VM_LOWMEM_QEMU_LIMIT	0
 #endif
 #define	VM_HIGHMEM_BASE	(4 * GB)
 
@@ -329,8 +331,10 @@ vm_get_guestmem_from_ctx(struct vmctx *ctx, char **guest_baseaddr,
 {
 
 	*guest_baseaddr = ctx->baseaddr;
-	*lowmem_size = ctx->lowmem_size;
-	*highmem_size = ctx->highmem_size;
+    if(lowmem_size && highmem_size) {
+        *lowmem_size = ctx->lowmem_size;
+        *highmem_size = ctx->highmem_size;
+    }
 	return (0);
 }
 
@@ -609,6 +613,30 @@ vm_setup_memory(struct vmctx *ctx, size_t memsize, enum vm_mmap_style vms)
 
 	return (vm_setup_memory_domains(ctx, vms, &dom0, 1));
 }
+
+#ifdef __amd64__
+int
+vm_setup_qmemory(struct vmctx *ctx, size_t memsize, int segid, enum vm_mmap_style vms, const char* name)
+{
+	size_t objsize;
+
+	assert(vms == VM_MMAP_ALL);
+
+    if (memsize > VM_LOWMEM_QEMU_LIMIT) {
+        ctx->lowmem_size = VM_LOWMEM_QEMU_LIMIT;
+        ctx->highmem_size = memsize - VM_LOWMEM_QEMU_LIMIT;
+        objsize = VM_HIGHMEM_BASE + ctx->highmem_size;
+    } else {
+        ctx->lowmem_size = memsize;
+        ctx->highmem_size = 0;
+        objsize = memsize;
+    }
+
+
+	ctx->baseaddr = vm_create_devmem(ctx, segid, name, objsize);
+    return (0);
+}
+#endif
 
 /*
  * Returns a non-NULL pointer if [gaddr, gaddr+len) is entirely contained in
