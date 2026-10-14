@@ -407,20 +407,57 @@ vm_get_flags(struct vm *vm, int *vflags)
 	*vflags = vm->flags;
 }
 
+/*
+ * ★★ claude 15/10/2026 -- MASCHERA PER BISEZIONARE setup_qemu_mode().
+ *
+ * Esperimento controllato del 15/10: un riproduttore di 60 righe che crea la
+ * VM, alloca un devmem da 64 MB, lo apre, lo mappa, ci scrive e distrugge
+ * tutto SOPRAVVIVE.  Aggiungendo la sola chiamata vm_set_flags(VM_OP_F_QEMU)
+ * -- che porta qui dentro -- la STESSA mmap uccide l'host.
+ *
+ * setup_qemu_mode() e le otto funzioni di init e di cleanup dei quattro
+ * dispositivi sono IDENTICHE a giugno, quindi non e' una modifica locale
+ * persa: e' l'interazione fra questa distruzione anticipata e il kernel di
+ * ottobre.  Per sapere QUALE dei quattro, invece di quattro ricompilazioni
+ * e quattro riavvii, c'e' questa maschera:
+ *
+ *     sysctl hw.vmm.qemu_mode_mask=0   non distrugge niente
+ *     bit 0 (1)  vpmtmr      bit 1 (2)  vatpit
+ *     bit 2 (4)  vhpet       bit 3 (8)  vrtc
+ *     15 = tutti e quattro = comportamento storico (predefinito)
+ *
+ * ⚠ Se con 0 la VM di QEMU non parte, pazienza: qui si cerca il colpevole,
+ *   non si configura la produzione.
+ */
+static int qemu_mode_mask = 15;
+SYSCTL_INT(_hw_vmm, OID_AUTO, qemu_mode_mask, CTLFLAG_RWTUN,
+    &qemu_mode_mask, 0,
+    "Quali dispositivi togliere in modalita' QEMU: 1=vpmtmr 2=vatpit "
+    "4=vhpet 8=vrtc (15 = tutti, storico)");
+
 static void
 setup_qemu_mode(struct vm *vm)
 {
 	/* Remove everything except vatpic and ioapic */
-	vpmtmr_cleanup(vm->vpmtmr);
-	vm->vpmtmr = NULL;
-	vatpit_cleanup(vm->vatpit);
-	vm->vatpit = NULL;
-	vhpet_cleanup(vm->vhpet);
-	vm->vhpet = NULL;
-	if (vm->vrtc) {
+	if ((qemu_mode_mask & 1) != 0 && vm->vpmtmr != NULL) {
+		vpmtmr_cleanup(vm->vpmtmr);
+		vm->vpmtmr = NULL;
+	}
+	if ((qemu_mode_mask & 2) != 0 && vm->vatpit != NULL) {
+		vatpit_cleanup(vm->vatpit);
+		vm->vatpit = NULL;
+	}
+	if ((qemu_mode_mask & 4) != 0 && vm->vhpet != NULL) {
+		vhpet_cleanup(vm->vhpet);
+		vm->vhpet = NULL;
+	}
+	if ((qemu_mode_mask & 8) != 0 && vm->vrtc != NULL) {
 		vrtc_cleanup(vm->vrtc);
 		vm->vrtc = NULL;
 	}
+	printf("vmm: setup_qemu_mode mask=0x%x -> vpmtmr=%p vatpit=%p "
+	    "vhpet=%p vrtc=%p\n", qemu_mode_mask, vm->vpmtmr, vm->vatpit,
+	    vm->vhpet, vm->vrtc);
 }
 
 int
@@ -1196,7 +1233,7 @@ vm_run(struct vcpu *vcpu)
 	struct pcb *pcb;
 	uint64_t tscval;
 	struct vm_exit *vme;
-	bool retu, intr_disabled __unused;
+	bool retu, intr_disabled;
 	pmap_t pmap;
 	int vmexit_count = 0;
 
@@ -1254,10 +1291,33 @@ restart:
 			break;
 		case VM_EXITCODE_HLT:
 			/*
-			 * Return HLT to userspace so QEMU can handle
-			 * timer ticks and re-inject interrupts.
+			 * claude 14/10/2026 -- riportata dall'albero
+			 * bhyve-native-gpu-16 (il modulo che l'utente
+			 * caricava si chiamava vmm-restore-"HLT"-mirrorfix:
+			 * questo e' l'"hlt").  Il ribasamento su main di
+			 * ottobre l'aveva persa, perche' il ramo di giugno
+			 * non la conteneva ancora.
 			 */
-			retu = true;
+			if (vm->flags & VM_OP_F_QEMU) {
+				/*
+				 * Return HLT to userspace so QEMU can handle
+				 * timer ticks and re-inject interrupts.
+				 */
+				retu = true;
+			} else {
+				/*
+				 * bhyve nativo: il kernel fa DORMIRE la vCPU
+				 * finche' non c'e' un interrupt, come a monte.
+				 * Il "retu = true" senza condizione era scritto
+				 * per il giro di QEMU ma si applicava a OGNI
+				 * modo: senza questo ramo ogni HLT del guest
+				 * tornava in spazio utente invece di bloccarsi,
+				 * e tutte le vCPU restavano al ~100% ciascuna
+				 * con il guest inattivo.
+				 */
+				intr_disabled = ((vme->u.hlt.rflags & PSL_I) == 0);
+				error = vm_handle_hlt(vcpu, intr_disabled, &retu);
+			}
 			break;
 		case VM_EXITCODE_PAGING:
 			error = vm_handle_paging(vcpu, &retu);
@@ -1300,6 +1360,28 @@ restart:
 		vmexit_count++;
 		if (vmexit_count >= 4096) {
 			retu = true;
+			/*
+			 * claude 14/10/2026 -- inst_length VA AZZERATO.
+			 *
+			 * Lo spazio utente lo pretende: vmexit_bogus() in
+			 * usr.sbin/bhyve/amd64/vmexit.c fa
+			 * assert(vm_exit->inst_length == 0) e senza questa
+			 * riga bhyve ABORTISCE (SIGABRT) appena il giro
+			 * arriva a 4096.  E' corretto anche nel merito: un'
+			 * uscita BOGUS vuol dire "non e' successo niente,
+			 * rientra", e la ripresa usa vcpu->nextrip, che il
+			 * kernel ha gia' avanzato -- lasciare qui la lunghezza
+			 * dell'ultima istruzione farebbe saltare un'istruzione
+			 * che non e' stata eseguita.  Stesso schema di
+			 * vm_exit_astpending() poche righe sopra.
+			 *
+			 * Il difetto c'era da prima ma non si vedeva: finche'
+			 * ogni VM_EXITCODE_HLT faceva "retu = true" senza
+			 * condizione, il giro non accumulava mai 4096 uscite.
+			 * Rimettendo la gestione di HLT dentro il kernel per
+			 * bhyve nativo (vedi sopra) il contatore ci arriva.
+			 */
+			vme->inst_length = 0;
 			vme->exitcode = VM_EXITCODE_BOGUS;
 		} else {
 			if ((vmexit_count & 63) == 0)

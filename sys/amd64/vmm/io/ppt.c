@@ -136,6 +136,30 @@ struct pptdev {
 	} msix;
 
 	struct uppt_cdev_state	*uppt_cdev;	/* /dev/pptN userspace interface */
+
+	/*
+	 * ★ claude 14/10/2026 -- I BAR SI MISURANO UNA VOLTA SOLA, ALL'ATTACH.
+	 *
+	 * Misurare un BAR vuol dire scriverci 0xFFFFFFFF e rileggere la
+	 * maschera: finche' c'e' quel valore il dispositivo si dichiara
+	 * padrone di un intervallo enorme.  Se la decodifica di memoria e'
+	 * ACCESA quell'intervallo si sovrappone alla RAM e ogni accesso della
+	 * CPU finisce nella GPU: l'host muore sul posto, senza panic e senza
+	 * una riga di registro.
+	 *
+	 * Prima la misura stava dentro UPPT_GET_BAR_INFO, che si fida di
+	 * ppt->vm == NULL e ASSUME che MEMEN sia spenta.  Qui invece si misura
+	 * una volta, in ppt_attach, dopo averla spenta per davvero, e poi
+	 * l'ioctl e la mmap leggono solo questi valori.
+	 */
+	struct {
+		uint64_t	base;		/* indirizzo fisico */
+		uint64_t	size;		/* dimensione in byte */
+		bool		valid;		/* questo BAR esiste */
+		bool		is_mmio;	/* memoria, non porte di I/O */
+		bool		is_64bit;
+		bool		is_prefetch;
+	} bar[6];
 };
 
 SYSCTL_DECL(_hw_vmm);
@@ -196,61 +220,28 @@ uppt_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 	case UPPT_GET_BAR_INFO: {
 		struct uppt_bar_info *bi = (struct uppt_bar_info *)data;
 		int bar = bi->bar;
-		uint32_t lo, hi, probe, probe_hi;
-		uint64_t base, size;
 
 		if (bar < 0 || bar > 5)
 			return (EINVAL);
 
-		lo = pci_read_config(dev, PCIR_BAR(bar), 4);
-		if (lo == 0 || lo == 0xFFFFFFFF)
+		/*
+		 * ★ claude 14/10/2026 -- NON si misura piu' qui.
+		 *
+		 * Prima questo ioctl scriveva 0xFFFFFFFF nei BAR del
+		 * dispositivo per rileggerne la maschera, fidandosi che
+		 * MEMEN fosse spenta.  Adesso i valori li ha gia' misurati
+		 * ppt_probe_bars() all'attach, nell'unico momento in cui si
+		 * puo' farlo senza rischiare l'host, e qui si leggono e
+		 * basta: l'ioctl non tocca piu' la configurazione PCI.
+		 */
+		if (!ppt->bar[bar].valid)
 			return (ENOENT);
 
-		bi->is_mmio     = !(lo & PCIM_BAR_IO_SPACE);
-		bi->is_64bit    = bi->is_mmio &&
-		    ((lo & PCIM_BAR_MEM_TYPE) == PCIM_BAR_MEM_64);
-		bi->is_prefetch = bi->is_mmio && !!(lo & PCIM_BAR_MEM_PREFETCH);
-
-		if (bi->is_mmio) {
-			base = lo & ~0xFULL;
-			hi = 0;
-			if (bi->is_64bit && bar < 5) {
-				hi = pci_read_config(dev, PCIR_BAR(bar + 1), 4);
-				base |= ((uint64_t)hi << 32);
-			}
-		} else {
-			base = lo & ~0x3ULL;
-		}
-		bi->phys_addr = base;
-
-		/*
-		 * BAR size probe: safe only when device is not in a VM
-		 * (MEMEN/PORTEN already disabled by ppt_attach).
-		 */
-		if (ppt->vm == NULL) {
-			pci_write_config(dev, PCIR_BAR(bar), 0xFFFFFFFF, 4);
-			probe = pci_read_config(dev, PCIR_BAR(bar), 4);
-			pci_write_config(dev, PCIR_BAR(bar), lo, 4);
-
-			if (bi->is_64bit && bar < 5) {
-				pci_write_config(dev, PCIR_BAR(bar + 1),
-				    0xFFFFFFFF, 4);
-				probe_hi = pci_read_config(dev,
-				    PCIR_BAR(bar + 1), 4);
-				pci_write_config(dev, PCIR_BAR(bar + 1),
-				    hi, 4);
-				size = ~((((uint64_t)probe_hi << 32) |
-				    (probe & ~0xFULL))) + 1;
-			} else if (bi->is_mmio) {
-				size = ~(probe & ~0xFULL) + 1;
-			} else {
-				size = (~(probe & ~0x3ULL) + 1) & 0xFFFF;
-			}
-			bi->size = size;
-		} else {
-			/* device in VM: can't safely probe size */
-			bi->size = 0;
-		}
+		bi->phys_addr   = ppt->bar[bar].base;
+		bi->size        = ppt->bar[bar].size;
+		bi->is_mmio     = ppt->bar[bar].is_mmio;
+		bi->is_64bit    = ppt->bar[bar].is_64bit;
+		bi->is_prefetch = ppt->bar[bar].is_prefetch;
 		break;
 	}
 
@@ -281,31 +272,40 @@ uppt_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
     int prot, vm_memattr_t *memattr)
 {
 	struct pptdev *ppt = cdev->si_drv1;
-	device_t dev = ppt->dev;
 	int bar;
-	uint32_t lo;
 
 	if (ppt->vm != NULL)
 		return (EBUSY);
 
-	/* verify offset falls within one of the device's MMIO BARs */
+	/*
+	 * ★★ claude 14/10/2026 -- SERVE ANCHE IL LIMITE SUPERIORE.
+	 *
+	 * Prima il controllo era soltanto
+	 *
+	 *     if (offset >= base) { *paddr = offset; return (0); }
+	 *
+	 * cioe' bastava che l'offset stesse SOPRA la base del primo BAR
+	 * trovato.  Senza un limite in alto, qualunque offset piu' grande
+	 * veniva accettato e mappato: non la MMIO della scheda, ma memoria
+	 * fisica qualsiasi -- la RAM, le tabelle dell'IOMMU, i registri di
+	 * un altro dispositivo -- e per di piu' marcata non cacheabile.
+	 * Toccare cosi' il LAPIC o i registri del chipset pianta la macchina
+	 * senza lasciare una riga.
+	 *
+	 * Ora l'offset deve cadere DENTRO un BAR misurato all'attach, e il
+	 * confronto si fa sulla dimensione vera.
+	 */
 	for (bar = 0; bar <= 5; bar++) {
-		uint64_t base;
-		uint32_t hi;
+		uint64_t base, size;
 
-		lo = pci_read_config(dev, PCIR_BAR(bar), 4);
-		if (lo == 0 || lo == 0xFFFFFFFF || (lo & PCIM_BAR_IO_SPACE))
+		if (!ppt->bar[bar].valid || !ppt->bar[bar].is_mmio)
 			continue;
 
-		base = lo & ~0xFULL;
-		if ((lo & PCIM_BAR_MEM_TYPE) == PCIM_BAR_MEM_64 && bar < 5) {
-			hi = pci_read_config(dev, PCIR_BAR(bar + 1), 4);
-			base |= ((uint64_t)hi << 32);
-		}
-		if (base == 0)
-			continue;
+		base = ppt->bar[bar].base;
+		size = ppt->bar[bar].size;
 
-		if (offset >= base) {
+		if ((uint64_t)offset >= base &&
+		    (uint64_t)offset < base + size) {
 			*paddr   = offset;
 			*memattr = VM_MEMATTR_UNCACHEABLE;
 			return (0);
@@ -397,6 +397,96 @@ ppt_probe(device_t dev)
 		return (BUS_PROBE_NOWILDCARD);
 }
 
+/*
+ * ppt_probe_bars: misura i sei BAR una volta sola e li mette in cache.
+ *                                                  [claude 14/10/2026]
+ *
+ * Da chiamare SOLO con la decodifica di memoria e di I/O gia' spenta
+ * (ppt_attach lo fa subito prima).  Per sicurezza lo verifica e, se le
+ * trova accese, le spegne per la durata della misura e le rimette come
+ * stavano: cosi' la funzione e' innocua anche se un domani qualcuno la
+ * chiamasse da un altro punto.
+ */
+static void
+ppt_probe_bars(struct pptdev *ppt)
+{
+	device_t dev = ppt->dev;
+	uint16_t cmd, cmd_salvato;
+	int bar;
+
+	cmd_salvato = pci_read_config(dev, PCIR_COMMAND, 2);
+	cmd = cmd_salvato & ~(PCIM_CMD_PORTEN | PCIM_CMD_MEMEN);
+	if (cmd != cmd_salvato)
+		pci_write_config(dev, PCIR_COMMAND, cmd, 2);
+
+	for (bar = 0; bar <= 5; bar++) {
+		uint32_t lo, hi, probe, probe_hi;
+		uint64_t base, size;
+
+		ppt->bar[bar].valid = false;
+
+		lo = pci_read_config(dev, PCIR_BAR(bar), 4);
+		if (lo == 0 || lo == 0xFFFFFFFF)
+			continue;
+
+		ppt->bar[bar].is_mmio = !(lo & PCIM_BAR_IO_SPACE);
+		ppt->bar[bar].is_64bit = ppt->bar[bar].is_mmio &&
+		    ((lo & PCIM_BAR_MEM_TYPE) == PCIM_BAR_MEM_64);
+		ppt->bar[bar].is_prefetch = ppt->bar[bar].is_mmio &&
+		    !!(lo & PCIM_BAR_MEM_PREFETCH);
+
+		hi = 0;
+		if (ppt->bar[bar].is_mmio) {
+			base = lo & ~0xFULL;
+			if (ppt->bar[bar].is_64bit && bar < 5) {
+				hi = pci_read_config(dev, PCIR_BAR(bar + 1), 4);
+				base |= ((uint64_t)hi << 32);
+			}
+		} else {
+			base = lo & ~0x3ULL;
+		}
+
+		pci_write_config(dev, PCIR_BAR(bar), 0xFFFFFFFF, 4);
+		probe = pci_read_config(dev, PCIR_BAR(bar), 4);
+		pci_write_config(dev, PCIR_BAR(bar), lo, 4);
+
+		if (ppt->bar[bar].is_64bit && bar < 5) {
+			pci_write_config(dev, PCIR_BAR(bar + 1), 0xFFFFFFFF, 4);
+			probe_hi = pci_read_config(dev, PCIR_BAR(bar + 1), 4);
+			pci_write_config(dev, PCIR_BAR(bar + 1), hi, 4);
+			size = ~((((uint64_t)probe_hi << 32) |
+			    (probe & ~0xFULL))) + 1;
+		} else if (ppt->bar[bar].is_mmio) {
+			size = ~(probe & ~0xFULL) + 1;
+		} else {
+			size = (~(probe & ~0x3ULL) + 1) & 0xFFFF;
+		}
+
+		/*
+		 * Dimensione o base nulle vogliono dire che il BAR non c'e'
+		 * davvero (o che e' la meta' alta di uno a 64 bit): meglio
+		 * scartarlo che lasciar passare una mmap su di esso.
+		 */
+		if (size == 0 || base == 0)
+			continue;
+
+		ppt->bar[bar].base = base;
+		ppt->bar[bar].size = size;
+		ppt->bar[bar].valid = true;
+
+		if (bootverbose)
+			device_printf(dev,
+			    "BAR%d %s base 0x%jx size 0x%jx%s%s\n", bar,
+			    ppt->bar[bar].is_mmio ? "mem" : "io",
+			    (uintmax_t)base, (uintmax_t)size,
+			    ppt->bar[bar].is_64bit ? " 64bit" : "",
+			    ppt->bar[bar].is_prefetch ? " prefetch" : "");
+	}
+
+	if (cmd != cmd_salvato)
+		pci_write_config(dev, PCIR_COMMAND, cmd_salvato, 2);
+}
+
 static int
 ppt_attach(device_t dev)
 {
@@ -419,6 +509,8 @@ ppt_attach(device_t dev)
 	num_pptdevs++;
 	TAILQ_INSERT_TAIL(&pptdev_list, ppt, next);
 	ppt->dev = dev;
+	/* MEMEN/PORTEN sono spente qui sopra: e' il solo momento sicuro. */
+	ppt_probe_bars(ppt);
 	PPT_UNLOCK();
 
 	/* uppt: create /dev/pptN character device */

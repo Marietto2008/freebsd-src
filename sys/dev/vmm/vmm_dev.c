@@ -1349,8 +1349,49 @@ devmem_mmap_single(struct cdev *cdev, vm_ooffset_t *offset, vm_size_t len,
 	vm_slock_memsegs(dsc->sc->vm);
 
 	error = vm_get_memseg(dsc->sc->vm, dsc->segid, &seglen, &sysmem, objp);
-	KASSERT(error == 0 && !sysmem && *objp != NULL,
-	    ("%s: invalid devmem segment %d", __func__, dsc->segid));
+	/*
+	 * ★★★★ claude 15/10/2026 -- L'INVARIANTE DI BHYVE ORIGINALE QUI NON VALE.
+	 *
+	 * L'assertion pretendeva !sysmem: in bhyve originale un segmento con
+	 * NOME e' sempre devmem, mai memoria di sistema.  Ma alloc_memseg(),
+	 * poco sopra in questo stesso file, in modalita' QEMU fa l'opposto DI
+	 * PROPOSITO:
+	 *
+	 *     if (!(vmflags & VM_OP_F_QEMU))
+	 *             sysmem = false;        <- in modalita' QEMU resta TRUE
+	 *
+	 * perche' la RAM del guest di QEMU (segmenti con nome, tipo "pc.ram")
+	 * dev'essere memoria di SISTEMA, altrimenti vm_iommu_map() non le crea
+	 * le mappature IOMMU e il DMA della GPU passata non funziona.  Pero'
+	 * subito dopo gli crea comunque il cdev devmem, perche' lo spazio
+	 * utente (vm_create_devmem in libvmmapi) mappa la memoria proprio da
+	 * li'.  Risultato: un cdev devmem che copre un segmento sysmem --
+	 * legittimo in questo albero, impossibile in bhyve originale.
+	 *
+	 * Con INVARIANTS la KASSERT spara e la macchina PANICA:
+	 *
+	 *     panic: devmem_mmap_single: invalid devmem segment 1
+	 *
+	 * ⚠ E' la causa degli OTTO "congelamenti muti" del 14-15/10: non erano
+	 *   blocchi, erano panic invisibili, perche' debug.debugger_on_panic
+	 *   era a 1 (il kernel restava fermo in ddb) e la console e' il
+	 *   framebuffer Intel, che era in stato rotto.  Messo
+	 *   debugger_on_panic=0, il primo tentativo ha prodotto il dump che
+	 *   nomina questa riga.
+	 *
+	 * La correzione e' far dire all'assertion l'invariante VERO di questo
+	 * albero: un segmento sysmem dietro un cdev devmem si accetta, ma
+	 * SOLO in modalita' QEMU.  Fuori da li' resta l'invariante di monte.
+	 */
+	{
+		int vmflags = 0;
+
+		vm_get_flags(dsc->sc->vm, &vmflags);
+		KASSERT(error == 0 && *objp != NULL &&
+		    (!sysmem || (vmflags & VM_OP_F_QEMU) != 0),
+		    ("%s: invalid devmem segment %d (sysmem=%d flags=%#x)",
+		    __func__, dsc->segid, (int)sysmem, vmflags));
+	}
 
 	if (seglen >= last)
 		vm_object_reference(*objp);
