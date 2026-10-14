@@ -52,6 +52,11 @@ int passthru_cfgwrite_default(struct passthru_softc *sc, struct pci_devinst *pi,
     int coff, int bytes, uint32_t val);
 int passthru_cfgwrite_emulate(struct passthru_softc *sc, struct pci_devinst *pi,
     int coff, int bytes, uint32_t val);
+/* claude 14/10/2026: le due vie usate dallo specchio NVIDIA (BAR0+0x88000). */
+int passthru_cfgwrite_virt(struct passthru_softc *sc, struct pci_devinst *pi,
+    int coff, int bytes, uint32_t val);
+void passthru_write_config(const struct pcisel *sel, long reg, int width,
+    uint32_t data);
 struct passthru_mmio_mapping *passthru_get_mmio(struct passthru_softc *sc,
     int num);
 struct pcisel *passthru_get_sel(struct passthru_softc *sc);

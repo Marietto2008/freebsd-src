@@ -234,7 +234,12 @@ host_write_config(int fd, const struct pcisel *sel, long reg, int width,
 	(void)ioctl(fd, PCIOCWRITE, &pi);		/* XXX */
 }
 
-static void
+/*
+ * claude 14/10/2026 -- non piu' static: la usa lo specchio di configurazione
+ * NVIDIA in pci_passthru_quirks.c per lo spazio di configurazione ESTESO
+ * (off > PCI_REGMAX), che non passa dalla catena dei gestori.
+ */
+void
 passthru_write_config(const struct pcisel *sel, long reg, int width,
     uint32_t data)
 {
@@ -1743,6 +1748,30 @@ passthru_cfgwrite_emulate(struct passthru_softc *sc __unused,
 	return (-1);
 }
 
+/*
+ * claude 14/10/2026 -- riportata dall'albero bhyve-native-gpu-16 (e' il
+ * "mirrorfix" nel nome del modulo che l'utente caricava).  Il ribasamento su
+ * main di ottobre l'aveva persa, perche' il ramo di giugno non la conteneva.
+ *
+ * Fa quello che fa la passthru_cfgwrite() qui sotto, ma e' chiamabile da
+ * fuori: serve agli specchi dello spazio di configurazione dentro un BAR
+ * (NVIDIA a BAR0+0x88000).  nvidia.ko/GSP scrive ATTRAVERSO lo specchio
+ * invece di usare cicli di configurazione normali -- abilitazione MSI-X
+ * compresa.  Senza questa via quelle scritture venivano buttate via in
+ * silenzio: vm_setup_pptdev_msi()/vm_setup_pptdev_msix() non venivano mai
+ * chiamate, l'IOMMU non rimappava gli interrupt, e l'autoverifica
+ * dell'interrupt della GPU non si concludeva mai.
+ */
+int
+passthru_cfgwrite_virt(struct passthru_softc *sc, struct pci_devinst *pi,
+    int coff, int bytes, uint32_t val)
+{
+	if (sc->psc_pcir_whandler[coff] != NULL)
+		return (sc->psc_pcir_whandler[coff](sc, pi, coff, bytes, val));
+
+	return (passthru_cfgwrite_default(sc, pi, coff, bytes, val));
+}
+
 static int
 passthru_cfgwrite(struct pci_devinst *pi, int coff, int bytes, uint32_t val)
 {
@@ -1793,9 +1822,24 @@ passthru_write_locked(struct pci_devinst *pi, int baridx, uint64_t offset,
 			errx(4, "passthru_write: bad size=%d bar=%d off=0x%lx",
 			    size, baridx, offset);
 		if (size == 8) {
+			/*
+			 * ⚠ claude 14/10/2026 -- le varianti _locked, NON
+			 * passthru_write()/passthru_read().
+			 *
+			 * A monte passthru_write()/read() ora prendono
+			 * sc->psc_io_mtx e poi chiamano la _locked.  Siamo
+			 * GIA' dentro quel mutex: richiamare la versione
+			 * esterna lo riprenderebbe e andrebbe in STALLO al
+			 * primo accesso a 8 byte del guest.
+			 * Nella base di ottobre 2025 il mutex non esisteva
+			 * (psc_io_mtx/psc_resetting: zero occorrenze), per
+			 * questo la ricorsione era innocua.
+			 */
 			/* Split 8-byte write into two 4-byte ops */
-			passthru_write(pi, baridx, offset, 4, value & 0xffffffffU);
-			passthru_write(pi, baridx, offset + 4, 4, value >> 32);
+			passthru_write_locked(pi, baridx, offset, 4,
+			    value & 0xffffffffU);
+			passthru_write_locked(pi, baridx, offset + 4, 4,
+			    value >> 32);
 			return;
 		}
 
@@ -1868,8 +1912,23 @@ passthru_read_locked(struct pci_devinst *pi, int baridx, uint64_t offset,
 			    size, baridx, offset);
 		if (size == 8) {
 			/* Split 8-byte read into two 4-byte ops */
-			uint64_t lo = passthru_read(pi, baridx, offset, 4);
-			uint64_t hi = passthru_read(pi, baridx, offset + 4, 4);
+			/*
+			 * ⚠ claude 14/10/2026 -- le varianti _locked, NON
+			 * passthru_write()/passthru_read().
+			 *
+			 * A monte passthru_write()/read() ora prendono
+			 * sc->psc_io_mtx e poi chiamano la _locked.  Siamo
+			 * GIA' dentro quel mutex: richiamare la versione
+			 * esterna lo riprenderebbe e andrebbe in STALLO al
+			 * primo accesso a 8 byte del guest.
+			 * Nella base di ottobre 2025 il mutex non esisteva
+			 * (psc_io_mtx/psc_resetting: zero occorrenze), per
+			 * questo la ricorsione era innocua.
+			 */
+			uint64_t lo = passthru_read_locked(pi, baridx,
+			    offset, 4);
+			uint64_t hi = passthru_read_locked(pi, baridx,
+			    offset + 4, 4);
 			return (lo | (hi << 32));
 		}
 
@@ -1964,7 +2023,18 @@ passthru_mmio_map(struct pci_devinst *pi, int baridx, int enabled,
 	return (0);
 }
 
-static void
+/*
+ * ⚠ claude 14/10/2026 -- NON e' morta per sbaglio: e' il ramo vmm-qemu-mods
+ * che la scavalca di proposito.  passthru_addr() qui sotto usa SEMPRE
+ * passthru_mmio_addr(), perche' solo cosi' i gestori di sotto-regione dei
+ * BAR (il config-mirror NVIDIA a BAR0+0x88000, il gestore fittizio della
+ * tabella MSI-X) restano onorati e le loro pagine non mappate in EPT.
+ * A monte invece passthru_addr() la chiama quando baridx e' il BAR della
+ * MSI-X.  Si tiene la versione locale -- e' quella che fa funzionare il
+ * passthrough della GPU -- e la funzione si marca inutilizzata, altrimenti
+ * -Werror ferma la compilazione.
+ */
+static void __unused
 passthru_msix_addr(struct pci_devinst *pi, int baridx, int enabled,
     uint64_t address)
 {

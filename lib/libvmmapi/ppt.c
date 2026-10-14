@@ -62,6 +62,35 @@ vm_unassign_pptdev(struct vmctx *ctx, int bus, int slot, int func)
 	return (ioctl(ctx->fd, VM_UNBIND_PPTDEV, &pptdev));
 }
 
+/*
+ * claude 14/10/2026 -- riportata dall'albero bhyve-native-gpu-16: il
+ * ribasamento su main di ottobre l'aveva persa (il lato KERNEL c'era --
+ * ioctl 123 in vmm_dev.h, il caso in vmm_dev_machdep.c -- ma non la via
+ * per chiamarlo dallo spazio utente).
+ *
+ * Secondary Bus Reset per un dispositivo passthrough che in questo momento
+ * NON e' assegnato a nessuna VM.  Serve ai dispositivi (certe NVIDIA) che
+ * dopo un semplice FLR o un cambio di stato di alimentazione non restano
+ * in uno stato pulito, e al ricaricamento del modulo vmm o al rilancio
+ * della VM piantano l'ospite.  Si chiama DOPO vm_unassign_pptdev() o la
+ * distruzione della VM, PRIMA del prossimo bind/avvio.
+ *
+ * Nota: e' diverso dal vm_reset_pptdev() di monte qui sotto, che agisce su
+ * un dispositivo gia' assegnato.
+ */
+int
+vm_ppt_sbr_device(struct vmctx *ctx, int bus, int slot, int func)
+{
+	struct vm_pptdev pptdev;
+
+	bzero(&pptdev, sizeof(pptdev));
+	pptdev.bus = bus;
+	pptdev.slot = slot;
+	pptdev.func = func;
+
+	return (ioctl(ctx->fd, VM_PPT_SBR_DEVICE, &pptdev));
+}
+
 int
 vm_reset_pptdev(struct vmctx *ctx, int bus, int slot, int func)
 {

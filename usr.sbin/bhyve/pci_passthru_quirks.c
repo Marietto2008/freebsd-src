@@ -19,7 +19,11 @@
 /*
  * NVIDIA GPUs mirror their PCI config space at BAR0+0x88000.
  * Intercept reads from that region and forward them to the host PCI config.
- * Writes are silently ignored (read-only mirror).
+ * nvidia.ko/GSP scrive ANCHE attraverso questo specchio invece di usare
+ * cicli di configurazione PCI normali (abilitazione MSI-X compresa), quindi
+ * le scritture vanno instradate nella stessa catena di gestori che userebbe
+ * una scrittura di configurazione normale.  claude 14/10/2026: riportato
+ * dall'albero bhyve-native-gpu-16, il ribasamento l'aveva perso.
  */
 static uint64_t
 pci_config_mirror_read(struct pci_devinst *const pi, int baridx __unused,
@@ -42,11 +46,29 @@ pci_config_mirror_read(struct pci_devinst *const pi, int baridx __unused,
 }
 
 static void
-pci_config_mirror_write(struct pci_devinst *const pi __unused,
-    int baridx __unused, uint64_t off __unused, int size __unused,
-    uint64_t val __unused)
+pci_config_mirror_write(struct pci_devinst *const pi, int baridx __unused,
+    uint64_t off, int size, uint64_t val)
 {
-	/* read-only mirror — silently ignore writes */
+	struct passthru_softc *sc = pi->pi_arg;
+
+	/*
+	 * Spazio di configurazione standard: lo si fa passare per la stessa
+	 * catena di gestori di una scrittura di configurazione normale, cosi'
+	 * le scritture sulle capacita' MSI/MSI-X vengono riconosciute e
+	 * vm_setup_pptdev_msi()/vm_setup_pptdev_msix() vengono chiamate a
+	 * impostare la rimappatura degli interrupt nell'IOMMU.  Senza, GSP
+	 * abilita MSI-X nello specchio, bhyve non lo vede mai, nessuna
+	 * rimappatura viene impostata, e l'autoverifica dell'interrupt della
+	 * GPU non si conclude.
+	 */
+	if (off <= PCI_REGMAX) {
+		(void)passthru_cfgwrite_virt(sc, pi, (int)off, size,
+		    (uint32_t)val);
+		return;
+	}
+	/* Spazio di configurazione ESTESO: diritto al dispositivo fisico. */
+	passthru_write_config(passthru_get_sel(sc), (long)off, size,
+	    (uint32_t)val);
 }
 
 static int

@@ -78,6 +78,8 @@ static int vm_suspend_opt;
 #endif
 
 static int get_all;
+/* claude 14/10/2026: --pptdev-sbr, riportata da bhyve-native-gpu-16. */
+static const char *pptdev_sbr_spec;
 
 enum {
 	VMNAME = OPT_START,	/* avoid collision with return values from getopt */
@@ -85,6 +87,7 @@ enum {
 	SET_MEM,
 	SET_CAP,
 	CAPNAME,
+	PPTDEV_SBR,
 #ifdef BHYVE_SNAPSHOT
 	SET_CHECKPOINT_FILE,
 	SET_SUSPEND_FILE,
@@ -123,6 +126,7 @@ setup_options(void)
 		{ "cpu",	REQ_ARG,	0,	VCPU },
 		{ "set-mem",	REQ_ARG,	0,	SET_MEM },
 		{ "capname",	REQ_ARG,	0,	CAPNAME },
+		{ "pptdev-sbr",	REQ_ARG,	0,	PPTDEV_SBR },
 		{ "setcap",	REQ_ARG,	0,	SET_CAP },
 		{ "getcap",	NO_ARG,		&getcap,	1 },
 		{ "get-stats",	NO_ARG,		&get_stats,	1 },
@@ -427,6 +431,9 @@ main(int argc, char *argv[])
 		case CAPNAME:
 			capname = optarg;
 			break;
+		case PPTDEV_SBR:
+			pptdev_sbr_spec = optarg;
+			break;
 #ifdef BHYVE_SNAPSHOT
 		case SET_CHECKPOINT_FILE:
 		case SET_SUSPEND_FILE:
@@ -590,6 +597,26 @@ main(int argc, char *argv[])
 			bhyvectl_dump_vm_run_exitcode(&vmexit, vcpuid);
 		else
 			printf("vm_run error %d\n", error);
+	}
+
+	if (!error && pptdev_sbr_spec) {
+		int bus, slot, func;
+
+		if (sscanf(pptdev_sbr_spec, "%d/%d/%d", &bus, &slot,
+		    &func) != 3) {
+			fprintf(stderr, "invalid --pptdev-sbr spec \"%s\", "
+			    "expected bus/slot/func\n", pptdev_sbr_spec);
+			error = 1;
+		} else {
+			error = vm_ppt_sbr_device(ctx, bus, slot, func);
+			if (error != 0)
+				fprintf(stderr,
+				    "pptdev-sbr %d/%d/%d failed: %s\n",
+				    bus, slot, func, strerror(errno));
+			else
+				printf("pptdev-sbr %d/%d/%d: OK\n", bus,
+				    slot, func);
+		}
 	}
 
 	if (!error && force_reset)

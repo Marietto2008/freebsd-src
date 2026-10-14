@@ -220,6 +220,8 @@ int	vm_set_capability(struct vcpu *vcpu, enum vm_cap_type cap,
 int	vm_assign_pptdev(struct vmctx *ctx, int bus, int slot, int func);
 int	vm_unassign_pptdev(struct vmctx *ctx, int bus, int slot, int func);
 int	vm_reset_pptdev(struct vmctx *ctx, int bus, int slot, int func);
+/* claude 14/10/2026: Secondary Bus Reset, locale.  Vedi ppt.c. */
+int	vm_ppt_sbr_device(struct vmctx *ctx, int bus, int slot, int func);
 int	vm_map_pptdev_mmio(struct vmctx *ctx, int bus, int slot, int func,
 			   vm_paddr_t gpa, size_t len, vm_paddr_t hpa);
 int	vm_unmap_pptdev_mmio(struct vmctx *ctx, int bus, int slot, int func,

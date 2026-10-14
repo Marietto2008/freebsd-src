@@ -99,7 +99,10 @@ options	TCP_HHOOK
 options	TCP_BLACKBOX
 options	TCP_OFFLOAD
 options	FIB_ALGO
-options	ROUTE_MPATH
+# ⚠ claude 13/10/2026: ROUTE_MPATH ritirata a monte (non e piu in
+# sys/conf/options ne in GENERIC): il multipath di routing ora e
+# incondizionato. Lasciarla fa fallire config(8) prima di compilare.
+#options	ROUTE_MPATH
 options	IPSEC_OFFLOAD
 options	IPSEC_SUPPORT
 options	INET6
@@ -195,12 +198,19 @@ device	ice
 device	vmx
 device	axp
 device	bxe
-device	le
+# ⚠ claude 13/10/2026: il driver "le" (AMD Lance/PCnet) e stato rimosso
+# da FreeBSD: config(8) si ferma se resta dichiarato.
+#device	le
 device	ti
 device	mlx5
 device	mlxfw
 device	mlx5en
 device	miibus
+# ⚠ claude 13/10/2026: a monte dev/ixgbe/if_ix.c include ora mdio_if.h,
+# generato da dev/mdio/mdio_if.m che sys/conf/files dichiara
+# "optional miiproxy | mdio".  Senza questa riga la compilazione di `ix`
+# si ferma con "mdio_if.h file not found".  GENERIC di ottobre ce l'ha.
+device	mdio
 device	ae
 device	age
 device	alc
