@@ -1201,6 +1201,7 @@ vmx_vcpu_init(void *vmi, struct vcpu *vcpu1, int vcpuid)
 	    M_WAITOK | M_ZERO);
 
 	vmcs = vcpu->vmcs;
+	vcpu->vmcs01 = vcpu->vmcs;	/* T2.1: finora vmcs == vmcs01 */
 	vmcs->identifier = vmx_revision();
 	error = vmclear(vmcs);
 	if (error != 0) {

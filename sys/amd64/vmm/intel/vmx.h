@@ -128,7 +128,8 @@ struct vmx_nested;	/* vmx_nested.h (T1.3) */
 struct vmx_vcpu {
 	struct vmx	*vmx;
 	struct vcpu	*vcpu;
-	struct vmcs	*vmcs;
+	struct vmcs	*vmcs;		/* VMCS corrente (01 o, in L2, 02) */
+	struct vmcs	*vmcs01;	/* VMCS dell'L1 (T2.1), da ripristinare dopo L2 */
 	struct apic_page *apic_page;
 	struct pir_desc	*pir_desc;
 	uint64_t	guest_msrs[GUEST_MSR_NUM];
