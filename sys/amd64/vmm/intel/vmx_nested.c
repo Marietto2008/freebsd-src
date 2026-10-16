@@ -782,6 +782,24 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_REFLECTIONS, 1);
 }
 
+/* Legge un bit in una bitmap in memoria dell'L1 (I/O o MSR). true se
+ * impostato o se la pagina non e' accessibile (conservativo: riflette). */
+static bool
+nested_bitmap_bit(struct vmx_vcpu *vcpu, uint64_t bmgpa, uint32_t bit)
+{
+	uint8_t *b;
+	void *cookie;
+	bool set;
+
+	b = vm_gpa_hold(vcpu->vcpu, bmgpa + (bit >> 3), 1, VM_PROT_READ,
+	    &cookie);
+	if (b == NULL)
+		return (true);
+	set = (*b >> (bit & 7)) & 1;
+	vm_gpa_release(cookie);
+	return (set);
+}
+
 /*
  * Instradamento delle uscite mentre il vCPU e' in L2 (§6.4). Chiamata
  * all'inizio di vmx_exit_process. Ritorna true se l'uscita e' stata gestita
@@ -804,7 +822,54 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		if (((uint32_t)vmcs_read(VMCS_EXIT_INTR_INFO) & 0x700) ==
 		    (2 << 8))	/* type 2 = NMI */
 			return (false);
-		/* FALLTHROUGH: riflette */
+		break;			/* eccezione non-NMI -> riflette */
+	case EXIT_REASON_INOUT: {
+		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
+		uint32_t p12;
+		if (cc == NULL) break;
+		p12 = (uint32_t)vmcs12_read_field(cc, VMCS_PRI_PROC_BASED_CTLS);
+		if (p12 & PROCBASED_IO_EXITING) break;	/* uncond -> riflette */
+		if (p12 & PROCBASED_IO_BITMAPS) {
+			uint16_t port = (vmcs_read(VMCS_EXIT_QUALIFICATION) >>
+			    16) & 0xffff;
+			uint64_t bm = (port < 0x8000) ?
+			    vmcs12_read_field(cc, VMCS_IO_BITMAP_A) :
+			    vmcs12_read_field(cc, VMCS_IO_BITMAP_B);
+			if (nested_bitmap_bit(vcpu, bm, port & 0x7fff))
+				break;			/* L1 intercetta -> riflette */
+		}
+		return (false);			/* L0 gestisce con i registri di L2 */
+	}
+	case EXIT_REASON_RDMSR:
+	case EXIT_REASON_WRMSR: {
+		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
+		uint32_t p12, msr, base, bit;
+		bool wr = (reason == EXIT_REASON_WRMSR);
+		if (cc == NULL) break;
+		p12 = (uint32_t)vmcs12_read_field(cc, VMCS_PRI_PROC_BASED_CTLS);
+		if ((p12 & PROCBASED_MSR_BITMAPS) == 0) break; /* tutte -> riflette */
+		msr = (uint32_t)vmx_get_guest_reg(vcpu, VM_REG_GUEST_RCX);
+		if (msr < 0x2000) { base = wr ? 2048 : 0; bit = msr; }
+		else if (msr >= 0xc0000000 && msr < 0xc0002000)
+			{ base = wr ? 3072 : 1024; bit = msr - 0xc0000000; }
+		else break;			/* fuori range -> riflette */
+		if (nested_bitmap_bit(vcpu,
+		    vmcs12_read_field(cc, VMCS_MSR_BITMAP) + base, bit))
+			break;			/* L1 intercetta -> riflette */
+		return (false);			/* L0 gestisce con i registri di L2 */
+	}
+	case EXIT_REASON_MWAIT:
+	case EXIT_REASON_MONITOR: {
+		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
+		uint32_t p12, flag;
+		if (cc == NULL) break;
+		p12 = (uint32_t)vmcs12_read_field(cc, VMCS_PRI_PROC_BASED_CTLS);
+		flag = (reason == EXIT_REASON_MWAIT) ? PROCBASED_MWAIT_EXITING :
+		    PROCBASED_MONITOR_EXITING;
+		if (p12 & flag) break;		/* L1 intercetta -> riflette */
+		vm_inject_ud(vcpu->vcpu);	/* non intercettato -> #UD in L2 */
+		return (false);
+	}
 	case EXIT_REASON_EPT_FAULT:
 	case EXIT_REASON_EPT_MISCONFIG: {
 		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
@@ -819,9 +884,11 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		return (false);
 	}
 	default:
-		nested_reflect_to_l1(vcpu, vmexit);
-		return (true);
+		break;
 	}
+	/* ogni break qui sopra significa: rifletti all'L1 */
+	nested_reflect_to_l1(vcpu, vmexit);
+	return (true);
 }
 
 static int
