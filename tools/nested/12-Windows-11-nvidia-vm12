@@ -15,6 +15,19 @@ bhyvectl --vm=vm0:12 --destroy
 # kldload /boot/kernel/vmm.ko.orig
 # kldload /mnt/linuxulator2/freebsd-radxa-src/bhyve-nvidia-corvin/vmm-b8ee8851f-kvmspoof.ko
 # kldload /mnt/linuxulator2/freebsd-radxa-src/bhyve-native-gpu-16/build-out/vmm-restore-hlt-mirrorfix.ko
+#
+# NIDIFICAZIONE (Claude 16/10/2026): la virtualizzazione annidata vive nel
+# vmm NESTED. E' l'albero di ottobre + il codice nested, quindi porta GIA'
+# dentro le tue fix GPU/HLT: vmx.c e' IDENTICO al tree gpu-16 sui marcatori
+# del passthrough (MASK_HWINTR 3/3, VM_CAP_IPI_EXIT 2/2), piu' ~96 righe nested.
+# Carica QUESTO modulo (non il mirrorfix) PRIMA di avviare, se non e' gia' su:
+#   kldstat | grep vmm    # dev'essere il vmm-restore.ko di nested-work
+#   # se no:  kldload /mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko
+NESTED_VMM=/mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko
+if ! kldstat -q -n vmm-restore 2>/dev/null && ! kldstat -q -n vmm 2>/dev/null; then
+	echo "nessun vmm caricato: carico il vmm nested $NESTED_VMM"
+	kldload "$NESTED_VMM" || { echo "kldload del vmm nested fallito"; exit 1; }
+fi
 
 sleep 10
 
@@ -184,7 +197,12 @@ mount -t ufs /dev/$vmdisk4'p2' /mnt/$vmdisk4'p2'
 # -s 1,ahci-hd,/mnt/$vmdisk4'p2'/bhyve/img/Windows/11/Windows11.img,bootindex=1 \
 # -s 1,ahci-hd,/mnt/zroot-133/bhyve/img/Windows/Windows11.img,bootindex=1 \
 
-/mnt/linuxulator2/freebsd-radxa-src/bhyve-native-gpu-16/build-out/bhyve-hlt-mirrorfix -S -c sockets=8,cores=1,threads=1 -m 32G -w -H -A \
+# NIDIFICAZIONE: bhyve NESTED (ottobre + nested = contiene le fix GPU/HLT) e
+# '-o x86.nested_virt=true' che espone VT-x al guest -> Hyper-V/WSL2 annidati.
+# Il vecchio binario (senza nested) e' qui sotto, commentato, per tornare indietro:
+# /mnt/linuxulator2/freebsd-radxa-src/bhyve-native-gpu-16/build-out/bhyve-hlt-mirrorfix -S -c sockets=8,cores=1,threads=1 -m 32G -w -H -A \
+/mnt/linuxulator2/vm/nested-work/stage/current/sbin/bhyve -S -c sockets=8,cores=1,threads=1 -m 32G -w -H -A \
+-o x86.nested_virt=true \
 -s 0,hostbridge \
 -s 1,ahci-hd,/mnt/$vmdisk4'p2'/bhyve/img/Windows/11/Windows11.img,bootindex=1 \
 -s 2,ahci-hd,/dev/$vmdisk5 \
