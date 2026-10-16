@@ -72,6 +72,7 @@
 #include "ept.h"
 #include "vmx_cpufunc.h"
 #include "vmx.h"
+#include "vmx_nested.h"
 #include "vmx_msr.h"
 #include "x86.h"
 #include "vmx_controls.h"
@@ -3577,6 +3578,7 @@ vmx_vcpu_cleanup(void *vcpui)
 	free(vcpu->pir_desc, M_VMX);
 	free(vcpu->apic_page, M_VMX);
 	free(vcpu->vmcs, M_VMX);
+	vmx_nested_free(vcpu);
 	free(vcpu, M_VMX);
 }
 
@@ -4020,6 +4022,11 @@ vmx_setcap(void *vcpui, int type, int val)
 		if (val && vcpu->has_run &&
 		    (vcpu->cap.set & (1 << VM_CAP_NESTED_VIRT)) == 0)
 			return (EBUSY);
+		if (val) {
+			if ((retval = vmx_nested_init(vcpu)) != 0)
+				return (retval);
+		} else
+			vmx_nested_free(vcpu);
 		retval = 0;
 		break;
 	default:

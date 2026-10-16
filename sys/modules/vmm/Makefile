@@ -112,6 +112,7 @@ SRCS+=	ept.c		\
 	vmx_msr.c	\
 	vmx_support.S	\
 	vmx.c		\
+	vmx_nested.c	\
 	vtd.c
 
 # amd-specific files

@@ -69,4 +69,50 @@
 /* Larghezza max della cache VMCS12 per vCPU (voci), §T1.3. */
 #define	VMX_NESTED_MAX_VMCS12			4
 
+/* GPA "nessun VMCS12" per le voci di cache e per current_vmcs12. */
+#define	VMCS12_GPA_NONE		(~0ULL)
+/* Numero di MSR VMX virtuali esposti all'L1: 0x480..0x491. */
+#define	VMX_NESTED_NMSR		(0x491 - 0x480 + 1)
+
+#ifdef _KERNEL
+#include <sys/malloc.h>
+
+MALLOC_DECLARE(M_VMX_NESTED);
+
+struct vmx_vcpu;
+
+/*
+ * Una voce della cache VMCS12->VMCS02 (per vCPU, MAI globale: §3). I campi
+ * operativi li riempiono i task T1.7/T1.8/T2.*; qui c'e' solo il guscio.
+ */
+struct vmcs12_cache {
+	uint64_t	vmcs12_gpa;	/* GPA del VMCS12; VMCS12_GPA_NONE = libera */
+	void		*vmcs02;	/* pagina VMCS02, allocata pigramente (T1.8) */
+	int		ref_cnt;
+	int		launched;	/* launch state di questo VMCS02 */
+	bool		host_dirty;	/* host-state da ricomporre */
+	bool		control_dirty;	/* controlli da ricomporre */
+};
+
+/*
+ * Stato della virtualizzazione VMX annidata, per vCPU. Allocato quando la
+ * capability passa 0->1 (vmx_nested_init), liberato a 1->0 e al cleanup del
+ * vCPU (vmx_nested_free). Mai condiviso fra vCPU.
+ */
+struct vmx_nested {
+	bool		vmxon;		/* L1 in VMX operation (dopo VMXON) */
+	bool		in_l2;		/* il vCPU sta eseguendo in L2 */
+	bool		init_pending;	/* INIT latched per il bersaglio (§6.5.5) */
+	uint64_t	vmxon_ptr;	/* GPA della regione VMXON */
+	uint64_t	current_vmcs12;	/* GPA del VMCS12 corrente, _NONE se nessuno */
+	struct vmcs12_cache cache[VMX_NESTED_MAX_VMCS12];
+	uint64_t	vmx_msr[VMX_NESTED_NMSR];  /* MSR VMX 0x480..0x491 (T1.4) */
+	uint64_t	feature_control;	/* IA32_FEATURE_CONTROL (T1.4) */
+	char		*msr_bitmap;	/* pagina MSR bitmap fusa L0|L1 (T6.3) */
+};
+
+int	vmx_nested_init(struct vmx_vcpu *vcpu);
+void	vmx_nested_free(struct vmx_vcpu *vcpu);
+#endif /* _KERNEL */
+
 #endif /* _VMX_NESTED_H_ */

@@ -124,6 +124,7 @@ enum {
 	GUEST_MSR_NUM		/* must be the last enumeration */
 };
 
+struct vmx_nested;	/* vmx_nested.h (T1.3) */
 struct vmx_vcpu {
 	struct vmx	*vmx;
 	struct vcpu	*vcpu;
@@ -136,6 +137,7 @@ struct vmx_vcpu {
 	struct vmxstate	state;
 	struct vm_mtrr  mtrr;
 	int		has_run;	/* >0 dopo il primo vmx_run (D3/T1.2) */
+	struct vmx_nested *nested;	/* stato VMX annidato (T1.3), NULL se off */
 	int		vcpuid;
 };
 
