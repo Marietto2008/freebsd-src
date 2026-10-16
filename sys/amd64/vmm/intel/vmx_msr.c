@@ -39,6 +39,7 @@
 
 #include "vmx.h"
 #include "vmx_msr.h"
+#include "vmx_nested.h"
 #include "x86.h"
 
 static bool
@@ -433,6 +434,24 @@ vmx_rdmsr(struct vmx_vcpu *vcpu, u_int num, uint64_t *val, bool *retu)
 	case MSR_PAT:
 		*val = vcpu->guest_msrs[IDX_MSR_PAT];
 		break;
+	case MSR_IA32_FEATURE_CONTROL:
+		if (vcpu->nested != NULL)
+			*val = vcpu->nested->feature_control;
+		else
+			error = EINVAL;	/* nested off: come prima, a userland */
+		break;
+	case MSR_VMX_BASIC ... MSR_VMX_BASIC + 0x10:	/* 0x480..0x490 */
+		if (vcpu->nested != NULL)
+			*val = vcpu->nested->vmx_msr[num - MSR_VMX_BASIC];
+		else
+			error = EINVAL;
+		break;
+	case MSR_VMX_BASIC + 0x11:			/* 0x491 VMFUNC: non esposto */
+		if (vcpu->nested != NULL)
+			vm_inject_gp(vcpu->vcpu);
+		else
+			error = EINVAL;
+		break;
 	default:
 		error = EINVAL;
 		break;
@@ -501,6 +520,18 @@ vmx_wrmsr(struct vmx_vcpu *vcpu, u_int num, uint64_t val, bool *retu)
 			vcpu->guest_msrs[IDX_MSR_TSC_AUX] = val;
 		else
 			vm_inject_gp(vcpu->vcpu);
+		break;
+	case MSR_IA32_FEATURE_CONTROL:
+		if (vcpu->nested != NULL)
+			vm_inject_gp(vcpu->vcpu);	/* bloccata da LOCK */
+		else
+			error = EINVAL;
+		break;
+	case MSR_VMX_BASIC ... MSR_VMX_BASIC + 0x11:	/* MSR VMX: sola lettura */
+		if (vcpu->nested != NULL)
+			vm_inject_gp(vcpu->vcpu);
+		else
+			error = EINVAL;
 		break;
 	default:
 		error = EINVAL;

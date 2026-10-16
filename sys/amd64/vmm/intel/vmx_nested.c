@@ -20,6 +20,9 @@
 #include <sys/sdt.h>
 
 #include <machine/vmm.h>
+#include <machine/cpufunc.h>
+#include <machine/specialreg.h>
+#include <machine/md_var.h>
 
 #include "vmx.h"
 #include "vmx_nested.h"
@@ -52,6 +55,84 @@ VMM_STAT_INTEL(VMX_NESTED_VMFAIL, "VMfail restituiti all'L1");
  * Chiamata dal passaggio 0->1 della capability VM_CAP_NESTED_VIRT, in
  * contesto di processo (ioctl), quindi M_WAITOK e' ammesso.
  */
+/*
+ * Calcola i valori delle MSR di capability VMX esposti all'L1 (D4=C, set A
+ * misurato dall'host), con le esclusioni di §6.3 e i must-be-1 di D4.b.
+ * Derivati dalle MSR dell'host; il set esatto lo conferma test_vmx_caps di
+ * kvm-unit-tests sull'hardware (T1.4 "Fatto quando").  I bit potrebbero
+ * essere rifiniti dopo quel test: vedi docs/nested/T1.4.md.
+ */
+static void
+vmx_nested_init_msrs(struct vmx_nested *n)
+{
+	uint64_t basic, misc, proc2, eptcap;
+	uint64_t *m = n->vmx_msr;
+
+	/* IA32_VMX_BASIC: revisione dell'host, dimensione 4096, memtype WB,
+	 * bit 54 (report INS/OUTS) e 55 (true controls). */
+	basic = rdmsr(MSR_VMX_BASIC);
+	m[0x480 - 0x480] = (basic & 0x7fffffffULL) | (4096ULL << 32) |
+	    (6ULL << 50) | (1ULL << 54) | (1ULL << 55);
+
+	/* pin-based (legacy e true): host + ext-int(0) e NMI(3) exiting
+	 * must-be-1 nelle allowed-0 (D4.b). */
+	m[0x481 - 0x480] = rdmsr(MSR_VMX_PINBASED_CTLS)      | 0x9ULL;
+	m[0x48d - 0x480] = rdmsr(MSR_VMX_TRUE_PINBASED_CTLS) | 0x9ULL;
+
+	/* proc-based primary, exit, entry: come l'host. */
+	m[0x482 - 0x480] = rdmsr(MSR_VMX_PROCBASED_CTLS);
+	m[0x48e - 0x480] = rdmsr(MSR_VMX_TRUE_PROCBASED_CTLS);
+	m[0x483 - 0x480] = rdmsr(MSR_VMX_EXIT_CTLS);
+	m[0x48f - 0x480] = rdmsr(MSR_VMX_TRUE_EXIT_CTLS);
+	m[0x484 - 0x480] = rdmsr(MSR_VMX_ENTRY_CTLS);
+	m[0x490 - 0x480] = rdmsr(MSR_VMX_TRUE_ENTRY_CTLS);
+
+	/* MISC: host senza PT (14), SMBASE (15), VMXOFF-unblock-SMI (28) e il
+	 * rate del preemption timer (0-4). bit 29 (VMWRITE-any) resta: F0=SI. */
+	misc = rdmsr(IA32_VMX_MISC);
+	m[0x485 - 0x480] = misc & ~(0x1fULL | (1ULL << 14) | (1ULL << 15) |
+	    (1ULL << 28));
+
+	/* CR0/CR4 fixed e VMCS_ENUM: dall'host. */
+	m[0x486 - 0x480] = rdmsr(MSR_VMX_CR0_FIXED0);
+	m[0x487 - 0x480] = rdmsr(MSR_VMX_CR0_FIXED1);
+	m[0x488 - 0x480] = rdmsr(MSR_VMX_CR4_FIXED0);
+	m[0x489 - 0x480] = rdmsr(MSR_VMX_CR4_FIXED1);
+	m[0x48a - 0x480] = rdmsr(IA32_VMX_VMCS_ENUM);
+
+	/* proc-based2: host MENO le feature escluse (§6.3), togliendole dalle
+	 * allowed-1 (dword alto). Restano EPT, VPID, unrestricted, RDTSCP,
+	 * INVPCID, WBINVD, DESC_TABLE, RDRAND/RDSEED, PAUSE_LOOP. */
+	proc2 = rdmsr(MSR_VMX_PROCBASED_CTLS2);
+	{
+		uint64_t exc =
+		    (1ULL << 0)  | /* virtualize APIC accesses */
+		    (1ULL << 4)  | /* virtualize x2APIC */
+		    (1ULL << 8)  | /* APIC register virtualization */
+		    (1ULL << 9)  | /* virtual-interrupt delivery */
+		    (1ULL << 13) | /* VMFUNC */
+		    (1ULL << 14) | /* VMCS shadowing (per l'L1) */
+		    (1ULL << 15) | /* ENCLS exiting */
+		    (1ULL << 17) | /* PML */
+		    (1ULL << 18) | /* EPT-violation #VE */
+		    (1ULL << 20) | /* XSAVES/XRSTORS */
+		    (1ULL << 22) | /* mode-based execute control */
+		    (1ULL << 23) | /* sub-page write permissions */
+		    (1ULL << 24) | /* Intel PT uses guest phys */
+		    (1ULL << 25) | /* TSC scaling */
+		    (1ULL << 28);  /* ENCLV exiting */
+		m[0x48b - 0x480] = proc2 & ~(exc << 32);
+	}
+
+	/* EPT/VPID cap: host senza EPT A/D (21) e page-walk a 5 livelli (7). */
+	eptcap = rdmsr(MSR_VMX_EPT_VPID_CAP);
+	m[0x48c - 0x480] = eptcap & ~((1ULL << 21) | (1ULL << 7));
+
+	/* IA32_FEATURE_CONTROL: LOCK + VMX outside SMX (niente SMX). */
+	n->feature_control = IA32_FEATURE_CONTROL_LOCK |
+	    IA32_FEATURE_CONTROL_VMX_EN;
+}
+
 int
 vmx_nested_init(struct vmx_vcpu *vcpu)
 {
@@ -65,6 +146,7 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	n->current_vmcs12 = VMCS12_GPA_NONE;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
 		n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
+	vmx_nested_init_msrs(n);
 	/*
 	 * msr_bitmap e le pagine VMCS02 restano NULL: le allocano pigramente
 	 * T6.3 (bitmap fusa) e T1.8 (VMCS02 al VMPTRLD del VMCS12).
