@@ -129,13 +129,17 @@ const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS |
 	    VMMDEV_IOCTL_PPT),
 	/*
-	 * ⚠ Flag 0 come nel ramo vmm-qemu-mods: il Secondary Bus Reset si
-	 * esegue senza congelare i vcpu.  Le altre ioctl PPT a monte ora
-	 * prendono XLOCK_MEMSEGS|LOCK_ALL_VCPUS|PPT; qui NON si allinea,
-	 * perche' cambiare la disciplina di lock cambierebbe i tempi del
-	 * reset -- ed e' quello che fa ripartire la GPU.
+	 * Il Secondary Bus Reset NON prende i flag di lock
+	 * (XLOCK_MEMSEGS|LOCK_ALL_VCPUS) delle altre ioctl PPT: congelare i
+	 * vcpu cambierebbe i tempi del reset, ed e' il timing che fa
+	 * ripartire la GPU.  Ma VMMDEV_IOCTL_PPT va messo comunque: quel
+	 * flag e' indipendente dal lock e serve SOLO al controllo di
+	 * privilegio (priv_check(PRIV_VMM_PPTDEV) + permesso di jail) in
+	 * vmm_dev.c.  Senza, con bhyve non privilegiato un utente del gruppo
+	 * vmm potrebbe lanciare un bus reset su un dispositivo passthrough
+	 * non assegnato alla sua VM.
 	 */
-	VMMDEV_IOCTL(VM_PPT_SBR_DEVICE, 0),
+	VMMDEV_IOCTL(VM_PPT_SBR_DEVICE, VMMDEV_IOCTL_PPT),
 	VMMDEV_IOCTL(VM_UNBIND_PPTDEV,
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS |
 	    VMMDEV_IOCTL_PPT),

@@ -1205,17 +1205,21 @@ vm_handle_ipi(struct vcpu *vcpu, struct vm_exit *vme, bool *retu)
 	switch (vme->u.ipi.mode) {
 	case APIC_DELMODE_INIT: {
 		cpuset_t active, reinit;
+		int vmflags = 0;
 
 		/*
-		 * When ipi_exit is set, INIT is handled by userland (QEMU).
-		 * Skip the rendezvous because the target AP may be halted
-		 * in userspace (kernel state IDLE), which would deadlock
-		 * vm_smp_rendezvous — the BSP waits in mtx_sleep for the
-		 * AP to participate but vcpu_notify_event does nothing for
-		 * IDLE vCPUs.  QEMU performs the equivalent reset via
-		 * do_cpu_init → apic_init_reset.
+		 * In modalita' QEMU l'INIT lo gestisce userland: QEMU fa il reset
+		 * equivalente via do_cpu_init -> apic_init_reset, e il vCPU
+		 * bersaglio puo' essere parcheggiato in userspace (stato kernel
+		 * IDLE), cosa che bloccherebbe vm_smp_rendezvous (il BSP aspetta
+		 * in mtx_sleep un AP che, da IDLE, vcpu_notify_event non sveglia).
+		 * bhyve(8) NATIVO invece, pur avendo anch'esso ipi_exit attivo,
+		 * NON resetta il vlapic nel suo handler vmexit_ipi (fa solo il
+		 * suspend del vcpu): per lui il reset in-kernel va mantenuto.
+		 * Percio' la guardia e' su VM_OP_F_QEMU, non su ipi_exit.
 		 */
-		if (!vlapic->ipi_exit) {
+		vm_get_flags(vcpu_vm(vcpu), &vmflags);
+		if (!(vmflags & VM_OP_F_QEMU)) {
 			active = vm_active_cpus(vcpu_vm(vcpu));
 			CPU_AND(&reinit, &active, dmask);
 			if (!CPU_EMPTY(&reinit)) {
