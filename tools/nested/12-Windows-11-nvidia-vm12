@@ -33,10 +33,14 @@ if [ "$cur" != "$NESTED_VMM" ]; then
 		echo "Distruggile (bhyvectl --vm=NOME --destroy) e rilancia."
 		exit 1
 	fi
-	if kldstat -q -n vmm 2>/dev/null; then
-		echo "scarico il vmm corrente ($cur) per mettere quello nested"
-		kldunload vmm 2>/dev/null || kldunload vmm-restore 2>/dev/null || {
-			echo "kldunload del vmm fallito"; exit 1; }
+	# scarico il vmm caricato PER ID (il file e' vmm-restore.ko, non "vmm":
+	# kldunload vmm darebbe "can't find file vmm"). Dentro c'e' anche pci/ppt,
+	# ma a zero VM si scarica/ricarica -- come nei tuoi swap di modulo abituali;
+	# al ricarico ppt si riaggancia alla GPU via i pptdevs di loader.conf.
+	id=$(kldstat 2>/dev/null | awk '/[ \t]vmm-restore\.ko/{print $1; exit}')
+	if [ -n "$id" ]; then
+		echo "scarico il vmm corrente (id $id: $cur)"
+		kldunload -i "$id" || { echo "kldunload id $id fallito"; exit 1; }
 	fi
 	echo "carico il vmm nested $NESTED_VMM"
 	kldload "$NESTED_VMM" || { echo "kldload del vmm nested fallito"; exit 1; }
