@@ -3295,6 +3295,7 @@ static int
 vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 {
 	int rc, handled, launched;
+	u_int vmrun_iters = 0;		/* anti-freeze del loop interno (nested) */
 	struct vmx *vmx;
 	struct vmx_vcpu *vcpu;
 	struct vmxctx *vmxctx;
@@ -3334,6 +3335,22 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	vmcs_write(VMCS_GUEST_RIP, rip);
 	vmx_set_pcpu_defaults(vmx, vcpu, pmap);
 	do {
+		/*
+		 * Anti-freeze del loop interno: se con il nested un'uscita L2
+		 * viene gestita in-kernel all'infinito (es. shadow-EPT che non
+		 * risolve il fault -> l'L2 rifaulta sullo stesso GPA), questo
+		 * do/while gira senza mai tornare a vm_run e senza cedere la
+		 * CPU -> host congelato. Cedo periodicamente (l'host resta vivo
+		 * e DTrace vede il loop) e, oltre una soglia enorme, PANICO col
+		 * dump invece di piantare la macchina.
+		 */
+		if ((++vmrun_iters & 4095) == 0)
+			kern_yield(PRI_USER);
+		if (vmrun_iters >= 2000000)
+			panic("vmx_run: loop interno (vcpu%d iter=%u rip=%#lx "
+			    "in_l2=%d)", vcpu->vcpuid, vmrun_iters, (u_long)rip,
+			    (vcpu->nested != NULL && vcpu->nested->in_l2));
+
 		KASSERT(vmcs_guest_rip() == rip, ("%s: vmcs guest rip mismatch "
 		    "%#lx/%#lx", __func__, vmcs_guest_rip(), rip));
 
