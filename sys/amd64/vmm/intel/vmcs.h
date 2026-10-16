@@ -154,6 +154,8 @@ vmcs_write(uint32_t encoding, uint64_t val)
 #define	VMCS_EOI_EXIT1			0x0000201E
 #define	VMCS_EOI_EXIT2			0x00002020
 #define	VMCS_EOI_EXIT3			0x00002022
+#define	VMCS_VMREAD_BITMAP		0x00002026
+#define	VMCS_VMWRITE_BITMAP		0x00002028
 #define	VMCS_EOI_EXIT(vector)		(VMCS_EOI_EXIT0 + ((vector) / 64) * 2)
 
 /* 64-bit read-only fields */
