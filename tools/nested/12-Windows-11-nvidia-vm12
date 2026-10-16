@@ -13,51 +13,35 @@ echo $vncs
 echo $session
 bhyvectl --vm=vm0:12 --destroy
 
-# NIDIFICAZIONE (Claude 16/10/2026): la virtualizzazione annidata vive nel
-# vmm NESTED. E' l'albero di ottobre + il codice nested, quindi porta GIA'
-# dentro le tue fix GPU/HLT: vmx.c e' IDENTICO al tree gpu-16 sui marcatori
-# del passthrough (MASK_HWINTR 3/3, VM_CAP_IPI_EXIT 2/2), piu' ~96 righe nested.
-# Carica QUESTO modulo (non il mirrorfix) PRIMA di avviare, se non e' gia' su:
-#   kldstat | grep vmm    # dev'essere il vmm-restore.ko di nested-work
-#   # se no:  kldload /mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko
-
+# NIDIFICAZIONE (Claude 16/10/2026): il vmm NESTED va caricato DAL BOOT.
+# Lo scambio a CALDO del modulo e' impossibile: dentro vmm-restore.ko c'e'
+# anche pci/ppt, e le GPU (3/0/x + 4/0/x) legate a ppt dai pptdevs tengono il
+# modulo "Device busy" -> kldunload fallisce sempre. Quindi il nested sta in
+# /boot/kernel/vmm-restore.ko (loader.conf: vmm_load=YES, vmm_name=vmm-restore)
+# e si carica all'avvio con le GPU gia' su ppt, pulite.
+#
+# Per aggiornare il modulo nested dopo una ricompilazione:
+#   cp -n /boot/kernel/vmm-restore.ko /boot/kernel/vmm-restore.ko.nonnested
+#   cp /mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko \
+#      /boot/kernel/vmm-restore.ko
+#   reboot
+# Per tornare al vmm non-nested: ripristina il .nonnested e riavvia.
 NESTED_VMM=/mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko
-# Il vmm caricato DEVE essere questo (nested). Se ne e' su un altro -- tipico:
-# /boot/kernel/vmm-restore.ko, che NON e' nested e fa fallire x86.nested_virt --
-# lo scambio. MA solo a zero VM attive, se no kldunload romperebbe le VM vive.
-# RICARICO SEMPRE il modulo nested dal file. Confrontare per PERCORSO non basta:
-# il file puo' essere stato RICOMPILATO tra un avvio e l'altro (stesso percorso,
-# contenuto diverso) e un modulo stale fa fallire x86.nested_virt. Solo a 0 VM:
-# dentro vmm-restore.ko c'e' anche pci/ppt, al ricarico si riaggancia via pptdevs.
-if ls /dev/vmm/* >/dev/null 2>&1; then
-	echo "Ci sono VM attive: non posso ricaricare il vmm. Distruggile:"
-	ls /dev/vmm/
-	echo "  bhyvectl --vm=NOME --destroy   (poi rilancia)"
+loaded=$(kldstat -v 2>/dev/null | awk -F'[()]' '/vmm-restore\.ko \(/{print $2; exit}')
+if [ -z "$loaded" ]; then
+	echo "vmm non caricato: controlla vmm_load=YES in /boot/loader.conf"
 	exit 1
 fi
-# Un bhyve rimasto appeso (tipico dopo un --destroy: il nodo /dev/vmm sparisce
-# ma il processo cicla su vm_run errno 6) tiene il modulo "Device busy".
-# Ammazzo quello di QUESTA VM e aspetto che il refcount scenda.
-if pgrep -f 'bhyve.*vm0:12' >/dev/null 2>&1; then
-	echo "bhyve di vm0:12 ancora vivo: lo chiudo per liberare il vmm"
-	pkill -9 -f 'bhyve.*vm0:12' 2>/dev/null || true
-	i=0
-	while pgrep -f 'bhyve.*vm0:12' >/dev/null 2>&1 && [ "$i" -lt 20 ]; do
-		i=$((i + 1)); sleep 1
-	done
+if ! cmp -s "$loaded" "$NESTED_VMM"; then
+	echo "ATTENZIONE: il vmm caricato ($loaded) NON coincide col nested"
+	echo "aggiornato ($NESTED_VMM). Installa in /boot e riavvia l'host:"
+	echo "  cp -n /boot/kernel/vmm-restore.ko /boot/kernel/vmm-restore.ko.nonnested"
+	echo "  cp '$NESTED_VMM' /boot/kernel/vmm-restore.ko && reboot"
+	exit 1
 fi
+echo "vmm nested aggiornato e attivo: $loaded"
 
-# scarico il vmm corrente PER ID (il file e' vmm-restore.ko, non "vmm")
-id=$(kldstat 2>/dev/null | awk '/[ \t]vmm-restore\.ko/{print $1; exit}')
-if [ -n "$id" ]; then
-	echo "scarico il vmm corrente (id $id) per ricaricare il nested aggiornato"
-	kldunload -i "$id" || { echo "kldunload id $id fallito"; exit 1; }
-fi
-echo "carico il vmm nested $NESTED_VMM"
-kldload "$NESTED_VMM" || { echo "kldload del vmm nested fallito"; exit 1; }
-echo "vmm nested attivo: $(kldstat -v 2>/dev/null | awk -F'[()]' '/vmm-restore\.ko \(/{print $2; exit}')"
-
-sleep 10
+sleep 2
 
 #if ! pciconf -l pci0:7:0:0 | grep -q "^ppt"; then
 #echo "USB-PCI controller 7/0/0 is not attached to ppt,attaching..."
