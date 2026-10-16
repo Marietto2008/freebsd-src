@@ -101,11 +101,12 @@ vmx_nested_init_msrs(struct vmx_nested *n)
 	m[0x484 - 0x480] = rdmsr(MSR_VMX_ENTRY_CTLS);
 	m[0x490 - 0x480] = rdmsr(MSR_VMX_TRUE_ENTRY_CTLS);
 
-	/* MISC: host senza PT (14), SMBASE (15), VMXOFF-unblock-SMI (28) e il
-	 * rate del preemption timer (0-4). bit 29 (VMWRITE-any) resta: F0=SI. */
+	/* MISC: host senza PT (14), SMBASE (15), VMXOFF-unblock-SMI (28).
+	 * TENGO il rate del preemption timer (bit 0-4): se lo azzero, Hyper-V
+	 * vede il timer annunciato ma con rate invalido e lo esclude dall'allowed
+	 * del pin-based (evt 46 su 0x48D). bit 29 (VMWRITE-any) resta: F0=SI. */
 	misc = rdmsr(IA32_VMX_MISC);
-	m[0x485 - 0x480] = misc & ~(0x1fULL | (1ULL << 14) | (1ULL << 15) |
-	    (1ULL << 28));
+	m[0x485 - 0x480] = misc & ~((1ULL << 14) | (1ULL << 15) | (1ULL << 28));
 
 	/* CR0/CR4 fixed e VMCS_ENUM: dall'host. */
 	m[0x486 - 0x480] = rdmsr(MSR_VMX_CR0_FIXED0);
