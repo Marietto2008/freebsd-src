@@ -147,6 +147,16 @@ struct vmx_nested {
 	uint64_t	*vept_root;	/* radice shadow EPT (T2.7), NULL se assente */
 	uint64_t	vept_eptp12;	/* EPTP12 che la shadow rispecchia */
 	uint16_t	vpid2;		/* VPID distinto per L2 (T2.8) */
+	/*
+	 * Campi d'uscita CATTURATI col VMCS01 corrente (in vmx_exit_process),
+	 * perche' nel slow path (vm_run, vCPU FROZEN) il VMCS NON e' caricato e
+	 * una vmcs_read grezza panica ("vmcs_read error 1"). Il gestore nested
+	 * usa questi invece di rileggere; per lo stato guest usa l'API registri.
+	 */
+	uint64_t	exit_qual;	/* VMCS_EXIT_QUALIFICATION */
+	uint64_t	exit_insn_info;	/* VMCS_EXIT_INSTRUCTION_INFO */
+	uint64_t	exit_insn_length; /* VMCS_EXIT_INSTRUCTION_LENGTH */
+	struct vm_guest_paging exit_paging; /* cr3/cpl/cpu_mode/paging_mode */
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);

@@ -202,18 +202,29 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 }
 
 /* --- Esito di un'istruzione VMX nel RFLAGS dell'L1 (SDM 31.2) --- */
+static int vmcs12_write_field(struct vmcs12_cache *c, uint32_t enc,
+    uint64_t val);	/* definito piu' sotto, usato da nested_vmx_result */
+
+/*
+ * Nota: questi girano nel slow path (vcpu FROZEN), dove il VMCS01 NON e'
+ * caricato. Lo stato guest (RFLAGS, RIP) si tocca via l'API registri, che a
+ * vcpu non-running carica il VMCS da sola; i campi d'uscita vengono dai valori
+ * catturati in vmx_exit_process (vcpu->nested->exit_*).
+ */
 void
 nested_vmx_result(struct vmx_vcpu *vcpu, int errnum)
 {
 	uint64_t rflags;
 
-	rflags = vmcs_read(VMCS_GUEST_RFLAGS);
+	vm_get_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, &rflags);
 	rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_Z | PSL_N | PSL_V);
 	if (errnum != VMXR_SUCCEED) {		/* VMfailValid(errnum) */
+		struct vmcs12_cache *c = nested_current_cache(vcpu->nested);
 		rflags |= PSL_Z;
-		vmcs_write(VMCS_INSTRUCTION_ERROR, errnum);
+		if (c != NULL)			/* L1 lo legge via VMREAD 0x4400 */
+			vmcs12_write_field(c, VMCS_INSTRUCTION_ERROR, errnum);
 	}
-	vmcs_write(VMCS_GUEST_RFLAGS, rflags);
+	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, rflags);
 }
 
 void
@@ -221,17 +232,20 @@ nested_vmfail_invalid(struct vmx_vcpu *vcpu)
 {
 	uint64_t rflags;
 
-	rflags = vmcs_read(VMCS_GUEST_RFLAGS);
+	vm_get_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, &rflags);
 	rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_Z | PSL_N | PSL_V);
 	rflags |= PSL_C;			/* VMfailInvalid */
-	vmcs_write(VMCS_GUEST_RFLAGS, rflags);
+	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, rflags);
 }
 
 static void
-nested_advance_rip(void)
+nested_advance_rip(struct vmx_vcpu *vcpu)
 {
-	vmcs_write(VMCS_GUEST_RIP, vmcs_read(VMCS_GUEST_RIP) +
-	    vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH));
+	uint64_t rip;
+
+	vm_get_register(vcpu->vcpu, VM_REG_GUEST_RIP, &rip);
+	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP,
+	    rip + vcpu->nested->exit_insn_length);
 }
 
 /*
@@ -252,8 +266,8 @@ nested_operand_gpa(struct vmx_vcpu *vcpu, int prot, uint64_t *gpa)
 	enum vm_reg_name seg;
 	int scaling, addrsize, fault, error;
 
-	qual = vmcs_read(VMCS_EXIT_QUALIFICATION);
-	info = (uint32_t)vmcs_read(VMCS_EXIT_INSTRUCTION_INFO);
+	qual = vcpu->nested->exit_qual;		/* catturati col VMCS corrente */
+	info = (uint32_t)vcpu->nested->exit_insn_info;
 
 	scaling = info & 0x3;
 	switch ((info >> 7) & 0x7) {
@@ -269,11 +283,11 @@ nested_operand_gpa(struct vmx_vcpu *vcpu, int prot, uint64_t *gpa)
 	if (((info >> 22) & 0x1) == 0)		/* IndexReg valido */
 		offset += vmx_get_guest_reg(vcpu, (info >> 18) & 0xf) << scaling;
 
-	error = vmx_getdesc(vcpu, seg, &desc);
+	error = vmx_getdesc(vcpu, seg, &desc);	/* sicuro: VMPTRLD a vcpu frozen */
 	if (error != 0)
 		return (-1);
-	vmx_paging_info(&paging);
-	if (vie_calculate_gla(vmx_cpu_mode(), seg, &desc, offset, 8, addrsize,
+	paging = vcpu->nested->exit_paging;	/* catturato col VMCS corrente */
+	if (vie_calculate_gla(paging.cpu_mode, seg, &desc, offset, 8, addrsize,
 	    prot, &gla) != 0) {
 		vm_inject_gp(vcpu->vcpu);
 		return (-1);
@@ -322,7 +336,7 @@ nested_vmxon(struct vmx_vcpu *vcpu)
 	n->vmxon = true;
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
-	nested_advance_rip();
+	nested_advance_rip(vcpu);
 	return (0);
 }
 
@@ -339,7 +353,7 @@ nested_vmxoff(struct vmx_vcpu *vcpu)
 		n->cache[i].launched = 0;
 	}
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
-	nested_advance_rip();
+	nested_advance_rip(vcpu);
 	return (0);
 }
 
@@ -370,7 +384,7 @@ nested_vmclear(struct vmx_vcpu *vcpu)
 	 * Scrittura in guest memory: T1.8/T2. */
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
-	nested_advance_rip();
+	nested_advance_rip(vcpu);
 	return (0);
 }
 
@@ -407,7 +421,7 @@ nested_vmptrld(struct vmx_vcpu *vcpu)
 	n->current_vmcs12 = vmcs12;
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
-	nested_advance_rip();
+	nested_advance_rip(vcpu);
 	return (0);
 }
 
@@ -430,7 +444,7 @@ nested_vmptrst(struct vmx_vcpu *vcpu)
 	vm_gpa_release(cookie);
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
-	nested_advance_rip();
+	nested_advance_rip(vcpu);
 	return (0);
 }
 
@@ -497,7 +511,7 @@ nested_vmread(struct vmx_vcpu *vcpu)
 	c = nested_current_cache(n);
 	if (c == NULL) { nested_vmfail_invalid(vcpu); goto done; }
 
-	info = (uint32_t)vmcs_read(VMCS_EXIT_INSTRUCTION_INFO);
+	info = (uint32_t)vcpu->nested->exit_insn_info; /* catturato */
 	field = (uint32_t)vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
 	val = vmcs12_read_field(c, field);
 
@@ -514,7 +528,7 @@ nested_vmread(struct vmx_vcpu *vcpu)
 	}
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
-	nested_advance_rip();
+	nested_advance_rip(vcpu);
 	return (0);
 }
 
@@ -531,7 +545,7 @@ nested_vmwrite(struct vmx_vcpu *vcpu)
 	c = nested_current_cache(n);
 	if (c == NULL) { nested_vmfail_invalid(vcpu); goto done; }
 
-	info = (uint32_t)vmcs_read(VMCS_EXIT_INSTRUCTION_INFO);
+	info = (uint32_t)vcpu->nested->exit_insn_info; /* catturato */
 	field = (uint32_t)vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
 
 	if ((info >> 10) & 0x1) {
@@ -554,7 +568,7 @@ nested_vmwrite(struct vmx_vcpu *vcpu)
 	c->host_dirty = true;
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
-	nested_advance_rip();
+	nested_advance_rip(vcpu);
 	return (0);
 }
 
@@ -579,18 +593,18 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	c = nested_current_cache(n);
 	if (c == NULL) {
 		nested_vmfail_invalid(vcpu);
-		nested_advance_rip();
+		nested_advance_rip(vcpu);
 		return (0);
 	}
 	/* launch state: VMLAUNCH vuole clear, VMRESUME vuole launched */
 	if (is_resume && !c->launched) {
 		nested_vmx_result(vcpu, VMXERR_VMRESUME_NONLAUNCHED_VMCS);
-		nested_advance_rip();
+		nested_advance_rip(vcpu);
 		return (0);
 	}
 	if (!is_resume && c->launched) {
 		nested_vmx_result(vcpu, VMXERR_VMLAUNCH_NONCLEAR_VMCS);
-		nested_advance_rip();
+		nested_advance_rip(vcpu);
 		return (0);
 	}
 	/*
@@ -601,7 +615,7 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	/* host-state fisso del VMCS02 (lascia nessun VMCS corrente) */
 	if ((error = vmx_nested_vmcs02_setup(c)) != 0) {
 		nested_vmx_result(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-		nested_advance_rip();
+		nested_advance_rip(vcpu);
 		return (0);
 	}
 	vmcs02 = (struct vmcs *)c->vmcs02;
@@ -620,7 +634,7 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		VMCLEAR(vmcs02);
 		VMPTRLD(vcpu->vmcs01);		/* torna corrente l'L1 */
 		nested_vmx_result(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-		nested_advance_rip();
+		nested_advance_rip(vcpu);
 		return (0);
 	}
 	VMCLEAR(vmcs02);			/* vmx_run lo ricarichera' */
@@ -910,7 +924,7 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 	d.vpid = n->vpid2;
 	invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
-	nested_advance_rip();
+	nested_advance_rip(vcpu);
 	return (0);
 }
 

@@ -3078,9 +3078,21 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		 * slow path (vmx_nested_exit via vm_run, vCPU frozen); altrimenti
 		 * #UD come prima (VM_EXITCODE_VMINSN).
 		 */
-		if (vcpu->nested != NULL)
+		if (vcpu->nested != NULL) {
+			/*
+			 * Cattura i campi d'uscita ORA, col VMCS01 corrente:
+			 * nel slow path (vcpu FROZEN) il VMCS non e' caricato
+			 * e rileggerli con vmcs_read grezza panica.
+			 */
+			vcpu->nested->exit_qual =
+			    vmexit->u.vmx.exit_qualification;
+			vcpu->nested->exit_insn_info =
+			    vmcs_read(VMCS_EXIT_INSTRUCTION_INFO);
+			vcpu->nested->exit_insn_length =
+			    vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH);
+			vmx_paging_info(&vcpu->nested->exit_paging);
 			vmexit->exitcode = VM_EXITCODE_NESTED;
-		else
+		} else
 			vmexit->exitcode = VM_EXITCODE_VMINSN;
 		break;
 	case EXIT_REASON_INVD:
