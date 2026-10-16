@@ -2929,21 +2929,21 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 				uint64_t guest_idtr_limit = vmcs_read(VMCS_GUEST_IDTR_LIMIT);
 
 				VMX_DBG("\n@@@ VMX_VEC30_TRAP: INTERCEPTED @@@\n");
-				printf("intr_info=0x%x intr_type=0x%x errcode_valid=%d errcode=0x%x\n",
+				VMX_DBG("intr_info=0x%x intr_type=0x%x errcode_valid=%d errcode=0x%x\n",
 				    intr_info, intr_type, errcode_valid, errcode);
-				printf("exit_qual=0x%lx\n", exit_qual2);
-				printf("GUEST: RIP=0x%lx RSP=0x%lx RFLAGS=0x%lx\n",
+				VMX_DBG("exit_qual=0x%lx\n", exit_qual2);
+				VMX_DBG("GUEST: RIP=0x%lx RSP=0x%lx RFLAGS=0x%lx\n",
 				    guest_rip, guest_rsp, guest_rfl);
-				printf("GUEST: CR0=0x%lx CR3=0x%lx CR4=0x%lx EFER=0x%lx\n",
+				VMX_DBG("GUEST: CR0=0x%lx CR3=0x%lx CR4=0x%lx EFER=0x%lx\n",
 				    guest_cr0, guest_cr3, guest_cr4, guest_efer);
-				printf("GUEST: CS=0x%lx SS=0x%lx\n", guest_cs, guest_ss);
-				printf("GUEST: IDTR base=0x%lx limit=0x%lx\n",
+				VMX_DBG("GUEST: CS=0x%lx SS=0x%lx\n", guest_cs, guest_ss);
+				VMX_DBG("GUEST: IDTR base=0x%lx limit=0x%lx\n",
 				    guest_idtr_base, guest_idtr_limit);
-				printf("GUEST: activity=%lu interruptibility=0x%lx\n",
+				VMX_DBG("GUEST: activity=%lu interruptibility=0x%lx\n",
 				    guest_activ, guest_intr);
 				VMX_DBG("IDT_VECTORING: info=0x%lx error=0x%lx\n",
 				    idt_vec, idt_err);
-				printf("ENTRY_INTR_INFO=0x%lx PIN_CTLS=0x%lx\n",
+				VMX_DBG("ENTRY_INTR_INFO=0x%lx PIN_CTLS=0x%lx\n",
 				    entry_intr, pin_ctl);
 				VMX_DBG("idtvec_info=0x%x (from exit)\n", idtvec_info);
 				VMX_DBG("=== END VECTOR 30 DUMP ===\n\n");
@@ -3473,13 +3473,13 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 				uint64_t interruptibility = vmcs_read(VMCS_GUEST_INTERRUPTIBILITY);
 				uint64_t activity = vmcs_read(VMCS_GUEST_ACTIVITY);
 				VMX_DBG("\n=== VMX_INTR_INIT_FINAL: RIP=0x%lx ===\n", _rip);
-				printf("ENTRY_INTR_INFO=0x%x RFLAGS=0x%lx\n", _ei, rfl);
-				printf("CR0=0x%lx CR4=0x%lx\n", cr0, cr4);
-				printf("EXC_BITMAP=0x%lx IDTR=0x%lx/0x%lx\n",
+				VMX_DBG("ENTRY_INTR_INFO=0x%x RFLAGS=0x%lx\n", _ei, rfl);
+				VMX_DBG("CR0=0x%lx CR4=0x%lx\n", cr0, cr4);
+				VMX_DBG("EXC_BITMAP=0x%lx IDTR=0x%lx/0x%lx\n",
 				    ebi, idt_base, idt_lim);
-				printf("PIN_CTL=0x%lx PROC1=0x%lx PROC2=0x%lx\n",
+				VMX_DBG("PIN_CTL=0x%lx PROC1=0x%lx PROC2=0x%lx\n",
 				    pin, proc1, proc2);
-				printf("ENTRY_CTL=0x%lx INTERRUPTIBILITY=0x%lx "
+				VMX_DBG("ENTRY_CTL=0x%lx INTERRUPTIBILITY=0x%lx "
 				    "ACTIVITY=%lu\n",
 				    entry_ctl, interruptibility, activity);
 			}

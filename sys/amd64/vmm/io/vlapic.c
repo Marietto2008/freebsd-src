@@ -75,6 +75,11 @@ SYSCTL_ULONG(_hw_vmm, OID_AUTO, deliver_msi_nomatch, CTLFLAG_RD,
 SYSCTL_ULONG(_hw_vmm, OID_AUTO, setintr_vec33, CTLFLAG_RD,
     &vlapic_setintr_vec33, 0, "lapic_set_intr calls for vec==33");
 
+static int vlapic_debug_lowvec = 0;
+SYSCTL_INT(_hw_vmm, OID_AUTO, vlapic_debug_lowvec, CTLFLAG_RWTUN,
+    &vlapic_debug_lowvec, 0,
+    "stampa i vettori <32 entrati nell IRR (debug, T0.7)");
+
 #define	x2apic(vlapic)	(((vlapic)->msr_apicbase & APICBASE_X2APIC) ? 1 : 0)
 
 /*
@@ -302,7 +307,7 @@ vlapic_set_intr_ready(struct vlapic *vlapic, int vector, bool level)
 		return (1);
 	}
 
-	if (vector < 32) {
+	if (vector < 32 && __predict_false(vlapic_debug_lowvec)) {
 		printf("VLAPIC_IRR: LOW VECTOR %d set in IRR! "
 		    "svr=0x%x\n", vector, lapic->svr);
 	}
