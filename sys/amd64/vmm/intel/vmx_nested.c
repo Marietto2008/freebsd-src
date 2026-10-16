@@ -36,6 +36,7 @@
 #include "vmx_nested.h"
 #include "vmm_stat.h"
 #include "vmm_host.h"
+#include "io/vlapic.h"
 #include <dev/vmm/vmm_mem.h>
 
 MALLOC_DEFINE(M_VMX_NESTED, "vmx_nested", "Intel VMX nested virtualization");
@@ -783,8 +784,7 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 
 	switch (reason) {
 	case EXIT_REASON_EXT_INTR:
-	case EXIT_REASON_NMI_WINDOW:
-		/* gestite dall'L0, si rientra in L2 (VMCS02 resta corrente) */
+		/* interrupt fisico per l'host: lo gestisce l'L0, si rientra in L2 */
 		return (false);
 	case EXIT_REASON_EXCEPTION:
 		/* NMI (intr_type NMI) all'L0; le altre eccezioni si riflettono
@@ -926,6 +926,16 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	    PROCBASED_CR8_STORE_EXITING;
 	proc = nested_adjust_ctl(proc, MSR_VMX_TRUE_PROCBASED_CTLS);
 	proc &= ~(PROCBASED_IO_BITMAPS | PROCBASED_USE_TPR_SHADOW);
+	/* T2.6: se l'L1 ha un evento pendente per se', accendi il window-exiting
+	 * cosi' l'L2 esce presto e la finestra viene riflessa all'L1 (§6.5). */
+	{
+		int vec;
+		struct vlapic *vl = vm_lapic(x->vcpu);
+		if (vlapic_pending_intr(vl, &vec))
+			proc |= PROCBASED_INT_WINDOW_EXITING;
+		if (vm_nmi_pending(x->vcpu))
+			proc |= PROCBASED_NMI_WINDOW_EXITING;
+	}
 	vmwrite(VMCS_PRI_PROC_BASED_CTLS, proc);
 
 	/* --- Secondary proc: EPT=1, VPID=1, shadowing=0, APIC-virt=0 --- */
