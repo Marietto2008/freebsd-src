@@ -2564,6 +2564,13 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmm_stat_incr(vcpu->vcpu, VMEXIT_COUNT, 1);
 	SDT_PROBE3(vmm, vmx, exit, entry, vmx, vcpuid, vmexit);
 
+	/* Uscite mentre il vCPU e' in L2: instradamento nested (§6.4) prima
+	 * dei rami dell'L1. Se riflessa all'L1, l'uscita e' gestita. */
+	if (vcpu->nested != NULL && vcpu->nested->in_l2) {
+		if (nested_l2_exit(vcpu, vmexit))
+			return (HANDLED);
+	}
+
 	/*
 	 * VM-entry failures during or after loading guest state.
 	 *

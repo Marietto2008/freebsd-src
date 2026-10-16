@@ -97,6 +97,7 @@ extern uint32_t exit_ctls, entry_ctls;
 extern uint64_t cr0_ones_mask, cr0_zeros_mask, cr4_ones_mask, cr4_zeros_mask;
 int	nested_compose_vmcs02(struct vmx_vcpu *vcpu);
 int	nested_vmcs02_check(struct vmx_vcpu *vcpu);
+bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
 
 struct vmx_vcpu;
 

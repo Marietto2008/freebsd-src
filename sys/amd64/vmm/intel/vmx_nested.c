@@ -626,6 +626,179 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	return (0);
 }
 
+
+/* Attributi "host load" standard dei segmenti all'uscita verso l'L1 (SDM
+ * "Loading Host State"): CS code R/A, dati RW/A, TR busy-TSS. */
+#define	NESTED_AR_CODE	0x0000a09b	/* P,S,DPL0,exec/read,accessed,L/D,G */
+#define	NESTED_AR_DATA	0x0000c093	/* P,S,DPL0,read/write,accessed,G */
+#define	NESTED_AR_TR	0x0000008b	/* P,busy 32/64 TSS */
+
+static void
+nested_load_seg(uint32_t sel_enc, uint32_t base_enc, uint32_t lim_enc,
+    uint32_t ar_enc, uint16_t sel, uint64_t base, uint32_t lim, uint32_t ar)
+{
+	vmwrite(sel_enc, sel);
+	vmwrite(base_enc, base);
+	vmwrite(lim_enc, lim);
+	vmwrite(ar_enc, ar);
+}
+
+/*
+ * L2 -> L1 (riflessione, §6.6). Il VMCS02 e' corrente. Salva le info d'uscita
+ * e lo stato di L2 nello store VMCS12, poi carica lo stato host di VMCS12 nel
+ * guest di VMCS01 (l'L1 riprende al suo "host RIP"). Al ritorno VMCS01 e'
+ * corrente, in_l2=0. vmexit->rip = host RIP di VMCS12.
+ * ⚠ Gli attributi di segmento e i dettagli di "Loading Host State" seguono
+ * l'SDM a memoria: da validare su hardware (un AR errato fa triple-fault
+ * l'L1 alla ripresa; lo rileva kut-f2a).
+ */
+static void
+nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c = nested_current_cache(n);
+	struct vmcs *vmcs02 = vcpu->vmcs;
+	uint64_t efer, pat, hrip, hrsp, hcr0, hcr3, hcr4;
+	uint32_t i;
+	/* stato di L2 da ricopiare in VMCS12 cosi' l'L1 lo rilegge con VMREAD */
+	static const uint32_t l2state[] = {
+		VMCS_GUEST_RIP, VMCS_GUEST_RSP, VMCS_GUEST_RFLAGS,
+		VMCS_GUEST_CR0, VMCS_GUEST_CR3, VMCS_GUEST_CR4,
+		VMCS_GUEST_IA32_EFER,
+		VMCS_GUEST_CS_SELECTOR, VMCS_GUEST_SS_SELECTOR,
+		VMCS_GUEST_INTERRUPTIBILITY, VMCS_GUEST_ACTIVITY,
+	};
+
+	if (c == NULL)
+		return;
+	/* 1-2. info d'uscita + stato di L2 -> store VMCS12 */
+	vmcs12_write_field(c, VMCS_EXIT_REASON,
+	    vmexit->u.vmx.exit_reason);
+	vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION,
+	    vmcs_read(VMCS_EXIT_QUALIFICATION));
+	vmcs12_write_field(c, VMCS_EXIT_INTR_INFO,
+	    vmcs_read(VMCS_EXIT_INTR_INFO));
+	vmcs12_write_field(c, VMCS_EXIT_INTR_ERRCODE,
+	    vmcs_read(VMCS_EXIT_INTR_ERRCODE));
+	vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_LENGTH,
+	    vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH));
+	vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_INFO,
+	    vmcs_read(VMCS_EXIT_INSTRUCTION_INFO));
+	for (i = 0; i < nitems(l2state); i++)
+		vmcs12_write_field(c, l2state[i], vmcs_read(l2state[i]));
+	/* [v2] IA-32e mode guest degli entry controls di VMCS12 = EFER.LMA di L2 */
+	efer = vmcs_read(VMCS_GUEST_IA32_EFER);
+
+	/* 4. commuta a VMCS01 */
+	VMCLEAR(vmcs02);
+	VMPTRLD(vcpu->vmcs01);
+	vcpu->vmcs = vcpu->vmcs01;
+
+	/* 6. Loading Host State: host di VMCS12 -> guest di VMCS01 */
+	hcr0 = (vmcs12_read_field(c, VMCS_HOST_CR0) | cr0_ones_mask) &
+	    ~cr0_zeros_mask;
+	hcr4 = (vmcs12_read_field(c, VMCS_HOST_CR4) | cr4_ones_mask) &
+	    ~cr4_zeros_mask;
+	hcr3 = vmcs12_read_field(c, VMCS_HOST_CR3);
+	hrip = vmcs12_read_field(c, VMCS_HOST_RIP);
+	hrsp = vmcs12_read_field(c, VMCS_HOST_RSP);
+	vmwrite(VMCS_GUEST_CR0, hcr0);
+	vmwrite(VMCS_GUEST_CR3, hcr3);
+	vmwrite(VMCS_GUEST_CR4, hcr4);
+	vmwrite(VMCS_GUEST_RIP, hrip);
+	vmwrite(VMCS_GUEST_RSP, hrsp);
+	vmwrite(VMCS_GUEST_RFLAGS, 0x2);		/* bit 1 fisso */
+	vmwrite(VMCS_GUEST_DR7, 0x400);
+	vmwrite(VMCS_GUEST_IA32_DEBUGCTL, 0);
+	vmwrite(VMCS_GUEST_INTERRUPTIBILITY, 0);
+	vmwrite(VMCS_GUEST_ACTIVITY, 0);		/* active */
+	vmwrite(VMCS_GUEST_PENDING_DBG_EXCEPTIONS, 0);
+	/* SYSENTER */
+	vmwrite(VMCS_GUEST_IA32_SYSENTER_CS,
+	    vmcs12_read_field(c, VMCS_HOST_IA32_SYSENTER_CS));
+	vmwrite(VMCS_GUEST_IA32_SYSENTER_ESP,
+	    vmcs12_read_field(c, VMCS_HOST_IA32_SYSENTER_ESP));
+	vmwrite(VMCS_GUEST_IA32_SYSENTER_EIP,
+	    vmcs12_read_field(c, VMCS_HOST_IA32_SYSENTER_EIP));
+	/* EFER/PAT secondo gli exit controls di VMCS12 */
+	efer = vmcs12_read_field(c, VMCS_HOST_IA32_EFER);
+	pat = vmcs12_read_field(c, VMCS_HOST_IA32_PAT);
+	vmwrite(VMCS_GUEST_IA32_EFER, efer);
+	vmwrite(VMCS_GUEST_IA32_PAT, pat);
+	/* segmenti host: selettori da VMCS12, basi/limiti/attributi standard */
+	nested_load_seg(VMCS_GUEST_CS_SELECTOR, VMCS_GUEST_CS_BASE,
+	    VMCS_GUEST_CS_LIMIT, VMCS_GUEST_CS_ACCESS_RIGHTS,
+	    vmcs12_read_field(c, VMCS_HOST_CS_SELECTOR), 0, 0xfffff,
+	    NESTED_AR_CODE);
+	nested_load_seg(VMCS_GUEST_SS_SELECTOR, VMCS_GUEST_SS_BASE,
+	    VMCS_GUEST_SS_LIMIT, VMCS_GUEST_SS_ACCESS_RIGHTS,
+	    vmcs12_read_field(c, VMCS_HOST_SS_SELECTOR), 0, 0xfffff,
+	    NESTED_AR_DATA);
+	nested_load_seg(VMCS_GUEST_DS_SELECTOR, VMCS_GUEST_DS_BASE,
+	    VMCS_GUEST_DS_LIMIT, VMCS_GUEST_DS_ACCESS_RIGHTS,
+	    vmcs12_read_field(c, VMCS_HOST_DS_SELECTOR), 0, 0xfffff,
+	    NESTED_AR_DATA);
+	nested_load_seg(VMCS_GUEST_ES_SELECTOR, VMCS_GUEST_ES_BASE,
+	    VMCS_GUEST_ES_LIMIT, VMCS_GUEST_ES_ACCESS_RIGHTS,
+	    vmcs12_read_field(c, VMCS_HOST_ES_SELECTOR), 0, 0xfffff,
+	    NESTED_AR_DATA);
+	nested_load_seg(VMCS_GUEST_FS_SELECTOR, VMCS_GUEST_FS_BASE,
+	    VMCS_GUEST_FS_LIMIT, VMCS_GUEST_FS_ACCESS_RIGHTS,
+	    vmcs12_read_field(c, VMCS_HOST_FS_SELECTOR),
+	    vmcs12_read_field(c, VMCS_HOST_FS_BASE), 0xfffff, NESTED_AR_DATA);
+	nested_load_seg(VMCS_GUEST_GS_SELECTOR, VMCS_GUEST_GS_BASE,
+	    VMCS_GUEST_GS_LIMIT, VMCS_GUEST_GS_ACCESS_RIGHTS,
+	    vmcs12_read_field(c, VMCS_HOST_GS_SELECTOR),
+	    vmcs12_read_field(c, VMCS_HOST_GS_BASE), 0xfffff, NESTED_AR_DATA);
+	nested_load_seg(VMCS_GUEST_TR_SELECTOR, VMCS_GUEST_TR_BASE,
+	    VMCS_GUEST_TR_LIMIT, VMCS_GUEST_TR_ACCESS_RIGHTS,
+	    vmcs12_read_field(c, VMCS_HOST_TR_SELECTOR),
+	    vmcs12_read_field(c, VMCS_HOST_TR_BASE), 0x67, NESTED_AR_TR);
+	vmwrite(VMCS_GUEST_GDTR_BASE, vmcs12_read_field(c, VMCS_HOST_GDTR_BASE));
+	vmwrite(VMCS_GUEST_GDTR_LIMIT, 0xffff);
+	vmwrite(VMCS_GUEST_IDTR_BASE, vmcs12_read_field(c, VMCS_HOST_IDTR_BASE));
+	vmwrite(VMCS_GUEST_IDTR_LIMIT, 0xffff);
+	vmwrite(VMCS_GUEST_FS_BASE, vmcs12_read_field(c, VMCS_HOST_FS_BASE));
+	vmwrite(VMCS_GUEST_GS_BASE, vmcs12_read_field(c, VMCS_HOST_GS_BASE));
+
+	n->in_l2 = false;
+	vmexit->rip = hrip;
+	vmexit->inst_length = 0;
+	vm_exit_intinfo(vcpu->vcpu, 0);
+	SDT_PROBE1(vmm, vmx, nested, reflect, vcpu);
+	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_REFLECTIONS, 1);
+}
+
+/*
+ * Instradamento delle uscite mentre il vCPU e' in L2 (§6.4). Chiamata
+ * all'inizio di vmx_exit_process. Ritorna true se l'uscita e' stata gestita
+ * qui (riflessa all'L1): il chiamante deve restituire HANDLED senza toccare i
+ * rami dell'L1. ext-int/NMI restano all'L0 (ritorna false: il flusso normale
+ * li gestisce e si rientra in L2, con VMCS02 ancora corrente).
+ */
+bool
+nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+{
+	uint32_t reason = vmexit->u.vmx.exit_reason & 0xffff;
+
+	switch (reason) {
+	case EXIT_REASON_EXT_INTR:
+	case EXIT_REASON_NMI_WINDOW:
+		/* gestite dall'L0, si rientra in L2 (VMCS02 resta corrente) */
+		return (false);
+	case EXIT_REASON_EXCEPTION:
+		/* NMI (intr_type NMI) all'L0; le altre eccezioni si riflettono
+		 * se nella exception bitmap di VMCS12 (semplificato: riflette). */
+		if (((uint32_t)vmcs_read(VMCS_EXIT_INTR_INFO) & 0x700) ==
+		    (2 << 8))	/* type 2 = NMI */
+			return (false);
+		/* FALLTHROUGH: riflette */
+	default:
+		nested_reflect_to_l1(vcpu, vmexit);
+		return (true);
+	}
+}
+
 /*
  * Slow path del nested (op vmmops_nested_exit): dispatch sull'istruzione VMX
  * che ha causato l'uscita, col vCPU FROZEN. VMLAUNCH/VMRESUME (T2.4),
