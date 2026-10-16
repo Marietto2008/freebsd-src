@@ -7,9 +7,11 @@
 # nested caricato da load.sh; altrimenti bhyve stampa "nested virtualization
 # not supported" ed esce).
 #
-# Windows 11 pretende: UEFI + TPM 2.0 + Secure-Boot-capable + >=4 GB + 2 core.
+# Windows 11 "ufficialmente" vuole UEFI + TPM 2.0 + Secure-Boot + >=4 GB + 2
+# core, ma in pratica si installa e gira anche senza TPM. Qui:
 #   - UEFI:  BHYVE_UEFI_CODE.fd + una copia VARS *scrivibile per-VM*.
-#   - TPM 2: swtpm (sysutils/swtpm) avviato come socket prima di bhyve.
+#   - TPM 2.0: OPZIONALE, spento di default. Con '--tpm' si aggancia swtpm
+#     (sysutils/swtpm) come socket. Senza, niente swtpm e niente vincolo.
 #   - disco NVMe e rete e1000 = driver GIA' nativi in Windows 11 (niente
 #     virtio da caricare in fase d'installazione).
 #
@@ -30,6 +32,7 @@
 #   --vnc <ip:porta> framebuffer VNC (default 0.0.0.0:5900)
 #   --no-wait       non attendere il client VNC prima di avviare
 #   --no-swire      non passare -S (wire della RAM; default: attivo)
+#   --tpm           aggancia un TPM 2.0 via swtpm (default: NESSUN TPM)
 #   --gpu           passa la NVIDIA RTX 2080 Ti (4 funzioni) al guest, come
 #                   UN device multifunzione a slot 6 (GPU+audio+USB-C+TypeC).
 #                   Richiede che le funzioni siano GIA' su ppt da loader.conf
@@ -59,6 +62,7 @@ TAP=""
 VNC="0.0.0.0:5900"
 WAIT=1
 SWIRE=1
+TPM=0
 GPU=0
 GPU_SEL="4/0/0 4/0/1 4/0/2 4/0/3"	# RTX 2080 Ti: VGA, HD-audio, USB-C, Type-C
 VMNAME="win11"
@@ -76,10 +80,11 @@ while [ $# -gt 0 ]; do
 	--vnc)     VNC="$2"; shift 2;;
 	--no-wait) WAIT=0; shift;;
 	--no-swire) SWIRE=0; shift;;
+	--tpm)     TPM=1; shift;;
 	--gpu)     GPU=1; shift;;
 	--gpu-sel) GPU_SEL="$2"; shift 2;;
 	--name)    VMNAME="$2"; shift 2;;
-	-h|--help) sed -n '2,42p' "$0"; exit 0;;
+	-h|--help) sed -n '2,41p' "$0"; exit 0;;
 	*) echo "argomento ignoto: $1" >&2; exit 2;;
 	esac
 done
@@ -112,17 +117,19 @@ if [ "$PROVA" = 0 ]; then
 			    die "la funzione $sel NON e' su ppt. Mettila in pptdevs di /boot/loader.conf e RIAVVIA. Mai legarla a caldo (congela l'host)."
 		done
 	fi
-	command -v swtpm >/dev/null 2>&1 || \
-	    die "swtpm assente: Windows 11 vuole il TPM 2.0 -> 'pkg install swtpm'"
-	command -v swtpm_setup >/dev/null 2>&1 || \
-	    die "swtpm_setup assente (parte di sysutils/swtpm)"
+	if [ "$TPM" = 1 ]; then
+		command -v swtpm >/dev/null 2>&1 || \
+		    die "--tpm richiede swtpm -> 'pkg install swtpm'"
+		command -v swtpm_setup >/dev/null 2>&1 || \
+		    die "swtpm_setup assente (parte di sysutils/swtpm)"
+	fi
 	[ -f "$CODE" ] || die "firmware UEFI mancante: $CODE"
 	[ -f "$VARS_TMPL" ] || die "template VARS UEFI mancante: $VARS_TMPL"
 	[ -z "$ISO" ] || [ -f "$ISO" ] || die "ISO inesistente: $ISO"
 fi
 
 # --- preparazione stato (idempotente, nessun rm) ---------------------------
-run "mkdir -p '$VMDIR' '$TPMDIR'"
+run "mkdir -p '$VMDIR'"
 
 # disco NVMe: crealo solo se assente (mai sovrascrivere un disco esistente)
 if [ ! -f "$DISK" ]; then
@@ -140,32 +147,40 @@ else
 	say "uso i VARS UEFI esistenti $VARS"
 fi
 
-# inizializza lo stato TPM una sola volta (cartella vuota = prima volta)
-if [ "$PROVA" = 1 ] || [ -z "$(ls -A "$TPMDIR" 2>/dev/null)" ]; then
-	say "inizializzo lo stato del TPM 2.0 in $TPMDIR"
-	run "swtpm_setup --tpm2 --tpmstate '$TPMDIR' \
-	      --create-ek-cert --create-platform-cert --lock-nvram --overwrite"
-fi
+# --- TPM 2.0 opzionale (solo con --tpm) ------------------------------------
+# Senza --tpm non si tocca swtpm: Windows 11 si installa/gira lo stesso.
+TPM_DEV=""
+if [ "$TPM" = 1 ]; then
+	TPM_DEV="-l tpm,swtpm,'$TPMSOCK'"
+	run "mkdir -p '$TPMDIR'"
 
-# --- avvia swtpm come socket (daemon per questa VM) ------------------------
-SWTPM_CMD="swtpm socket --tpm2 \
-  --tpmstate dir='$TPMDIR' \
-  --ctrl type=unixio,path='$TPMSOCK' \
-  --flags startup-clear \
-  --log file='$VMDIR/swtpm.log',level=1"
-if [ "$PROVA" = 1 ]; then
-	echo "  PROVA> $SWTPM_CMD &"
-else
-	say "avvio swtpm su $TPMSOCK"
-	eval "$SWTPM_CMD &"
-	SWTPM_PID=$!
-	trap 'kill "$SWTPM_PID" 2>/dev/null || true' EXIT INT TERM
-	# attendi che il socket compaia (max ~5 s)
-	i=0
-	while [ ! -S "$TPMSOCK" ] && [ "$i" -lt 50 ]; do
-		i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
-	done
-	[ -S "$TPMSOCK" ] || die "swtpm non ha creato il socket $TPMSOCK (vedi $VMDIR/swtpm.log)"
+	# inizializza lo stato TPM una sola volta (cartella vuota = prima volta)
+	if [ "$PROVA" = 1 ] || [ -z "$(ls -A "$TPMDIR" 2>/dev/null)" ]; then
+		say "inizializzo lo stato del TPM 2.0 in $TPMDIR"
+		run "swtpm_setup --tpm2 --tpmstate '$TPMDIR' \
+		      --create-ek-cert --create-platform-cert --lock-nvram --overwrite"
+	fi
+
+	# avvia swtpm come socket (daemon per questa VM)
+	SWTPM_CMD="swtpm socket --tpm2 \
+	  --tpmstate dir='$TPMDIR' \
+	  --ctrl type=unixio,path='$TPMSOCK' \
+	  --flags startup-clear \
+	  --log file='$VMDIR/swtpm.log',level=1"
+	if [ "$PROVA" = 1 ]; then
+		echo "  PROVA> $SWTPM_CMD &"
+	else
+		say "avvio swtpm su $TPMSOCK"
+		eval "$SWTPM_CMD &"
+		SWTPM_PID=$!
+		trap 'kill "$SWTPM_PID" 2>/dev/null || true' EXIT INT TERM
+		# attendi che il socket compaia (max ~5 s)
+		i=0
+		while [ ! -S "$TPMSOCK" ] && [ "$i" -lt 50 ]; do
+			i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
+		done
+		[ -S "$TPMSOCK" ] || die "swtpm non ha creato il socket $TPMSOCK (vedi $VMDIR/swtpm.log)"
+	fi
 fi
 
 # --- costruisci la riga bhyve ----------------------------------------------
@@ -214,7 +229,7 @@ BHYVE_CMD="$cpuset_pfx '$BHYVE' \
   -s 30,xhci,tablet \
   -s 31,lpc \
   -l com1,stdio \
-  -l tpm,swtpm,'$TPMSOCK' \
+  $TPM_DEV \
   -l bootrom,'$CODE','$VARS' \
   '$VMNAME'"
 
