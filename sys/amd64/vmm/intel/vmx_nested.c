@@ -87,8 +87,11 @@ vmx_nested_init_msrs(struct vmx_nested *n)
 
 	/* pin-based (legacy e true): host + ext-int(0) e NMI(3) exiting
 	 * must-be-1 nelle allowed-0 (D4.b). */
-	m[0x481 - 0x480] = rdmsr(MSR_VMX_PINBASED_CTLS)      | 0x9ULL;
-	m[0x48d - 0x480] = rdmsr(MSR_VMX_TRUE_PINBASED_CTLS) | 0x9ULL;
+	/* ext-int(0) e NMI(3) must-be-1, PIU' il VMX-preemption timer (bit 6
+	 * allowed-1, dword alto -> bit 38): Hyper-V lo esige per lanciare
+	 * l'hypervisor (System log evt 46, MSR 0x48D richiede 0x7F0000001F). */
+	m[0x481 - 0x480] = rdmsr(MSR_VMX_PINBASED_CTLS)      | 0x9ULL | (1ULL << 38);
+	m[0x48d - 0x480] = rdmsr(MSR_VMX_TRUE_PINBASED_CTLS) | 0x9ULL | (1ULL << 38);
 
 	/* proc-based primary, exit, entry: come l'host. */
 	m[0x482 - 0x480] = rdmsr(MSR_VMX_PROCBASED_CTLS);
