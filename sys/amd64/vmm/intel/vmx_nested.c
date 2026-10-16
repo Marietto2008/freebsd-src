@@ -419,6 +419,130 @@ done:
 	return (0);
 }
 
+/* --- store software dei campi VMCS12 (T1.8) --- */
+static struct vmcs12_cache *
+nested_current_cache(struct vmx_nested *n)
+{
+	int i;
+
+	if (n->current_vmcs12 == VMCS12_GPA_NONE)
+		return (NULL);
+	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
+		if (n->cache[i].vmcs12_gpa == n->current_vmcs12)
+			return (&n->cache[i]);
+	return (NULL);
+}
+
+static uint64_t
+vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc)
+{
+	int i;
+
+	for (i = 0; i < c->nfields; i++)
+		if (c->fields[i].enc == enc)
+			return (c->fields[i].val);
+	return (0);
+}
+
+static int
+vmcs12_write_field(struct vmcs12_cache *c, uint32_t enc, uint64_t val)
+{
+	int i;
+
+	for (i = 0; i < c->nfields; i++)
+		if (c->fields[i].enc == enc) {
+			c->fields[i].val = val;
+			return (0);
+		}
+	if (c->nfields >= VMCS12_NFIELDS)
+		return (-1);
+	c->fields[c->nfields].enc = enc;
+	c->fields[c->nfields].val = val;
+	c->nfields++;
+	return (0);
+}
+
+/*
+ * VMREAD/VMWRITE dell'L1. Tutte le istruzioni escono (nessuno shadowing
+ * hardware ancora: §6.2 e' un'ottimizzazione rimandata a T2) e si gestiscono
+ * in software sullo store del VMCS12 corrente. Decode dell'operando: campo
+ * in reg2 (bit 31:28), valore/dest in reg1 (bit 6:3) se registro (bit 10),
+ * altrimenti operando di memoria (SDM/KVM).
+ */
+static int
+nested_vmread(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	uint64_t val, gpa, *p;
+	uint32_t info, field;
+	void *cookie;
+
+	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
+	c = nested_current_cache(n);
+	if (c == NULL) { nested_vmfail_invalid(vcpu); goto done; }
+
+	info = (uint32_t)vmcs_read(VMCS_EXIT_INSTRUCTION_INFO);
+	field = (uint32_t)vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
+	val = vmcs12_read_field(c, field);
+
+	if ((info >> 10) & 0x1) {
+		vmx_set_guest_reg(vcpu, (info >> 3) & 0xf, val);
+	} else {
+		if (nested_operand_gpa(vcpu, VM_PROT_WRITE, &gpa) != 0)
+			return (0);
+		p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t),
+		    VM_PROT_WRITE, &cookie);
+		if (p == NULL) { nested_vmfail_invalid(vcpu); goto done; }
+		*p = val;
+		vm_gpa_release(cookie);
+	}
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+done:
+	nested_advance_rip();
+	return (0);
+}
+
+static int
+nested_vmwrite(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	uint64_t val, gpa, *p;
+	uint32_t info, field;
+	void *cookie;
+
+	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
+	c = nested_current_cache(n);
+	if (c == NULL) { nested_vmfail_invalid(vcpu); goto done; }
+
+	info = (uint32_t)vmcs_read(VMCS_EXIT_INSTRUCTION_INFO);
+	field = (uint32_t)vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
+
+	if ((info >> 10) & 0x1) {
+		val = vmx_get_guest_reg(vcpu, (info >> 3) & 0xf);
+	} else {
+		if (nested_operand_gpa(vcpu, VM_PROT_READ, &gpa) != 0)
+			return (0);
+		p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t),
+		    VM_PROT_READ, &cookie);
+		if (p == NULL) { nested_vmfail_invalid(vcpu); goto done; }
+		val = *p;
+		vm_gpa_release(cookie);
+	}
+	/* F0: VMWRITE su ogni campo (MISC bit 29) = SI -> niente rifiuto RO. */
+	if (vmcs12_write_field(c, field, val) != 0) {
+		nested_vmx_result(vcpu, VMXERR_UNSUPPORTED_VMCS_COMPONENT);
+		goto done;
+	}
+	c->control_dirty = true;
+	c->host_dirty = true;
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+done:
+	nested_advance_rip();
+	return (0);
+}
+
 /*
  * Slow path del nested (op vmmops_nested_exit): dispatch sull'istruzione VMX
  * che ha causato l'uscita, col vCPU FROZEN. VMLAUNCH/VMRESUME (T2.4),
@@ -440,6 +564,8 @@ vmx_nested_exit(void *vcpui)
 	case EXIT_REASON_VMCLEAR:	return (nested_vmclear(vcpu));
 	case EXIT_REASON_VMPTRLD:	return (nested_vmptrld(vcpu));
 	case EXIT_REASON_VMPTRST:	return (nested_vmptrst(vcpu));
+	case EXIT_REASON_VMREAD:	return (nested_vmread(vcpu));
+	case EXIT_REASON_VMWRITE:	return (nested_vmwrite(vcpu));
 	default:
 		vm_inject_ud(vcpu->vcpu);
 		return (0);

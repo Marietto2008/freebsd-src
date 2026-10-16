@@ -86,6 +86,7 @@ MALLOC_DECLARE(M_VMX_NESTED);
 
 /* Helper di vmx.c esposti per il nested (T1.7). */
 uint64_t vmx_get_guest_reg(struct vmx_vcpu *vcpu, int ident);
+void	vmx_set_guest_reg(struct vmx_vcpu *vcpu, int ident, uint64_t regval);
 int	vmx_getdesc(void *vcpui, int reg, struct seg_desc *desc);
 void	vmx_paging_info(struct vm_guest_paging *paging);
 enum vm_cpu_mode vmx_cpu_mode(void);
@@ -96,6 +97,12 @@ struct vmx_vcpu;
  * Una voce della cache VMCS12->VMCS02 (per vCPU, MAI globale: §3). I campi
  * operativi li riempiono i task T1.7/T1.8/T2.*; qui c'e' solo il guscio.
  */
+#define	VMCS12_NFIELDS	256	/* campi VMCS memorizzati per VMCS12 (T1.8) */
+struct vmcs12_field {
+	uint32_t	enc;
+	uint64_t	val;
+};
+
 struct vmcs12_cache {
 	uint64_t	vmcs12_gpa;	/* GPA del VMCS12; VMCS12_GPA_NONE = libera */
 	void		*vmcs02;	/* pagina VMCS02, allocata pigramente (T1.8) */
@@ -103,6 +110,8 @@ struct vmcs12_cache {
 	int		launched;	/* launch state di questo VMCS02 */
 	bool		host_dirty;	/* host-state da ricomporre */
 	bool		control_dirty;	/* controlli da ricomporre */
+	struct vmcs12_field fields[VMCS12_NFIELDS];  /* store software (T1.8) */
+	int		nfields;
 };
 
 /*

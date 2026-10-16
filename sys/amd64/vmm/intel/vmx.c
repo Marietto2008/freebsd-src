@@ -1959,7 +1959,7 @@ vmx_get_guest_reg(struct vmx_vcpu *vcpu, int ident)
 	}
 }
 
-static void
+void
 vmx_set_guest_reg(struct vmx_vcpu *vcpu, int ident, uint64_t regval)
 {
 	struct vmxctx *vmxctx;
