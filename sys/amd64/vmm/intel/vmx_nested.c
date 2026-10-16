@@ -897,7 +897,11 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		if (cc != NULL && (vmcs12_read_field(cc,
 		    VMCS_SEC_PROC_BASED_CTLS) & PROCBASED2_ENABLE_EPT)) {
 			if (vmx_vept_fault(vcpu) == 0)
-				return (false);	/* shadow installata, rientra in L2 */
+				return (true);	/* shadow installata: HANDLED ->
+						 * vmx_run RI-ESEGUE il VMCS02 (L2).
+						 * (prima: return false -> l'uscita
+						 * veniva rielaborata come EPT fault
+						 * L0 sul pmap sbagliato -> giro) */
 			nested_reflect_to_l1(vcpu, vmexit);
 			return (true);
 		}
