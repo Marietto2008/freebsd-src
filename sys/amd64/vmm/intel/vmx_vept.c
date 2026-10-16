@@ -51,8 +51,22 @@ vmx_vept_eptp(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 
-	if (n->vept_root == NULL)
-		return (0);
+	/*
+	 * Alloca la radice shadow VUOTA ORA (prima del VMLAUNCH), se manca.
+	 * Tornare 0 darebbe un EPTP invalido: il VM-entry dell'L2 fallirebbe,
+	 * l'L2 non girerebbe mai, quindi nessuna EPT violation -> la radice
+	 * non verrebbe MAI allocata (uovo-e-gallina -> hang dell'host).
+	 * Con radice valida l'L2 entra e la shadow si riempie a domanda in
+	 * vmx_vept_fault. Fisso vept_eptp12 al VMCS12 corrente cosi' il primo
+	 * fault non la scarta e non cambia l'indirizzo gia' scritto nel VMCS02.
+	 */
+	if (n->vept_root == NULL) {
+		struct vmcs12_cache *c = nested_current_cache(n);
+
+		n->vept_root = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
+		    M_VMX_VEPT, M_WAITOK | M_ZERO);
+		n->vept_eptp12 = (c != NULL) ? vmcs12_read_field(c, VMCS_EPTP) : 0;
+	}
 	return (vtophys(n->vept_root) | EPT_PG_MEMORY_TYPE(6) | (3UL << 3));
 }
 
