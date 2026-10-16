@@ -35,6 +35,7 @@
 #include "vmx_msr.h"
 #include "vmx_nested.h"
 #include "vmm_stat.h"
+#include "vmm_host.h"
 #include <dev/vmm/vmm_mem.h>
 
 MALLOC_DEFINE(M_VMX_NESTED, "vmx_nested", "Intel VMX nested virtualization");
@@ -545,6 +546,86 @@ done:
 	return (0);
 }
 
+
+/*
+ * L1 -> L2: VMLAUNCH (is_resume=false) / VMRESUME (is_resume=true), §6.6.
+ * Prepara e compone VMCS02, lo rende corrente e lascia che vm_run (dopo il
+ * goto restart) ci entri. Su fallimento ripristina VMCS01 e riflette un
+ * VMfail all'L1 (in bring-up, piu' sicuro di sospendere la VM). Ritorna
+ * sempre 0: l'esito e' nel RFLAGS dell'L1 (fallimento) o nell'ingresso in L2.
+ */
+static int
+nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	struct vmcs *vmcs02;
+	struct vm_exit *vmexit = vm_exitinfo(vcpu->vcpu);
+	int error;
+
+	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
+	c = nested_current_cache(n);
+	if (c == NULL) {
+		nested_vmfail_invalid(vcpu);
+		nested_advance_rip();
+		return (0);
+	}
+	/* launch state: VMLAUNCH vuole clear, VMRESUME vuole launched */
+	if (is_resume && !c->launched) {
+		nested_vmx_result(vcpu, VMXERR_VMRESUME_NONLAUNCHED_VMCS);
+		nested_advance_rip();
+		return (0);
+	}
+	if (!is_resume && c->launched) {
+		nested_vmx_result(vcpu, VMXERR_VMLAUNCH_NONCLEAR_VMCS);
+		nested_advance_rip();
+		return (0);
+	}
+	/*
+	 * Controlli su controlli/host-state di VMCS12 in software (VMfailValid
+	 * 7/8): limite v1, rimandati. Lo stato guest lo verifica l'hardware.
+	 */
+
+	/* host-state fisso del VMCS02 (lascia nessun VMCS corrente) */
+	if ((error = vmx_nested_vmcs02_setup(c)) != 0) {
+		nested_vmx_result(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		nested_advance_rip();
+		return (0);
+	}
+	vmcs02 = (struct vmcs *)c->vmcs02;
+
+	VMPTRLD(vmcs02);
+	nested_compose_vmcs02(vcpu);
+	/* host-state PER-CPU + HOST_CR3 (dipendono dalla CPU d'ingresso) */
+	vmwrite(VMCS_HOST_TR_BASE, vmm_get_host_trbase());
+	vmwrite(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
+	vmwrite(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
+	vmwrite(VMCS_HOST_CR3, rcr3());
+
+	/* controllo di sicurezza OBBLIGATORIO (unico chiamante, §3/§6.3) */
+	error = nested_vmcs02_check(vcpu);
+	if (error != 0) {
+		VMCLEAR(vmcs02);
+		VMPTRLD(vcpu->vmcs01);		/* torna corrente l'L1 */
+		nested_vmx_result(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		nested_advance_rip();
+		return (0);
+	}
+	VMCLEAR(vmcs02);			/* vmx_run lo ricarichera' */
+
+	/*
+	 * Commuta al VMCS02: vmx_run, dopo il goto restart di vm_run, fara'
+	 * VMPTRLD(vcpu->vmcs) ed entrera' in L2. Il RIP dell'L2 e' nel
+	 * GUEST_RIP di VMCS02 (copiato in compose).
+	 */
+	vcpu->vmcs = vmcs02;
+	n->in_l2 = true;
+	c->launched = 1;			/* dopo VMLAUNCH il VMCS12 e' launched */
+	vmexit->inst_length = 0;
+	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_L2_ENTRIES, 1);
+	return (0);
+}
+
 /*
  * Slow path del nested (op vmmops_nested_exit): dispatch sull'istruzione VMX
  * che ha causato l'uscita, col vCPU FROZEN. VMLAUNCH/VMRESUME (T2.4),
@@ -568,6 +649,8 @@ vmx_nested_exit(void *vcpui)
 	case EXIT_REASON_VMPTRST:	return (nested_vmptrst(vcpu));
 	case EXIT_REASON_VMREAD:	return (nested_vmread(vcpu));
 	case EXIT_REASON_VMWRITE:	return (nested_vmwrite(vcpu));
+	case EXIT_REASON_VMLAUNCH:	return (nested_vmlaunch(vcpu, false));
+	case EXIT_REASON_VMRESUME:	return (nested_vmlaunch(vcpu, true));
 	default:
 		vm_inject_ud(vcpu->vcpu);
 		return (0);
