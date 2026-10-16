@@ -4656,6 +4656,7 @@ const struct vmm_ops vmm_ops_intel = {
 	.setdesc	= vmx_setdesc,
 	.getcap		= vmx_getcap,
 	.setcap		= vmx_setcap,
+	.nested_exit	= vmx_nested_exit,
 	.vmspace_alloc	= vmx_vmspace_alloc,
 	.vmspace_free	= vmx_vmspace_free,
 	.vlapic_init	= vmx_vlapic_init,

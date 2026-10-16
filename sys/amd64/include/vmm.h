@@ -197,6 +197,7 @@ DECLARE_VMMOPS_FUNC(int, setdesc, (void *vcpui, int num,
     struct seg_desc *desc));
 DECLARE_VMMOPS_FUNC(int, getcap, (void *vcpui, int num, int *retval));
 DECLARE_VMMOPS_FUNC(int, setcap, (void *vcpui, int num, int val));
+DECLARE_VMMOPS_FUNC(int, nested_exit, (void *vcpui));
 DECLARE_VMMOPS_FUNC(struct vmspace *, vmspace_alloc,
     (vm_offset_t min, vm_offset_t max));
 DECLARE_VMMOPS_FUNC(void, vmspace_free, (struct vmspace *vmspace));
@@ -223,6 +224,7 @@ struct vmm_ops {
 	vmmops_setdesc_t	setdesc;
 	vmmops_getcap_t		getcap;
 	vmmops_setcap_t		setcap;
+	vmmops_nested_exit_t	nested_exit;	/* slow path nested (T1.6) */
 	vmmops_vmspace_alloc_t	vmspace_alloc;
 	vmmops_vmspace_free_t	vmspace_free;
 	vmmops_vlapic_init_t	vlapic_init;
@@ -563,6 +565,7 @@ enum vm_exitcode {
 	VM_EXITCODE_BPT,
 	VM_EXITCODE_IPI,
 	VM_EXITCODE_DB,
+	VM_EXITCODE_NESTED,	/* slow path VMX annidato (T1.6) */
 	VM_EXITCODE_MAX
 };
 

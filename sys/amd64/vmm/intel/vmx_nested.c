@@ -178,3 +178,18 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 	free(n, M_VMX_NESTED);
 	vcpu->nested = NULL;
 }
+
+/*
+ * Slow path del nested (op vmmops_nested_exit). Chiamato da vm_run quando
+ * vmx_exit_process segna VM_EXITCODE_NESTED, col vCPU FROZEN. Ancora nessuna
+ * istruzione VMX gestita qui (arrivano da T1.7/T1.8): per ora si rientra.
+ */
+int
+vmx_nested_exit(void *vcpui)
+{
+	struct vmx_vcpu *vcpu = vcpui;
+
+	SDT_PROBE1(vmm, vmx, nested, slowpath, vcpu);
+	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
+	return (0);
+}

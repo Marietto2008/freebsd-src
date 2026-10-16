@@ -112,6 +112,7 @@ struct vmx_nested {
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);
+int	vmx_nested_exit(void *vcpui);
 void	vmx_nested_free(struct vmx_vcpu *vcpu);
 #endif /* _KERNEL */
 

@@ -143,6 +143,7 @@ DEFINE_VMMOPS_IFUNC(int, getdesc, (void *vcpui, int num, struct seg_desc *desc))
 DEFINE_VMMOPS_IFUNC(int, setdesc, (void *vcpui, int num, struct seg_desc *desc))
 DEFINE_VMMOPS_IFUNC(int, getcap, (void *vcpui, int num, int *retval))
 DEFINE_VMMOPS_IFUNC(int, setcap, (void *vcpui, int num, int val))
+DEFINE_VMMOPS_IFUNC(int, nested_exit, (void *vcpui))
 DEFINE_VMMOPS_IFUNC(struct vmspace *, vmspace_alloc, (vm_offset_t min,
     vm_offset_t max))
 DEFINE_VMMOPS_IFUNC(void, vmspace_free, (struct vmspace *vmspace))
@@ -1337,6 +1338,14 @@ restart:
 		case VM_EXITCODE_VMINSN:
 			vm_inject_ud(vcpu);
 			break;
+		case VM_EXITCODE_NESTED:
+			/*
+			 * Slow path del nested (§6.1): gestito in kernel col
+			 * vCPU FROZEN, mai in userland. Vedi il goto restart e
+			 * la KASSERT sotto.
+			 */
+			error = vmmops_nested_exit(vcpu->cookie);
+			break;
 		default:
 			retu = true;	/* handled in userland */
 			break;
@@ -1349,6 +1358,13 @@ restart:
 	 */
 	if (error == 0 && vme->exitcode == VM_EXITCODE_IPI)
 		error = vm_handle_ipi(vcpu, vme, &retu);
+
+	/*
+	 * Il nested rientra SUBITO, senza contare nel limite dei 4096 e
+	 * senza mai arrivare a userland (§6.1).
+	 */
+	if (error == 0 && vme->exitcode == VM_EXITCODE_NESTED)
+		goto restart;
 
 	if (error == 0 && retu == false) {
 		/*
@@ -1390,6 +1406,8 @@ restart:
 		}
 	}
 
+	KASSERT(vme->exitcode != VM_EXITCODE_NESTED,
+	    ("VM_EXITCODE_NESTED giunto al ritorno verso userland"));
 	vmm_stat_incr(vcpu, VMEXIT_USERSPACE, 1);
 	VMM_CTR2(vcpu, "retu %d/%d", error, vme->exitcode);
 

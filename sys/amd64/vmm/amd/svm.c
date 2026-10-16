@@ -2831,6 +2831,12 @@ svm_restore_tsc(void *vcpui, uint64_t offset)
 }
 #endif
 
+static int
+svm_nested_exit(void *vcpui __unused)
+{
+	return (ENXIO);	/* VMX annidato non esiste su SVM */
+}
+
 const struct vmm_ops vmm_ops_amd = {
 	.modinit	= svm_modinit,
 	.modcleanup	= svm_modcleanup,
@@ -2847,6 +2853,7 @@ const struct vmm_ops vmm_ops_amd = {
 	.setdesc	= svm_setdesc,
 	.getcap		= svm_getcap,
 	.setcap		= svm_setcap,
+	.nested_exit	= svm_nested_exit,
 	.vmspace_alloc	= svm_vmspace_alloc,
 	.vmspace_free	= svm_vmspace_free,
 	.vlapic_init	= svm_vlapic_init,
