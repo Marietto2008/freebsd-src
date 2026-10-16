@@ -1,0 +1,44 @@
+# F0 — eseguito da Marietto il 2026-10-16 su i9-9900K (Z390)
+CPU: Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz
+VMCS revision ID: 0x00000004
+== Bloccante ==
+VMCS shadowing            (0x48B bit 46) SI
+== Cambia il design se NO ==
+VMWRITE su ogni campo     (0x485 bit 29) SI
+== Necessari a vmm come L0 e come L1 ==
+EPT                       (0x48B bit 33) SI
+VPID                      (0x48B bit 37) SI
+Unrestricted guest        (0x48B bit 39) SI
+EPT page walk 4           (0x48C bit 6)  SI
+EPT memtype WB            (0x48C bit 14) SI
+INVEPT                    (0x48C bit 20) SI
+INVEPT single-context     (0x48C bit 25) SI
+INVEPT all-context        (0x48C bit 26) SI
+INVVPID                   (0x48C bit 32) SI
+INVVPID tipi 0/1/2/3      (0x48C bit 40-43) 1111
+== Informativi ==
+True controls             (0x480 bit 55) SI
+Posted interrupts         (0x481 bit 39) NO
+APIC-register virt.       (0x48B bit 40) NO
+Virtual-interrupt deliv.  (0x48B bit 41) NO
+TSC scaling               (0x48B bit 57) NO
+EPT A/D                   (0x48C bit 21) SI
+== Valori grezzi ==
+MSR 0x3a: 0x00000000 0x00020005
+MSR 0x480: 0x00da0400 0x00000004
+MSR 0x481: 0x0000007f 0x00000016
+MSR 0x482: 0xfff9fffe 0x0401e172
+MSR 0x483: 0x01ffffff 0x00036dff
+MSR 0x484: 0x0003ffff 0x000011ff
+MSR 0x485: 0x00000000 0x7004c1e7
+MSR 0x486: 0x00000000 0x80000021
+MSR 0x487: 0x00000000 0xffffffff
+MSR 0x488: 0x00000000 0x00002000
+MSR 0x489: 0x00000000 0x003767ff
+MSR 0x48a: 0x00000000 0x0000002e
+MSR 0x48b: 0x005ffcff 0x00000000
+MSR 0x48c: 0x00000f01 0x06734141
+MSR 0x48d: 0x0000007f 0x00000016
+MSR 0x48e: 0xfff9fffe 0x04006172
+MSR 0x48f: 0x01ffffff 0x00036dfb
+MSR 0x490: 0x0003ffff 0x000011fb
