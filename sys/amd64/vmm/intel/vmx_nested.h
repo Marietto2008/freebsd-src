@@ -98,6 +98,11 @@ extern uint64_t cr0_ones_mask, cr0_zeros_mask, cr4_ones_mask, cr4_zeros_mask;
 int	nested_compose_vmcs02(struct vmx_vcpu *vcpu);
 int	nested_vmcs02_check(struct vmx_vcpu *vcpu);
 bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
+int	vmx_vept_fault(struct vmx_vcpu *vcpu);	/* EPT violation in L2 (T2.7) */
+void	vmx_vept_flush(struct vmx_nested *n);
+uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
+struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
+uint64_t vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc);
 
 struct vmx_vcpu;
 
@@ -137,6 +142,8 @@ struct vmx_nested {
 	uint64_t	vmx_msr[VMX_NESTED_NMSR];  /* MSR VMX 0x480..0x491 (T1.4) */
 	uint64_t	feature_control;	/* IA32_FEATURE_CONTROL (T1.4) */
 	char		*msr_bitmap;	/* pagina MSR bitmap fusa L0|L1 (T6.3) */
+	uint64_t	*vept_root;	/* radice shadow EPT (T2.7), NULL se assente */
+	uint64_t	vept_eptp12;	/* EPTP12 che la shadow rispecchia */
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);

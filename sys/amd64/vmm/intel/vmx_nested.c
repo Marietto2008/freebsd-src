@@ -184,6 +184,7 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 		if (n->cache[i].vmcs02 != NULL)
 			free(n->cache[i].vmcs02, M_VMX_NESTED);
 	}
+	vmx_vept_flush(n);
 	if (n->msr_bitmap != NULL)
 		free(n->msr_bitmap, M_VMX_NESTED);
 	free(n, M_VMX_NESTED);
@@ -424,7 +425,7 @@ done:
 }
 
 /* --- store software dei campi VMCS12 (T1.8) --- */
-static struct vmcs12_cache *
+struct vmcs12_cache *
 nested_current_cache(struct vmx_nested *n)
 {
 	int i;
@@ -437,7 +438,7 @@ nested_current_cache(struct vmx_nested *n)
 	return (NULL);
 }
 
-static uint64_t
+uint64_t
 vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc)
 {
 	int i;
@@ -793,6 +794,19 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		    (2 << 8))	/* type 2 = NMI */
 			return (false);
 		/* FALLTHROUGH: riflette */
+	case EXIT_REASON_EPT_FAULT:
+	case EXIT_REASON_EPT_MISCONFIG: {
+		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
+		if (cc != NULL && (vmcs12_read_field(cc,
+		    VMCS_SEC_PROC_BASED_CTLS) & PROCBASED2_ENABLE_EPT)) {
+			if (vmx_vept_fault(vcpu) == 0)
+				return (false);	/* shadow installata, rientra in L2 */
+			nested_reflect_to_l1(vcpu, vmexit);
+			return (true);
+		}
+		/* VMCS12 senza EPT: L2-GPA == L1-GPA, gestione L0 normale */
+		return (false);
+	}
 	default:
 		nested_reflect_to_l1(vcpu, vmexit);
 		return (true);
@@ -989,8 +1003,12 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 		vmwrite(gstate[i], vmcs12_read_field(c, gstate[i]));
 
 	/* --- EPTP, VPID, MSR bitmap, TSC offset, liste MSR, link pointer --- */
-	/* EPTP01 finche' VMCS12 non usa EPT con shadow (T2.7). */
-	vmwrite(VMCS_EPTP, x->vmx->eptp);
+	/* EPTP: shadow EPT se VMCS12 usa EPT (T2.7), altrimenti EPTP01. */
+	if (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	    PROCBASED2_ENABLE_EPT)
+		vmwrite(VMCS_EPTP, vmx_vept_eptp(vcpu));
+	else
+		vmwrite(VMCS_EPTP, x->vmx->eptp);
 	/* VPID: per ora quello del vCPU; VPID02 distinto in T2.8. */
 	vmwrite(VMCS_VPID, x->state.vpid);
 	/* MSR bitmap: quello dell'L0 (intercetta cio' che serve a L0); la
