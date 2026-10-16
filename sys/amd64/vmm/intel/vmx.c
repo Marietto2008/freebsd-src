@@ -2067,6 +2067,17 @@ vmx_emulate_cr4_access(struct vmx_vcpu *vcpu, uint64_t exitqual)
 
 	regval = vmx_get_guest_reg(vcpu, (exitqual >> 8) & 0xf);
 
+	/*
+	 * Nested (T1.5): CR4.VMXE dell'L1 e' tracciata nella read shadow
+	 * (regval ci finisce sotto). In VMX operation l'L1 non puo'
+	 * azzerarla: #GP (SDM, "CR4.VMXE").
+	 */
+	if (vcpu->nested != NULL && vcpu->nested->vmxon &&
+	    (regval & CR4_VMXE) == 0) {
+		vm_inject_gp(vcpu->vcpu);
+		return (HANDLED);
+	}
+
 	vmcs_write(VMCS_CR4_SHADOW, regval);
 
 	crval = regval | cr4_ones_mask;
