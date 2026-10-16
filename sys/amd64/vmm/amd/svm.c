@@ -2455,6 +2455,10 @@ svm_setcap(void *vcpui, int type, int val)
 	error = 0;
 
 	switch (type) {
+	case VM_CAP_NESTED_VIRT:
+		/* VMX annidato: non esiste su SVM (D3). */
+		error = ENOENT;
+		break;
 	case VM_CAP_HALT_EXIT:
 		svm_set_intercept(vcpu, VMCB_CTRL1_INTCPT,
 		    VMCB_INTCPT_HLT, val);

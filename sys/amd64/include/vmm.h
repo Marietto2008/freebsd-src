@@ -399,6 +399,7 @@ enum vm_cap_type {
 	VM_CAP_IPI_EXIT,
 	VM_CAP_MASK_HWINTR,
 	VM_CAP_RFLAGS_TF,
+	VM_CAP_NESTED_VIRT,	/* VMX annidato (D3, T1.2) */
 	VM_CAP_MAX
 };
 

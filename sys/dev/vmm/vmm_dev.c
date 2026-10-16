@@ -718,6 +718,17 @@ vmmdev_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		struct vm_capability *vmcap;
 
 		vmcap = (struct vm_capability *)data;
+#ifdef __amd64__
+		/*
+		 * D3.b(i): accendere la virtualizzazione annidata e' un punto
+		 * d'ingresso a codice nuovo dell'L0; lo si consente solo a chi
+		 * ha PRIV_DRIVER (root fuori dalle jail), come gli altri
+		 * controlli di privilegio di questo file.
+		 */
+		if (vmcap->captype == VM_CAP_NESTED_VIRT && vmcap->capval != 0 &&
+		    (error = priv_check(td, PRIV_DRIVER)) != 0)
+			break;
+#endif
 		error = vm_set_capability(vcpu, vmcap->captype, vmcap->capval);
 		break;
 	}

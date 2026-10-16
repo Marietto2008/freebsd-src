@@ -135,6 +135,7 @@ struct vmx_vcpu {
 	struct vmxcap	cap;
 	struct vmxstate	state;
 	struct vm_mtrr  mtrr;
+	int		has_run;	/* >0 dopo il primo vmx_run (D3/T1.2) */
 	int		vcpuid;
 };
 

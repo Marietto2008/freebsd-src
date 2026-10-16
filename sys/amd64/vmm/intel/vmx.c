@@ -3272,6 +3272,7 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	vlapic = vm_lapic(vcpu->vcpu);
 	vmexit = vm_exitinfo(vcpu->vcpu);
 	launched = 0;
+	vcpu->has_run = 1;	/* D3/T1.2: blocca l'accensione tardiva del nested */
 
 	KASSERT(vmxctx->pmap == pmap,
 	    ("pmap %p different than ctx pmap %p", pmap, vmxctx->pmap));
@@ -3903,6 +3904,9 @@ vmx_getcap(void *vcpui, int type, int *retval)
 	case VM_CAP_IPI_EXIT:
 		ret = 0;
 		break;
+	case VM_CAP_NESTED_VIRT:
+		ret = 0;
+		break;
 	default:
 		break;
 	}
@@ -4004,6 +4008,18 @@ vmx_setcap(void *vcpui, int type, int val)
 		vlapic->ipi_exit = val;
 		break;
 	case VM_CAP_MASK_HWINTR:
+		retval = 0;
+		break;
+	case VM_CAP_NESTED_VIRT:
+		/*
+		 * Capability puramente virtuale (nessun controllo VMCS): la
+		 * registra solo cap.set. L'accensione 0->1 e' ammessa solo
+		 * prima del primo vmx_run del vCPU (o dopo un reset, D5),
+		 * altrimenti EBUSY. L'allocazione dello stato nested e' T1.3.
+		 */
+		if (val && vcpu->has_run &&
+		    (vcpu->cap.set & (1 << VM_CAP_NESTED_VIRT)) == 0)
+			return (EBUSY);
 		retval = 0;
 		break;
 	default:
