@@ -2,8 +2,8 @@
 
 setxkbmap it
 
-kldunload vmm
-kldload /mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko
+# NB: il ricarico del vmm nested lo fa il blocco piu' sotto, per ID e solo a
+# zero VM attive ('kldunload vmm' a mano fallirebbe: il file e' vmm-restore.ko).
 
 vms="$(ls /dev/vmm/*)"
 vncs="$(ps ax | awk '/vncviewer [0]/{print $6}')"
@@ -25,26 +25,24 @@ NESTED_VMM=/mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko
 # Il vmm caricato DEVE essere questo (nested). Se ne e' su un altro -- tipico:
 # /boot/kernel/vmm-restore.ko, che NON e' nested e fa fallire x86.nested_virt --
 # lo scambio. MA solo a zero VM attive, se no kldunload romperebbe le VM vive.
-cur=$(kldstat -v 2>/dev/null | awk -F'[()]' '/vmm-restore\.ko \(/{print $2; exit}')
-if [ "$cur" != "$NESTED_VMM" ]; then
-	if ls /dev/vmm/* >/dev/null 2>&1; then
-		echo "Caricato un vmm NON nested ($cur) e ci sono VM attive:"
-		ls /dev/vmm/
-		echo "Distruggile (bhyvectl --vm=NOME --destroy) e rilancia."
-		exit 1
-	fi
-	# scarico il vmm caricato PER ID (il file e' vmm-restore.ko, non "vmm":
-	# kldunload vmm darebbe "can't find file vmm"). Dentro c'e' anche pci/ppt,
-	# ma a zero VM si scarica/ricarica -- come nei tuoi swap di modulo abituali;
-	# al ricarico ppt si riaggancia alla GPU via i pptdevs di loader.conf.
-	id=$(kldstat 2>/dev/null | awk '/[ \t]vmm-restore\.ko/{print $1; exit}')
-	if [ -n "$id" ]; then
-		echo "scarico il vmm corrente (id $id: $cur)"
-		kldunload -i "$id" || { echo "kldunload id $id fallito"; exit 1; }
-	fi
-	echo "carico il vmm nested $NESTED_VMM"
-	kldload "$NESTED_VMM" || { echo "kldload del vmm nested fallito"; exit 1; }
+# RICARICO SEMPRE il modulo nested dal file. Confrontare per PERCORSO non basta:
+# il file puo' essere stato RICOMPILATO tra un avvio e l'altro (stesso percorso,
+# contenuto diverso) e un modulo stale fa fallire x86.nested_virt. Solo a 0 VM:
+# dentro vmm-restore.ko c'e' anche pci/ppt, al ricarico si riaggancia via pptdevs.
+if ls /dev/vmm/* >/dev/null 2>&1; then
+	echo "Ci sono VM attive: non posso ricaricare il vmm. Distruggile:"
+	ls /dev/vmm/
+	echo "  bhyvectl --vm=NOME --destroy   (poi rilancia)"
+	exit 1
 fi
+# scarico il vmm corrente PER ID (il file e' vmm-restore.ko, non "vmm")
+id=$(kldstat 2>/dev/null | awk '/[ \t]vmm-restore\.ko/{print $1; exit}')
+if [ -n "$id" ]; then
+	echo "scarico il vmm corrente (id $id) per ricaricare il nested aggiornato"
+	kldunload -i "$id" || { echo "kldunload id $id fallito"; exit 1; }
+fi
+echo "carico il vmm nested $NESTED_VMM"
+kldload "$NESTED_VMM" || { echo "kldload del vmm nested fallito"; exit 1; }
 echo "vmm nested attivo: $(kldstat -v 2>/dev/null | awk -F'[()]' '/vmm-restore\.ko \(/{print $2; exit}')"
 
 sleep 10
