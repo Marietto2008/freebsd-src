@@ -103,6 +103,8 @@ void	vmx_vept_flush(struct vmx_nested *n);
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
 struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
 uint64_t vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc);
+uint16_t vpid_alloc(int vcpuid);
+void vpid_free(int vpid);
 
 struct vmx_vcpu;
 
@@ -144,6 +146,7 @@ struct vmx_nested {
 	char		*msr_bitmap;	/* pagina MSR bitmap fusa L0|L1 (T6.3) */
 	uint64_t	*vept_root;	/* radice shadow EPT (T2.7), NULL se assente */
 	uint64_t	vept_eptp12;	/* EPTP12 che la shadow rispecchia */
+	uint16_t	vpid2;		/* VPID distinto per L2 (T2.8) */
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);

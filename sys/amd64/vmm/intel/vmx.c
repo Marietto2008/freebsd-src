@@ -564,7 +564,7 @@ vmx_fix_cr4(u_long cr4)
 	return ((cr4 | cr4_ones_mask) & ~cr4_zeros_mask);
 }
 
-static void
+void
 vpid_free(int vpid)
 {
 	if (vpid < 0 || vpid > 0xffff)
@@ -579,7 +579,7 @@ vpid_free(int vpid)
 		free_unr(vpid_unr, vpid);
 }
 
-static uint16_t
+uint16_t
 vpid_alloc(int vcpuid)
 {
 	int x;

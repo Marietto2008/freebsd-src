@@ -158,6 +158,7 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
 		n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
 	vmx_nested_init_msrs(n);
+	n->vpid2 = vpid_alloc(vcpu->vcpuid);	/* VPID distinto L2 (T2.8) */
 	/*
 	 * msr_bitmap e le pagine VMCS02 restano NULL: le allocano pigramente
 	 * T6.3 (bitmap fusa) e T1.8 (VMCS02 al VMPTRLD del VMCS12).
@@ -185,6 +186,8 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 			free(n->cache[i].vmcs02, M_VMX_NESTED);
 	}
 	vmx_vept_flush(n);
+	if (n->vpid2 != 0)
+		vpid_free(n->vpid2);
 	if (n->msr_bitmap != NULL)
 		free(n->msr_bitmap, M_VMX_NESTED);
 	free(n, M_VMX_NESTED);
@@ -691,6 +694,14 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* [v2] IA-32e mode guest degli entry controls di VMCS12 = EFER.LMA di L2 */
 	efer = vmcs_read(VMCS_GUEST_IA32_EFER);
 
+	/* 3. se VMCS12 non usa VPID, flush del VPID02 (§6.6) */
+	if ((vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	    PROCBASED2_ENABLE_VPID) == 0) {
+		struct invvpid_desc d;
+		bzero(&d, sizeof(d));
+		d.vpid = n->vpid2;
+		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
+	}
 	/* 4. commuta a VMCS01 */
 	VMCLEAR(vmcs02);
 	VMPTRLD(vcpu->vmcs01);
@@ -813,6 +824,22 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	}
 }
 
+static int
+nested_invvpid(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct invvpid_desc d;
+
+	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
+	/* flush delle mappature VPID02 di L2 (semplificato: single-context) */
+	bzero(&d, sizeof(d));
+	d.vpid = n->vpid2;
+	invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+	nested_advance_rip();
+	return (0);
+}
+
 /*
  * Slow path del nested (op vmmops_nested_exit): dispatch sull'istruzione VMX
  * che ha causato l'uscita, col vCPU FROZEN. VMLAUNCH/VMRESUME (T2.4),
@@ -838,6 +865,7 @@ vmx_nested_exit(void *vcpui)
 	case EXIT_REASON_VMWRITE:	return (nested_vmwrite(vcpu));
 	case EXIT_REASON_VMLAUNCH:	return (nested_vmlaunch(vcpu, false));
 	case EXIT_REASON_VMRESUME:	return (nested_vmlaunch(vcpu, true));
+	case EXIT_REASON_INVVPID:	return (nested_invvpid(vcpu));
 	default:
 		vm_inject_ud(vcpu->vcpu);
 		return (0);
@@ -1009,8 +1037,8 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 		vmwrite(VMCS_EPTP, vmx_vept_eptp(vcpu));
 	else
 		vmwrite(VMCS_EPTP, x->vmx->eptp);
-	/* VPID: per ora quello del vCPU; VPID02 distinto in T2.8. */
-	vmwrite(VMCS_VPID, x->state.vpid);
+	/* VPID02 distinto per l2 (T2.8), per non aliasare la TLB con l1 */
+	vmwrite(VMCS_VPID, n->vpid2);
 	/* MSR bitmap: quello dell'L0 (intercetta cio' che serve a L0); la
 	 * fusione con quello dell'L1 e' T6.3. */
 	vmwrite(VMCS_MSR_BITMAP, vtophys(x->vmx->msr_bitmap));
