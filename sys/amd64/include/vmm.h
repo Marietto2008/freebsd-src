@@ -103,6 +103,7 @@ enum vm_reg_name {
 	VM_REG_GUEST_GS_BASE,
 	VM_REG_GUEST_KGS_BASE,
 	VM_REG_GUEST_TPR,
+	VM_REG_GUEST_NESTED_LEVEL,	/* read-only: 1=L1, 2=L2 (D2/T2.10) */
 	VM_REG_LAST
 };
 

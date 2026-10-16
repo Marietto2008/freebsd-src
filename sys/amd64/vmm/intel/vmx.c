@@ -3782,6 +3782,9 @@ vmx_getreg(void *vcpui, int reg, uint64_t *retval)
 	case VM_REG_GUEST_TPR:
 		*retval = vlapic_get_cr8(vm_lapic(vcpu->vcpu));
 		return (0);
+	case VM_REG_GUEST_NESTED_LEVEL:
+		*retval = (vcpu->nested != NULL && vcpu->nested->in_l2) ? 2 : 1;
+		return (0);
 	}
 
 	if (vmxctx_getreg(&vcpu->ctx, reg, retval) == 0)
@@ -3806,6 +3809,14 @@ vmx_setreg(void *vcpui, int reg, uint64_t val)
 
 	if (reg == VM_REG_GUEST_INTR_SHADOW)
 		return (vmx_modify_intr_shadow(vcpu, running, val));
+
+	/* D2/T2.10: il livello nested e' read-only; in L2 CR0/CR4/EFER danno EBUSY */
+	if (reg == VM_REG_GUEST_NESTED_LEVEL)
+		return (EINVAL);
+	if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+	    (reg == VM_REG_GUEST_CR0 || reg == VM_REG_GUEST_CR4 ||
+	    reg == VM_REG_GUEST_EFER))
+		return (EBUSY);
 
 	if (vmxctx_setreg(&vcpu->ctx, reg, val) == 0)
 		return (0);
@@ -4527,6 +4538,10 @@ vmx_vcpu_snapshot(void *vcpui, struct vm_snapshot_meta *meta)
 	err = 0;
 	vcpu = vcpui;
 	vmx = vcpu->vmx;
+
+	/* D2/T2.10: niente snapshot mentre l'L1 e' in VMX operation */
+	if (vcpu->nested != NULL && vcpu->nested->vmxon)
+		return (EBUSY);
 	vmcs = vcpu->vmcs;
 
 	run = vcpu_is_running(vcpu->vcpu, &hostcpu);
