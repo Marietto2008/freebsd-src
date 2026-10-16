@@ -35,6 +35,18 @@ if ls /dev/vmm/* >/dev/null 2>&1; then
 	echo "  bhyvectl --vm=NOME --destroy   (poi rilancia)"
 	exit 1
 fi
+# Un bhyve rimasto appeso (tipico dopo un --destroy: il nodo /dev/vmm sparisce
+# ma il processo cicla su vm_run errno 6) tiene il modulo "Device busy".
+# Ammazzo quello di QUESTA VM e aspetto che il refcount scenda.
+if pgrep -f 'bhyve.*vm0:12' >/dev/null 2>&1; then
+	echo "bhyve di vm0:12 ancora vivo: lo chiudo per liberare il vmm"
+	pkill -9 -f 'bhyve.*vm0:12' 2>/dev/null || true
+	i=0
+	while pgrep -f 'bhyve.*vm0:12' >/dev/null 2>&1 && [ "$i" -lt 20 ]; do
+		i=$((i + 1)); sleep 1
+	done
+fi
+
 # scarico il vmm corrente PER ID (il file e' vmm-restore.ko, non "vmm")
 id=$(kldstat 2>/dev/null | awk '/[ \t]vmm-restore\.ko/{print $1; exit}')
 if [ -n "$id" ]; then
