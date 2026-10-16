@@ -1237,6 +1237,7 @@ vm_run(struct vcpu *vcpu)
 	bool retu, intr_disabled;
 	pmap_t pmap;
 	int vmexit_count = 0;
+	u_int nested_loops = 0;		/* restart nested consecutivi (anti-freeze) */
 
 	vcpuid = vcpu->vcpuid;
 
@@ -1363,8 +1364,25 @@ restart:
 	 * Il nested rientra SUBITO, senza contare nel limite dei 4096 e
 	 * senza mai arrivare a userland (§6.1).
 	 */
-	if (error == 0 && vme->exitcode == VM_EXITCODE_NESTED)
+	if (error == 0 && vme->exitcode == VM_EXITCODE_NESTED) {
+		/*
+		 * Anti-freeze del nested: il restart qui NON passa dal limite
+		 * dei 4096 ne' dallo yield del percorso normale, quindi un
+		 * gestore nested che non avanza (es. L2 che rifaulta e hvix64
+		 * rifa' VMRESUME all'infinito) pianterebbe l'host in un loop
+		 * stretto senza cedere la CPU. Cedo periodicamente e, oltre una
+		 * soglia enorme, PANICO (col dump) invece di congelare: due
+		 * milioni di uscite nested consecutive = loop, mai carico vero.
+		 */
+		if ((++nested_loops & 1023) == 0)
+			kern_yield(PRI_USER);
+		if (nested_loops >= 2000000)
+			panic("nested: loop su VM_EXITCODE_NESTED "
+			    "(vcpu%d rip=%#lx count=%u)", vcpuid,
+			    (u_long)vme->rip, nested_loops);
 		goto restart;
+	}
+	nested_loops = 0;		/* progresso: uscita non-nested */
 
 	if (error == 0 && retu == false) {
 		/*
