@@ -135,6 +135,7 @@ int	vmx_nested_init(struct vmx_vcpu *vcpu);
 int	vmx_nested_exit(void *vcpui);
 void	nested_vmx_result(struct vmx_vcpu *vcpu, int errnum);
 void	nested_vmfail_invalid(struct vmx_vcpu *vcpu);
+int	vmx_nested_vmcs02_setup(struct vmcs12_cache *c);
 void	vmx_nested_free(struct vmx_vcpu *vcpu);
 #endif /* _KERNEL */
 

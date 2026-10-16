@@ -31,6 +31,7 @@
 #include <machine/vmparam.h>
 #include "vmx_cpufunc.h"
 #include "vmx.h"
+#include "vmx_msr.h"
 #include "vmx_nested.h"
 #include "vmm_stat.h"
 #include <dev/vmm/vmm_mem.h>
@@ -570,4 +571,30 @@ vmx_nested_exit(void *vcpui)
 		vm_inject_ud(vcpu->vcpu);
 		return (0);
 	}
+}
+
+/*
+ * Prepara la pagina VMCS02 di una voce di cache (T2.2): alloca se serve,
+ * scrive la revision ID, VMCLEAR, poi l'host-state FISSO via vmcs_init_host()
+ * sulla pagina resa corrente. I campi host PER-CPU (TR/GDTR/GS base) e
+ * HOST_CR3 li scrive il chiamante all'ingresso in L2 (T2.4). Al ritorno non
+ * resta nessun VMCS corrente: il chiamante ricarica cio' che gli serve.
+ */
+int
+vmx_nested_vmcs02_setup(struct vmcs12_cache *c)
+{
+	struct vmcs *v;
+	int error;
+
+	if (c->vmcs02 == NULL)
+		c->vmcs02 = malloc_aligned(sizeof(struct vmcs), PAGE_SIZE,
+		    M_VMX_NESTED, M_WAITOK | M_ZERO);
+	v = (struct vmcs *)c->vmcs02;
+	v->identifier = vmx_revision();
+	if ((error = vmclear(v)) != 0)
+		return (error);
+	VMPTRLD(v);
+	error = vmcs_init_host();
+	VMCLEAR(v);
+	return (error);
 }

@@ -338,7 +338,7 @@ done:
 }
 
 int
-vmcs_init(struct vmcs *vmcs)
+vmcs_init_host(void)
 {
 	int error, codesel, datasel, tsssel;
 	u_long cr0, cr4, efer;
@@ -348,54 +348,49 @@ vmcs_init(struct vmcs *vmcs)
 	datasel = vmm_get_host_datasel();
 	tsssel = vmm_get_host_tsssel();
 
-	/*
-	 * Make sure we have a "current" VMCS to work with.
-	 */
-	VMPTRLD(vmcs);
-
 	/* Host state */
 
 	/* Initialize host IA32_PAT MSR */
 	pat = vmm_get_host_pat();
 	if ((error = vmwrite(VMCS_HOST_IA32_PAT, pat)) != 0)
-		goto done;
+		return (error);
 
 	/* Load the IA32_EFER MSR */
 	efer = vmm_get_host_efer();
 	if ((error = vmwrite(VMCS_HOST_IA32_EFER, efer)) != 0)
-		goto done;
+		return (error);
 
 	/* Load the control registers */
 
 	cr0 = vmm_get_host_cr0();
 	if ((error = vmwrite(VMCS_HOST_CR0, cr0)) != 0)
-		goto done;
+		return (error);
 
 	cr4 = vmm_get_host_cr4() | CR4_VMXE;
 	if ((error = vmwrite(VMCS_HOST_CR4, cr4)) != 0)
-		goto done;
+		return (error);
 
 	/* Load the segment selectors */
 	if ((error = vmwrite(VMCS_HOST_ES_SELECTOR, datasel)) != 0)
-		goto done;
+		return (error);
 
 	if ((error = vmwrite(VMCS_HOST_CS_SELECTOR, codesel)) != 0)
-		goto done;
+		return (error);
 
 	if ((error = vmwrite(VMCS_HOST_SS_SELECTOR, datasel)) != 0)
-		goto done;
+		return (error);
 
 	if ((error = vmwrite(VMCS_HOST_DS_SELECTOR, datasel)) != 0)
-		goto done;
+		return (error);
 
 	if ((error = vmwrite(VMCS_HOST_FS_SELECTOR, datasel)) != 0)
-		goto done;
+		return (error);
 
 	if ((error = vmwrite(VMCS_HOST_GS_SELECTOR, datasel)) != 0)
-		goto done;
+		return (error);
 
 	if ((error = vmwrite(VMCS_HOST_TR_SELECTOR, tsssel)) != 0)
-		goto done;
+		return (error);
 
 	/*
 	 * Load the Base-Address for %fs and idtr.
@@ -405,27 +400,37 @@ vmcs_init(struct vmcs *vmcs)
 	 */
 	fsbase = vmm_get_host_fsbase();
 	if ((error = vmwrite(VMCS_HOST_FS_BASE, fsbase)) != 0)
-		goto done;
+		return (error);
 
 	idtrbase = vmm_get_host_idtrbase();
 	if ((error = vmwrite(VMCS_HOST_IDTR_BASE, idtrbase)) != 0)
-		goto done;
+		return (error);
 
 	/* instruction pointer */
 	if (no_flush_rsb) {
 		if ((error = vmwrite(VMCS_HOST_RIP,
 		    (u_long)vmx_exit_guest)) != 0)
-			goto done;
+			return (error);
 	} else {
 		if ((error = vmwrite(VMCS_HOST_RIP,
 		    (u_long)vmx_exit_guest_flush_rsb)) != 0)
-			goto done;
+			return (error);
 	}
 
 	/* link pointer */
 	if ((error = vmwrite(VMCS_LINK_POINTER, ~0)) != 0)
-		goto done;
-done:
+		return (error);
+	return (0);
+}
+
+int
+vmcs_init(struct vmcs *vmcs)
+{
+	int error;
+
+	/* Rendi corrente il VMCS, scrivi l'host-state, poi rilascialo. */
+	VMPTRLD(vmcs);
+	error = vmcs_init_host();
 	VMCLEAR(vmcs);
 	return (error);
 }
