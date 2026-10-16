@@ -30,6 +30,7 @@
 #include <vm/pmap.h>
 #include <machine/vmparam.h>
 #include "vmx_cpufunc.h"
+#include "vmx_controls.h"
 #include "vmx.h"
 #include "vmx_msr.h"
 #include "vmx_nested.h"
@@ -597,4 +598,189 @@ vmx_nested_vmcs02_setup(struct vmcs12_cache *c)
 	error = vmcs_init_host();
 	VMCLEAR(v);
 	return (error);
+}
+
+/* adjust_ctl: rende un controllo valido sull'hardware (must-be-1 nel dword
+ * basso, allowed-1 nell'alto della MSR di capability). Come KVM/ACRN. */
+static uint32_t
+nested_adjust_ctl(uint32_t desired, u_int msr)
+{
+	uint64_t cap = rdmsr(msr);
+	return ((desired | (uint32_t)cap) & (uint32_t)(cap >> 32));
+}
+
+/*
+ * Compone VMCS02 da VMCS12 (§6.3). Il VMCS02 deve essere GIA' corrente
+ * (VMPTRLD dal chiamante, T2.4). Legge VMCS12 dallo store software; scrive
+ * VMCS02 con vmwrite. La corrispondenza riga-per-riga con §6.3 e' in
+ * docs/nested/T2.3.md (da rivedere).
+ */
+int
+nested_compose_vmcs02(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmx_vcpu *x = vcpu;
+	struct vmcs12_cache *c;
+	uint32_t pin, proc, proc2, exitc, entryc, excbmp;
+	uint64_t g_cr0, g_cr4, m12cr0, m12cr4;
+	int i;
+	/* guest-state copiato esplicitamente (niente shadowing hw: §6.2 -> T2) */
+	static const uint32_t gstate[] = {
+		VMCS_GUEST_ES_SELECTOR, VMCS_GUEST_CS_SELECTOR,
+		VMCS_GUEST_SS_SELECTOR, VMCS_GUEST_DS_SELECTOR,
+		VMCS_GUEST_FS_SELECTOR, VMCS_GUEST_GS_SELECTOR,
+		VMCS_GUEST_LDTR_SELECTOR, VMCS_GUEST_TR_SELECTOR,
+		VMCS_GUEST_ES_LIMIT, VMCS_GUEST_CS_LIMIT, VMCS_GUEST_SS_LIMIT,
+		VMCS_GUEST_DS_LIMIT, VMCS_GUEST_FS_LIMIT, VMCS_GUEST_GS_LIMIT,
+		VMCS_GUEST_LDTR_LIMIT, VMCS_GUEST_TR_LIMIT,
+		VMCS_GUEST_GDTR_LIMIT, VMCS_GUEST_IDTR_LIMIT,
+		VMCS_GUEST_ES_ACCESS_RIGHTS, VMCS_GUEST_CS_ACCESS_RIGHTS,
+		VMCS_GUEST_SS_ACCESS_RIGHTS, VMCS_GUEST_DS_ACCESS_RIGHTS,
+		VMCS_GUEST_FS_ACCESS_RIGHTS, VMCS_GUEST_GS_ACCESS_RIGHTS,
+		VMCS_GUEST_LDTR_ACCESS_RIGHTS, VMCS_GUEST_TR_ACCESS_RIGHTS,
+		VMCS_GUEST_ES_BASE, VMCS_GUEST_CS_BASE, VMCS_GUEST_SS_BASE,
+		VMCS_GUEST_DS_BASE, VMCS_GUEST_FS_BASE, VMCS_GUEST_GS_BASE,
+		VMCS_GUEST_LDTR_BASE, VMCS_GUEST_TR_BASE,
+		VMCS_GUEST_GDTR_BASE, VMCS_GUEST_IDTR_BASE,
+		VMCS_GUEST_CR3, VMCS_GUEST_DR7, VMCS_GUEST_RSP, VMCS_GUEST_RIP,
+		VMCS_GUEST_RFLAGS, VMCS_GUEST_PENDING_DBG_EXCEPTIONS,
+		VMCS_GUEST_IA32_SYSENTER_CS, VMCS_GUEST_IA32_SYSENTER_ESP,
+		VMCS_GUEST_IA32_SYSENTER_EIP, VMCS_GUEST_IA32_DEBUGCTL,
+		VMCS_GUEST_IA32_PAT, VMCS_GUEST_IA32_EFER,
+		VMCS_GUEST_INTERRUPTIBILITY, VMCS_GUEST_ACTIVITY,
+	};
+
+	c = nested_current_cache(n);
+	if (c == NULL)
+		return (EINVAL);
+
+	/* --- Pin-based: VMCS12 U {ext-int, NMI exiting}; preempt/posted = 0 --- */
+	pin = (uint32_t)vmcs12_read_field(c, VMCS_PIN_BASED_CTLS);
+	pin |= PINBASED_EXTINT_EXITING | PINBASED_NMI_EXITING;
+	pin = nested_adjust_ctl(pin, MSR_VMX_TRUE_PINBASED_CTLS);
+	pin &= ~(PINBASED_PREMPTION_TIMER | PINBASED_POSTED_INTERRUPT);
+	vmwrite(VMCS_PIN_BASED_CTLS, pin);
+
+	/* --- Primary proc: VMCS12 U requisiti L0; I/O bitmaps=0, TPR shadow=0;
+	 *     HLT = SOLO VMCS12 (non si eredita da VMCS01) --- */
+	proc = (uint32_t)vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS);
+	proc |= PROCBASED_IO_EXITING | PROCBASED_MSR_BITMAPS |
+	    PROCBASED_MWAIT_EXITING | PROCBASED_MONITOR_EXITING |
+	    PROCBASED_SECONDARY_CONTROLS | PROCBASED_CR8_LOAD_EXITING |
+	    PROCBASED_CR8_STORE_EXITING;
+	proc = nested_adjust_ctl(proc, MSR_VMX_TRUE_PROCBASED_CTLS);
+	proc &= ~(PROCBASED_IO_BITMAPS | PROCBASED_USE_TPR_SHADOW);
+	vmwrite(VMCS_PRI_PROC_BASED_CTLS, proc);
+
+	/* --- Secondary proc: EPT=1, VPID=1, shadowing=0, APIC-virt=0 --- */
+	proc2 = (uint32_t)vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS);
+	proc2 |= PROCBASED2_ENABLE_EPT | PROCBASED2_ENABLE_VPID;
+	proc2 = nested_adjust_ctl(proc2, MSR_VMX_PROCBASED_CTLS2);
+	proc2 &= ~(PROCBASED2_VMCS_SHADOWING |
+	    PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
+	    PROCBASED2_VIRTUALIZE_X2APIC_MODE |
+	    PROCBASED2_APIC_REGISTER_VIRTUALIZATION |
+	    PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY);
+	vmwrite(VMCS_SEC_PROC_BASED_CTLS, proc2);
+
+	/* --- Exit controls: quelli dell'L0 --- */
+	exitc = nested_adjust_ctl(exit_ctls, MSR_VMX_TRUE_EXIT_CTLS);
+	vmwrite(VMCS_EXIT_CTLS, exitc);
+
+	/* --- Entry controls: IA-32e mode guest = VMCS12; load EFER/PAT/dbg=1 --- */
+	entryc = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_CTLS) &
+	    VM_ENTRY_GUEST_LMA;
+	entryc |= VM_ENTRY_LOAD_DEBUG_CONTROLS | VM_ENTRY_LOAD_PAT |
+	    VM_ENTRY_LOAD_EFER;
+	entryc = nested_adjust_ctl(entryc, MSR_VMX_TRUE_ENTRY_CTLS);
+	entryc &= ~(VM_ENTRY_INTO_SMM | VM_ENTRY_DEACTIVATE_DUAL_MONITOR);
+	vmwrite(VMCS_ENTRY_CTLS, entryc);
+
+	/* --- Exception bitmap: VMCS12 U bitmap dell'L0 (#MC, vec30, #DB) --- */
+	excbmp = (uint32_t)vmcs12_read_field(c, VMCS_EXCEPTION_BITMAP) |
+	    x->cap.exc_bitmap;
+	vmwrite(VMCS_EXCEPTION_BITMAP, excbmp);
+	vmwrite(VMCS_PF_ERROR_MASK, vmcs12_read_field(c, VMCS_PF_ERROR_MASK));
+	vmwrite(VMCS_PF_ERROR_MATCH, vmcs12_read_field(c, VMCS_PF_ERROR_MATCH));
+
+	/* --- CR0/CR4: maschere (mask12), read-shadow (VMCS12), guest con i bit
+	 *     fixed dell'host applicati --- */
+	m12cr0 = vmcs12_read_field(c, VMCS_CR0_MASK);
+	m12cr4 = vmcs12_read_field(c, VMCS_CR4_MASK);
+	vmwrite(VMCS_CR0_MASK, m12cr0);
+	vmwrite(VMCS_CR4_MASK, m12cr4);
+	vmwrite(VMCS_CR0_SHADOW, vmcs12_read_field(c, VMCS_CR0_SHADOW));
+	vmwrite(VMCS_CR4_SHADOW, vmcs12_read_field(c, VMCS_CR4_SHADOW));
+	g_cr0 = (vmcs12_read_field(c, VMCS_GUEST_CR0) | cr0_ones_mask) &
+	    ~cr0_zeros_mask;
+	g_cr4 = (vmcs12_read_field(c, VMCS_GUEST_CR4) | cr4_ones_mask) &
+	    ~cr4_zeros_mask;
+	vmwrite(VMCS_GUEST_CR0, g_cr0);
+	vmwrite(VMCS_GUEST_CR4, g_cr4);
+
+	/* --- resto del guest-state copiato esplicitamente --- */
+	for (i = 0; i < (int)nitems(gstate); i++)
+		vmwrite(gstate[i], vmcs12_read_field(c, gstate[i]));
+
+	/* --- EPTP, VPID, MSR bitmap, TSC offset, liste MSR, link pointer --- */
+	/* EPTP01 finche' VMCS12 non usa EPT con shadow (T2.7). */
+	vmwrite(VMCS_EPTP, x->vmx->eptp);
+	/* VPID: per ora quello del vCPU; VPID02 distinto in T2.8. */
+	vmwrite(VMCS_VPID, x->state.vpid);
+	/* MSR bitmap: quello dell'L0 (intercetta cio' che serve a L0); la
+	 * fusione con quello dell'L1 e' T6.3. */
+	vmwrite(VMCS_MSR_BITMAP, vtophys(x->vmx->msr_bitmap));
+	/* TSC offset: quello di VMCS12 (l'offset dell'L0 si somma in T2). */
+	vmwrite(VMCS_TSC_OFFSET, vmcs12_read_field(c, VMCS_TSC_OFFSET));
+	/* liste MSR a 0 (applicate in software nello slow path, §6.3). */
+	vmwrite(VMCS_EXIT_MSR_STORE_COUNT, 0);
+	vmwrite(VMCS_EXIT_MSR_LOAD_COUNT, 0);
+	vmwrite(VMCS_ENTRY_MSR_LOAD_COUNT, 0);
+	vmwrite(VMCS_LINK_POINTER, ~0UL);
+
+	/* entry interruption info: VMCS12 (prima entry dopo VMLAUNCH/VMRESUME). */
+	vmwrite(VMCS_ENTRY_INTR_INFO, vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO));
+
+	c->control_dirty = false;
+	SDT_PROBE1(vmm, vmx, nested, enter_l2, vcpu);
+	return (0);
+}
+
+/*
+ * Controllo di sicurezza OBBLIGATORIO prima di ogni VMLAUNCH/VMRESUME su
+ * VMCS02 (§3). Unico chiamante: subito prima di vmx_enter_guest (T2.4). Il
+ * VMCS02 deve essere corrente. Ritorna 0 se e' sicuro entrare.
+ */
+int
+nested_vmcs02_check(struct vmx_vcpu *vcpu)
+{
+	uint32_t pin, proc, proc2;
+	uint64_t link;
+
+	pin   = (uint32_t)vmcs_read(VMCS_PIN_BASED_CTLS);
+	proc  = (uint32_t)vmcs_read(VMCS_PRI_PROC_BASED_CTLS);
+	proc2 = (uint32_t)vmcs_read(VMCS_SEC_PROC_BASED_CTLS);
+	link  = vmcs_read(VMCS_LINK_POINTER);
+
+	/* requisiti dell'L0 presenti */
+	if ((pin & (PINBASED_EXTINT_EXITING | PINBASED_NMI_EXITING)) !=
+	    (PINBASED_EXTINT_EXITING | PINBASED_NMI_EXITING))
+		return (EINVAL);
+	if ((proc & PROCBASED_SECONDARY_CONTROLS) == 0)
+		return (EINVAL);
+	/* I/O incondizionato e NIENTE I/O bitmaps */
+	if ((proc & PROCBASED_IO_EXITING) == 0 ||
+	    (proc & PROCBASED_IO_BITMAPS) != 0)
+		return (EINVAL);
+	/* HLT NON ereditato da VMCS01: non deve essere forzato dall'L0 qui.
+	 * (Se c'e', deve venire da VMCS12; non lo possiamo distinguere a
+	 * posteriori, quindi e' solo un promemoria per la review.) */
+	/* shadowing spento, EPT acceso, link pointer ~0 */
+	if ((proc2 & PROCBASED2_VMCS_SHADOWING) != 0)
+		return (EINVAL);
+	if ((proc2 & PROCBASED2_ENABLE_EPT) == 0)
+		return (EINVAL);
+	if (link != ~0UL)
+		return (EINVAL);
+	return (0);
 }

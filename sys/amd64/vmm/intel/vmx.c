@@ -137,16 +137,16 @@ SYSCTL_NODE(_hw_vmm, OID_AUTO, vmx, CTLFLAG_RW | CTLFLAG_MPSAFE, NULL,
 int vmxon_enabled[MAXCPU];
 static uint8_t *vmxon_region;
 
-static uint32_t pinbased_ctls, procbased_ctls, procbased_ctls2;
-static uint32_t exit_ctls, entry_ctls;
+uint32_t pinbased_ctls, procbased_ctls, procbased_ctls2;
+uint32_t exit_ctls, entry_ctls;
 
-static uint64_t cr0_ones_mask, cr0_zeros_mask;
+uint64_t cr0_ones_mask, cr0_zeros_mask;
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, cr0_ones_mask, CTLFLAG_RD,
 	     &cr0_ones_mask, 0, NULL);
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, cr0_zeros_mask, CTLFLAG_RD,
 	     &cr0_zeros_mask, 0, NULL);
 
-static uint64_t cr4_ones_mask, cr4_zeros_mask;
+uint64_t cr4_ones_mask, cr4_zeros_mask;
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, cr4_ones_mask, CTLFLAG_RD,
 	     &cr4_ones_mask, 0, NULL);
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, cr4_zeros_mask, CTLFLAG_RD,

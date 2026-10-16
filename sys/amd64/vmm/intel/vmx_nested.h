@@ -91,6 +91,13 @@ int	vmx_getdesc(void *vcpui, int reg, struct seg_desc *desc);
 void	vmx_paging_info(struct vm_guest_paging *paging);
 enum vm_cpu_mode vmx_cpu_mode(void);
 
+/* Controlli/maschere richiesti dall'L0 (vmx.c), per comporre VMCS02 (T2.3). */
+extern uint32_t pinbased_ctls, procbased_ctls, procbased_ctls2;
+extern uint32_t exit_ctls, entry_ctls;
+extern uint64_t cr0_ones_mask, cr0_zeros_mask, cr4_ones_mask, cr4_zeros_mask;
+int	nested_compose_vmcs02(struct vmx_vcpu *vcpu);
+int	nested_vmcs02_check(struct vmx_vcpu *vcpu);
+
 struct vmx_vcpu;
 
 /*
