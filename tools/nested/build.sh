@@ -55,6 +55,16 @@ fi
 say "build-id $BUILD_ID -> $DEST"
 run "mkdir -p '$DEST/lib' '$DEST/sbin' '$DEST/bin' '$DEST/include'"
 
+# Sysroot per il userland e per QEMU: <machine/*.h> e <x86/*.h> del CLONE,
+# non di /usr/include. Quando il nested cambia l'ABI (es. nuovo VM_CAP_* in
+# vmm.h), il userland DEVE vedere i nuovi header. Il modulo (kernel, -nostdinc)
+# ignora C_INCLUDE_PATH, quindi e' sicuro esportarlo globalmente.
+SR="$DEST/sysroot-include"
+run "mkdir -p '$SR'"
+run "ln -shf '$SRC/sys/amd64/include' '$SR/machine'"
+run "ln -shf '$SRC/sys/x86/include' '$SR/x86'"
+export C_INCLUDE_PATH="$SR${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+
 # --- coerenza kernel/userland (§7.3.1) ------------------------------------
 UK=$(uname -K); UU=$(uname -U)
 say "uname -K=$UK  uname -U=$UU  KERNCONF=$KERNCONF"
