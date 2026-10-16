@@ -1,0 +1,8 @@
+# F2c — L2: il grosso di vmx.flat + EPT + page-fault VMX.
+# kut-run.sh --nested kut-f2c.list
+# NB: il set esatto va allineato alle voci [vmx] (con le sue esclusioni),
+# [ept] e [vmx_pf_*] di unittests.cfg; le esclusioni attese vanno in
+# docs/nested/fallimenti-attesi.md. Qui lo schema di partenza.
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+vmx-full | vmx.flat | | | 1 | 1024 | 600
+ept      | ept.flat | | | 1 | 1024 | 300

@@ -1,0 +1,4 @@
+# F2b — L2: intercetti, interrupt, MSR.
+# kut-run.sh --nested kut-f2b.list
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+vmx | vmx.flat | I/O_bitmap instruction_intercept interrupt nmi_hlt debug_controls MSR_switch vmmcall disable_RDTSCP | | 1 | 1024 | 240
