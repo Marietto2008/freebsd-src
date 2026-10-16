@@ -21,12 +21,19 @@
 
 #include <machine/vmm.h>
 #include <machine/cpufunc.h>
+#include <machine/psl.h>
 #include <machine/specialreg.h>
 #include <machine/md_var.h>
 
+#include <vm/vm.h>
+#include <vm/vm_extern.h>
+#include <vm/pmap.h>
+#include <machine/vmparam.h>
+#include "vmx_cpufunc.h"
 #include "vmx.h"
 #include "vmx_nested.h"
 #include "vmm_stat.h"
+#include <dev/vmm/vmm_mem.h>
 
 MALLOC_DEFINE(M_VMX_NESTED, "vmx_nested", "Intel VMX nested virtualization");
 
@@ -179,17 +186,262 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 	vcpu->nested = NULL;
 }
 
+/* --- Esito di un'istruzione VMX nel RFLAGS dell'L1 (SDM 31.2) --- */
+void
+nested_vmx_result(struct vmx_vcpu *vcpu, int errnum)
+{
+	uint64_t rflags;
+
+	rflags = vmcs_read(VMCS_GUEST_RFLAGS);
+	rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_Z | PSL_N | PSL_V);
+	if (errnum != VMXR_SUCCEED) {		/* VMfailValid(errnum) */
+		rflags |= PSL_Z;
+		vmcs_write(VMCS_INSTRUCTION_ERROR, errnum);
+	}
+	vmcs_write(VMCS_GUEST_RFLAGS, rflags);
+}
+
+void
+nested_vmfail_invalid(struct vmx_vcpu *vcpu)
+{
+	uint64_t rflags;
+
+	rflags = vmcs_read(VMCS_GUEST_RFLAGS);
+	rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_Z | PSL_N | PSL_V);
+	rflags |= PSL_C;			/* VMfailInvalid */
+	vmcs_write(VMCS_GUEST_RFLAGS, rflags);
+}
+
+static void
+nested_advance_rip(void)
+{
+	vmcs_write(VMCS_GUEST_RIP, vmcs_read(VMCS_GUEST_RIP) +
+	    vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH));
+}
+
 /*
- * Slow path del nested (op vmmops_nested_exit). Chiamato da vm_run quando
- * vmx_exit_process segna VM_EXITCODE_NESTED, col vCPU FROZEN. Ancora nessuna
- * istruzione VMX gestita qui (arrivano da T1.7/T1.8): per ora si rientra.
+ * Decodifica l'operando di memoria di un'istruzione VMX (SDM: campo
+ * VM-exit instruction-information + exit qualification) e lo traduce nel
+ * GPA dell'L1. Ritorna 0 e *gpa, oppure -1 se e' stata iniettata
+ * un'eccezione (#GP/#PF) nell'L1. Il formato dei bit coincide con quello
+ * gia' usato da inout_str_* e con KVM/SDM: addrsize 9:7, seg 17:15,
+ * index 21:18 (invalido se bit 22), base 26:23 (invalido se bit 27).
+ */
+static int
+nested_operand_gpa(struct vmx_vcpu *vcpu, int prot, uint64_t *gpa)
+{
+	struct vm_guest_paging paging;
+	struct seg_desc desc;
+	uint64_t qual, offset, gla;
+	uint32_t info;
+	enum vm_reg_name seg;
+	int scaling, addrsize, fault, error;
+
+	qual = vmcs_read(VMCS_EXIT_QUALIFICATION);
+	info = (uint32_t)vmcs_read(VMCS_EXIT_INSTRUCTION_INFO);
+
+	scaling = info & 0x3;
+	switch ((info >> 7) & 0x7) {
+	case 0: addrsize = 2; break;
+	case 1: addrsize = 4; break;
+	default: addrsize = 8; break;
+	}
+	seg = vm_segment_name((info >> 15) & 0x7);
+
+	offset = qual;				/* displacement */
+	if (((info >> 27) & 0x1) == 0)		/* BaseReg valido */
+		offset += vmx_get_guest_reg(vcpu, (info >> 23) & 0xf);
+	if (((info >> 22) & 0x1) == 0)		/* IndexReg valido */
+		offset += vmx_get_guest_reg(vcpu, (info >> 18) & 0xf) << scaling;
+
+	error = vmx_getdesc(vcpu, seg, &desc);
+	if (error != 0)
+		return (-1);
+	vmx_paging_info(&paging);
+	if (vie_calculate_gla(vmx_cpu_mode(), seg, &desc, offset, 8, addrsize,
+	    prot, &gla) != 0) {
+		vm_inject_gp(vcpu->vcpu);
+		return (-1);
+	}
+	if (vm_gla2gpa(vcpu->vcpu, &paging, gla, prot, gpa, &fault) != 0 || fault)
+		return (-1);			/* #PF iniettato da vm_gla2gpa */
+	return (0);
+}
+
+/* Legge gli 8 byte (puntatore VMCS/regione) all'operando. -1 = fallito. */
+static int
+nested_read_operand_u64(struct vmx_vcpu *vcpu, uint64_t *out)
+{
+	uint64_t gpa, *p;
+	void *cookie;
+
+	if (nested_operand_gpa(vcpu, VM_PROT_READ, &gpa) != 0)
+		return (-1);			/* eccezione gia' iniettata */
+	p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t), VM_PROT_READ, &cookie);
+	if (p == NULL) {
+		nested_vmfail_invalid(vcpu);
+		return (-1);
+	}
+	*out = *p;
+	vm_gpa_release(cookie);
+	return (0);
+}
+
+static int
+nested_vmxon(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t ptr;
+
+	if (n->vmxon) {
+		nested_vmx_result(vcpu, VMXERR_VMXON_IN_VMX_ROOT);
+		goto done;
+	}
+	if (nested_read_operand_u64(vcpu, &ptr) != 0)
+		return (0);
+	/*
+	 * Controlli SDM completi (CR0/CR4 fixed, CPL, revisione e
+	 * allineamento della VMXON region): limite v1, vedi deviazioni.md.
+	 */
+	n->vmxon_ptr = ptr;
+	n->vmxon = true;
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+done:
+	nested_advance_rip();
+	return (0);
+}
+
+static int
+nested_vmxoff(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	int i;
+
+	n->vmxon = false;
+	n->current_vmcs12 = VMCS12_GPA_NONE;
+	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
+		n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
+		n->cache[i].launched = 0;
+	}
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+	nested_advance_rip();
+	return (0);
+}
+
+static int
+nested_vmclear(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t vmcs12;
+	int i;
+
+	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
+	if (nested_read_operand_u64(vcpu, &vmcs12) != 0)
+		return (0);
+	if ((vmcs12 & PAGE_MASK) != 0 || vmcs12 == n->vmxon_ptr) {
+		nested_vmx_result(vcpu, VMXERR_VMCLEAR_INVALID_ADDRESS);
+		goto done;
+	}
+	if (vmcs12 == n->current_vmcs12)
+		n->current_vmcs12 = VMCS12_GPA_NONE;
+	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
+		if (n->cache[i].vmcs12_gpa == vmcs12) {
+			n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
+			n->cache[i].launched = 0;
+			break;
+		}
+	}
+	/* SDM: VMCLEAR azzera il launch-state anche nel VMCS12 in memoria.
+	 * Scrittura in guest memory: T1.8/T2. */
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+done:
+	nested_advance_rip();
+	return (0);
+}
+
+static int
+nested_vmptrld(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t vmcs12;
+	int i, slot;
+
+	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
+	if (nested_read_operand_u64(vcpu, &vmcs12) != 0)
+		return (0);
+	if ((vmcs12 & PAGE_MASK) != 0 || vmcs12 == n->vmxon_ptr) {
+		nested_vmx_result(vcpu, VMXERR_VMPTRLD_INVALID_ADDRESS);
+		goto done;
+	}
+	/* (Verifica della revisione del VMCS12: T1.8.) */
+	slot = -1;
+	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
+		if (n->cache[i].vmcs12_gpa == vmcs12)
+			break;
+		if (slot < 0 && n->cache[i].vmcs12_gpa == VMCS12_GPA_NONE)
+			slot = i;
+	}
+	if (i == VMX_NESTED_MAX_VMCS12) {	/* non in cache: creane una voce */
+		if (slot < 0)
+			slot = 0;		/* evizione semplice (v1) */
+		n->cache[slot].vmcs12_gpa = vmcs12;
+		n->cache[slot].launched = 0;
+		n->cache[slot].host_dirty = true;
+		n->cache[slot].control_dirty = true;
+	}
+	n->current_vmcs12 = vmcs12;
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+done:
+	nested_advance_rip();
+	return (0);
+}
+
+static int
+nested_vmptrst(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t gpa, *p;
+	void *cookie;
+
+	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
+	if (nested_operand_gpa(vcpu, VM_PROT_WRITE, &gpa) != 0)
+		return (0);
+	p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t), VM_PROT_WRITE, &cookie);
+	if (p == NULL) {
+		nested_vmfail_invalid(vcpu);
+		goto done;
+	}
+	*p = n->current_vmcs12;			/* VMCS12_GPA_NONE se nessuno */
+	vm_gpa_release(cookie);
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+done:
+	nested_advance_rip();
+	return (0);
+}
+
+/*
+ * Slow path del nested (op vmmops_nested_exit): dispatch sull'istruzione VMX
+ * che ha causato l'uscita, col vCPU FROZEN. VMLAUNCH/VMRESUME (T2.4),
+ * VMREAD/VMWRITE (T1.8) e VMCALL non sono ancora qui: per ora #UD.
  */
 int
 vmx_nested_exit(void *vcpui)
 {
 	struct vmx_vcpu *vcpu = vcpui;
+	struct vm_exit *vmexit = vm_exitinfo(vcpu->vcpu);
+	uint32_t reason = vmexit->u.vmx.exit_reason & 0xffff;
 
 	SDT_PROBE1(vmm, vmx, nested, slowpath, vcpu);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
-	return (0);
+
+	switch (reason) {
+	case EXIT_REASON_VMXON:		return (nested_vmxon(vcpu));
+	case EXIT_REASON_VMXOFF:	return (nested_vmxoff(vcpu));
+	case EXIT_REASON_VMCLEAR:	return (nested_vmclear(vcpu));
+	case EXIT_REASON_VMPTRLD:	return (nested_vmptrld(vcpu));
+	case EXIT_REASON_VMPTRST:	return (nested_vmptrst(vcpu));
+	default:
+		vm_inject_ud(vcpu->vcpu);
+		return (0);
+	}
 }

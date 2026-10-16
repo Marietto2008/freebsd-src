@@ -69,6 +69,9 @@
 /* Larghezza max della cache VMCS12 per vCPU (voci), §T1.3. */
 #define	VMX_NESTED_MAX_VMCS12			4
 
+/* Esito di un'istruzione VMX nel RFLAGS dell'L1 (SDM 31.2). */
+#define	VMXR_SUCCEED	0	/* VMsucceed: tutti i flag a 0 */
+
 /* GPA "nessun VMCS12" per le voci di cache e per current_vmcs12. */
 #define	VMCS12_GPA_NONE		(~0ULL)
 /* Numero di MSR VMX virtuali esposti all'L1: 0x480..0x491. */
@@ -76,8 +79,16 @@
 
 #ifdef _KERNEL
 #include <sys/malloc.h>
+#include <machine/vmm.h>
+#include <machine/vmm_instruction_emul.h>
 
 MALLOC_DECLARE(M_VMX_NESTED);
+
+/* Helper di vmx.c esposti per il nested (T1.7). */
+uint64_t vmx_get_guest_reg(struct vmx_vcpu *vcpu, int ident);
+int	vmx_getdesc(void *vcpui, int reg, struct seg_desc *desc);
+void	vmx_paging_info(struct vm_guest_paging *paging);
+enum vm_cpu_mode vmx_cpu_mode(void);
 
 struct vmx_vcpu;
 
@@ -113,6 +124,8 @@ struct vmx_nested {
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);
 int	vmx_nested_exit(void *vcpui);
+void	nested_vmx_result(struct vmx_vcpu *vcpu, int errnum);
+void	nested_vmfail_invalid(struct vmx_vcpu *vcpu);
 void	vmx_nested_free(struct vmx_vcpu *vcpu);
 #endif /* _KERNEL */
 

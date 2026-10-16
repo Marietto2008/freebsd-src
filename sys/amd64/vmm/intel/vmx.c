@@ -362,7 +362,7 @@ SDT_PROBE_DEFINE4(vmm, vmx, exit, return,
  */
 #define	APIC_ACCESS_ADDRESS	0xFFFFF000
 
-static int vmx_getdesc(void *vcpui, int reg, struct seg_desc *desc);
+int vmx_getdesc(void *vcpui, int reg, struct seg_desc *desc);
 static int vmx_getreg(void *vcpui, int reg, uint64_t *retval);
 static int vmxctx_setreg(struct vmxctx *vmxctx, int reg, uint64_t val);
 static void vmx_inject_pir(struct vlapic *vlapic);
@@ -1914,7 +1914,7 @@ vmx_emulate_xsetbv(struct vmx *vmx, struct vmx_vcpu *vcpu,
 	return (HANDLED);
 }
 
-static uint64_t
+uint64_t
 vmx_get_guest_reg(struct vmx_vcpu *vcpu, int ident)
 {
 	const struct vmxctx *vmxctx;
@@ -2125,7 +2125,7 @@ vmx_cpl(void)
 	return ((ssar >> 5) & 0x3);
 }
 
-static enum vm_cpu_mode
+enum vm_cpu_mode
 vmx_cpu_mode(void)
 {
 	uint32_t csar;
@@ -2224,7 +2224,7 @@ inout_str_seginfo(struct vmx_vcpu *vcpu, uint32_t inst_info, int in,
 	KASSERT(error == 0, ("%s: vmx_getdesc error %d", __func__, error));
 }
 
-static void
+void
 vmx_paging_info(struct vm_guest_paging *paging)
 {
 	paging->cr3 = vmcs_guest_cr3();
@@ -3065,7 +3065,15 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	case EXIT_REASON_VMXOFF:
 	case EXIT_REASON_VMXON:
 		SDT_PROBE3(vmm, vmx, exit, vminsn, vmx, vcpuid, vmexit);
-		vmexit->exitcode = VM_EXITCODE_VMINSN;
+		/*
+		 * Con la capability nested attiva le istruzioni VMX vanno al
+		 * slow path (vmx_nested_exit via vm_run, vCPU frozen); altrimenti
+		 * #UD come prima (VM_EXITCODE_VMINSN).
+		 */
+		if (vcpu->nested != NULL)
+			vmexit->exitcode = VM_EXITCODE_NESTED;
+		else
+			vmexit->exitcode = VM_EXITCODE_VMINSN;
 		break;
 	case EXIT_REASON_INVD:
 	case EXIT_REASON_WBINVD:
@@ -3843,7 +3851,7 @@ vmx_setreg(void *vcpui, int reg, uint64_t val)
 	return (error);
 }
 
-static int
+int
 vmx_getdesc(void *vcpui, int reg, struct seg_desc *desc)
 {
 	int hostcpu, running;
