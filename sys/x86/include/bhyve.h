@@ -30,6 +30,6 @@
 
 /* Bhyve feature detection */
 #define CPUID_BHYVE_FEATURES		0x40000001
-#define CPUID_BHYVE_FEAT_EXT_DEST_ID	(1UL << 0) /* MSI Extended Dest ID */
+#define CPUID_BHYVE_FEAT_EXT_DEST_ID	(1UL << 15) /* = KVM_FEATURE_MSI_EXT_DEST_ID; era bit 0, che sotto firma KVM e' kvmclock (D6=A) */
 
 #endif
