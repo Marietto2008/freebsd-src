@@ -183,11 +183,12 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, initialized, CTLFLAG_RD,
  *  3 = dopo la riflessione a L1: stato del VMCS01; VM spenta;
  *  5 = solo traccia: le prime 32 uscite EXTERNAL_INTERRUPT sintetiche;
  *  6 = solo traccia: le prime 64 uscite riflesse all'L1;
- *  7 = solo traccia: i primi 64 VMfail dati all'L1.
+ *  7 = solo traccia: i primi 64 VMfail dati all'L1;
+ *  8 = solo traccia: le prime 16 EPT violation di L2 gestite da L0.
  */
 int vmx_nested_probe = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_probe, CTLFLAG_RWTUN,
-    &vmx_nested_probe, 0, "nested: sonda (0=off, 1..3 arresto, 5 EXTINT, 6 riflessioni, 7 VMfail)");
+    &vmx_nested_probe, 0, "nested: sonda (0=off, 1..3 arresto, 5 EXTINT, 6 riflessioni, 7 VMfail, 8 EPT02)");
 
 static int vmx_debug_trace = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, debug_trace, CTLFLAG_RWTUN,
@@ -3052,6 +3053,25 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		 * this must be an instruction that accesses MMIO space.
 		 */
 		gpa = vmcs_gpa();
+		if (__predict_false(vmx_nested_probe == 8) &&
+		    vcpu->nested != NULL && vcpu->nested->in_l2) {
+			/* sonda 8: EPT violation di L2 gestite da L0 */
+			static int traced8;
+			if (traced8 < 16) {
+				traced8++;
+				printf("nested_probe EPT02#%d gpa=%#lx qual=%#lx "
+				    "rip=%#lx proc2=%#lx eptp=%#lx cr0=%#lx "
+				    "cs_ar=%#lx ss_ar=%#lx efer=%#lx\n", traced8,
+				    (u_long)gpa, (u_long)qual,
+				    (u_long)vmcs_read(VMCS_GUEST_RIP),
+				    (u_long)vmcs_read(VMCS_SEC_PROC_BASED_CTLS),
+				    (u_long)vmcs_read(VMCS_EPTP),
+				    (u_long)vmcs_read(VMCS_GUEST_CR0),
+				    (u_long)vmcs_read(VMCS_GUEST_CS_ACCESS_RIGHTS),
+				    (u_long)vmcs_read(VMCS_GUEST_SS_ACCESS_RIGHTS),
+				    (u_long)vmcs_read(VMCS_GUEST_IA32_EFER));
+			}
+		}
 		if (vm_mem_allocated(vcpu->vcpu, gpa) ||
 		    ppt_is_mmio(vmx->vm, gpa) || apic_access_fault(vcpu, gpa)) {
 			vmexit->exitcode = VM_EXITCODE_PAGING;
