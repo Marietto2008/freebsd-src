@@ -1,4 +1,4 @@
 # F1 — istruzioni VMX, nessun L2. Eseguire con: kut-run.sh --nested kut-f1.list
 # formato: nome | file.flat | args | qemu_params | smp | mem | timeout
 # vmx.flat riceve i nomi dei test come argomenti (-append).
-vmx | vmx.flat | test_vmx_feature_control test_vmxon test_vmptrld test_vmclear test_vmptrst test_vmwrite_vmread test_vmcs_high test_vmcs_lifecycle test_vmx_caps test_vmread_flags_touch test_vmwrite_flags_touch | | 1 | 1024 | 180
+vmx | vmx.flat | test_vmx_feature_control test_vmxon test_vmptrld test_vmclear test_vmptrst test_vmwrite_vmread test_vmcs_high test_vmcs_lifecycle test_vmx_caps test_vmread_flags_touch test_vmwrite_flags_touch | -cpu max | 1 | 1024 | 180

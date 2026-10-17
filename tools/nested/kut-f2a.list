@@ -1,4 +1,4 @@
 # F2a — primo L2: ingresso base e campi di controllo.
 # kut-run.sh --nested kut-f2a.list
 # nome | file.flat | args | qemu_params | smp | mem | timeout
-vmx | vmx.flat | null vmenter control_field_PAT control_field_EFER CR_shadowing | | 1 | 1024 | 180
+vmx | vmx.flat | null vmenter control_field_PAT control_field_EFER CR_shadowing | -cpu max | 1 | 1024 | 180

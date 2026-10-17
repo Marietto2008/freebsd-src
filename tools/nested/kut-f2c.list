@@ -1,8 +1,8 @@
-# F2c — L2: il grosso di vmx.flat + EPT + page-fault VMX.
+# F2c — L2: il grosso di vmx.flat + EPT.
 # kut-run.sh --nested kut-f2c.list
-# NB: il set esatto va allineato alle voci [vmx] (con le sue esclusioni),
-# [ept] e [vmx_pf_*] di unittests.cfg; le esclusioni attese vanno in
-# docs/nested/fallimenti-attesi.md. Qui lo schema di partenza.
+# Allineato a x86/unittests.cfg di kvm-unit-tests 5a22134:
+#  [vmx] = vmx.flat con le stesse esclusioni ufficiali;
+#  [ept] = vmx.flat "ept_access*" (NON esiste un ept.flat).
 # nome | file.flat | args | qemu_params | smp | mem | timeout
-vmx-full | vmx.flat | | | 1 | 1024 | 600
-ept      | ept.flat | | | 1 | 1024 | 300
+vmx-full | vmx.flat | -exit_monitor_from_l2_test -ept_access* -vmx_smp* -vmx_vmcs_shadow_test -atomic_switch_overflow_msrs_test -vmx_init_signal_test -vmx_apic_passthrough_tpr_threshold_test -apic_reg_virt_test -virt_x2apic_mode_test -vmx_pf_exception_test -vmx_pf_exception_forced_emulation_test -vmx_pf_no_vpid_test -vmx_pf_invvpid_test -vmx_pf_vpid_test -vmx_basic_vid_test -vmx_eoi_virt_test -vmx_posted_interrupts_test | -cpu max | 1 | 1024 | 600
+ept      | vmx.flat | ept_access* | -cpu max | 1 | 2560 | 300
