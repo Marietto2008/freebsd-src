@@ -1347,14 +1347,28 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	vmwrite(VMCS_SEC_PROC_BASED_CTLS, proc2);
 
 	/* --- Exit controls: quelli dell'L0 --- */
-	exitc = nested_adjust_ctl(exit_ctls, MSR_VMX_TRUE_EXIT_CTLS);
+	/*
+	 * PAT. bhyve non tocca mai il PAT reale (l'L1 gira col PAT dell'host),
+	 * quindi exit_ctls non ha LOAD_PAT. Ma qui l'ingresso in L2 lo caricava
+	 * SEMPRE dal VMCS12: senza LOAD_PAT all'uscita l'host restava col PAT
+	 * dell'L2 (kvm-unit-tests 'null': GUEST_PAT mai scritto = 0 = tutto
+	 * UC) -> host lentissimo, "congelato", USB giu'. Ora:
+	 *  - all'uscita il PAT dell'host si RICARICA sempre (HOST_IA32_PAT e'
+	 *    quello giusto, vmcs_init_host);
+	 *  - all'ingresso si carica il PAT dell'L2 solo se l'L1 lo chiede;
+	 *  - si salva il PAT dell'L2 all'uscita solo se l'L1 lo chiede.
+	 */
+	exitc = exit_ctls | VM_EXIT_LOAD_PAT;
+	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_PAT)
+		exitc |= VM_EXIT_SAVE_PAT;
+	exitc = nested_adjust_ctl(exitc, MSR_VMX_TRUE_EXIT_CTLS);
 	vmwrite(VMCS_EXIT_CTLS, exitc);
 
-	/* --- Entry controls: IA-32e mode guest = VMCS12; load EFER/PAT/dbg=1 --- */
+	/* --- Entry controls: IA-32e mode guest = VMCS12; load EFER/dbg=1,
+	 *     load PAT solo se richiesto dall'L1 (vedi sopra) --- */
 	entryc = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_CTLS) &
-	    VM_ENTRY_GUEST_LMA;
-	entryc |= VM_ENTRY_LOAD_DEBUG_CONTROLS | VM_ENTRY_LOAD_PAT |
-	    VM_ENTRY_LOAD_EFER;
+	    (VM_ENTRY_GUEST_LMA | VM_ENTRY_LOAD_PAT);
+	entryc |= VM_ENTRY_LOAD_DEBUG_CONTROLS | VM_ENTRY_LOAD_EFER;
 	entryc = nested_adjust_ctl(entryc, MSR_VMX_TRUE_ENTRY_CTLS);
 	entryc &= ~(VM_ENTRY_INTO_SMM | VM_ENTRY_DEACTIVATE_DUAL_MONITOR);
 	vmwrite(VMCS_ENTRY_CTLS, entryc);
