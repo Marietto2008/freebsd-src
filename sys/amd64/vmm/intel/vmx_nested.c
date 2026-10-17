@@ -908,25 +908,6 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		/* VMCS12 senza EPT: L2-GPA == L1-GPA, gestione L0 normale */
 		return (false);
 	}
-	case EXIT_REASON_VMX_PREEMPT: {
-		/* DIAG backstop: il timer di preemption di L0 ha fatto uscire L2 a
-		 * forza (l'L1 non sa di questo timer). Normale: si rientra in L2 e
-		 * il timer si ri-arma. Ma se il RIP di L2 non avanza per un numero
-		 * enorme di preemption consecutive, l'L2 e' incastrato (il vecchio
-		 * "freeze"): panic col RIP per avere il dump invece di piantare. */
-		struct vmx_nested *n = vcpu->nested;
-		if (vmexit->rip == n->diag_last_rip) {
-			if (++n->diag_stuck >= 200000)
-				panic("nested: L2 BLOCCATO rip=%#lx (vcpu%d, "
-				    "%u preempt consecutivi stesso rip)",
-				    (u_long)vmexit->rip, vcpu->vcpuid,
-				    n->diag_stuck);
-		} else {
-			n->diag_last_rip = vmexit->rip;
-			n->diag_stuck = 0;
-		}
-		return (true);		/* rientra in L2 */
-	}
 	default:
 		break;
 	}
@@ -1066,15 +1047,9 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	/* --- Pin-based: VMCS12 U {ext-int, NMI exiting}; preempt/posted = 0 --- */
 	pin = (uint32_t)vmcs12_read_field(c, VMCS_PIN_BASED_CTLS);
 	pin |= PINBASED_EXTINT_EXITING | PINBASED_NMI_EXITING;
-	/* DIAG backstop: il timer di preemption di L0 fa uscire L2 a forza, cosi'
-	 * un L2 che non esce mai (freeze in guest-mode) non puo' incastrare
-	 * l'host; l'uscita 52 e' gestita in nested_l2_exit. */
-	pin |= PINBASED_PREMPTION_TIMER;
 	pin = nested_adjust_ctl(pin, MSR_VMX_TRUE_PINBASED_CTLS);
-	pin &= ~PINBASED_POSTED_INTERRUPT;
+	pin &= ~(PINBASED_PREMPTION_TIMER | PINBASED_POSTED_INTERRUPT);
 	vmwrite(VMCS_PIN_BASED_CTLS, pin);
-	/* valore grande: ~ms, si ri-arma da solo a ogni VM-entry (SAVE spento) */
-	vmwrite(VMCS_PREEMPTION_TIMER_VALUE, 0x100000);
 
 	/* --- Primary proc: VMCS12 U requisiti L0; I/O bitmaps=0, TPR shadow=0;
 	 *     HLT = SOLO VMCS12 (non si eredita da VMCS01) --- */
@@ -1110,7 +1085,6 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 
 	/* --- Exit controls: quelli dell'L0 --- */
 	exitc = nested_adjust_ctl(exit_ctls, MSR_VMX_TRUE_EXIT_CTLS);
-	exitc &= ~VM_EXIT_SAVE_PREEMPTION_TIMER;	/* DIAG: il valore si ri-arma */
 	vmwrite(VMCS_EXIT_CTLS, exitc);
 
 	/* --- Entry controls: IA-32e mode guest = VMCS12; load EFER/PAT/dbg=1 --- */
