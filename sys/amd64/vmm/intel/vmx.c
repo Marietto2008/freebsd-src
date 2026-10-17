@@ -2567,8 +2567,20 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* Uscite mentre il vCPU e' in L2: instradamento nested (§6.4) prima
 	 * dei rami dell'L1. Se riflessa all'L1, l'uscita e' gestita. */
 	if (vcpu->nested != NULL && vcpu->nested->in_l2) {
-		if (nested_l2_exit(vcpu, vmexit))
-			return (HANDLED);
+		if (nested_l2_exit(vcpu, vmexit)) {
+			if (vcpu->nested->in_l2)
+				return (HANDLED); /* gestita in L0, resta in L2 */
+			/*
+			 * Riflessa all'L1: il VMCS corrente ora e' il VMCS01,
+			 * in stato clear. Restare nel ciclo di vmx_run vorrebbe
+			 * dire VMRESUME su un VMCS non launched (VMfail 5). Si
+			 * esce: vm_run riparte con un vmx_run nuovo (VMPTRLD,
+			 * campi host per-CPU, VMLAUNCH), come all'ingresso in L2.
+			 */
+			vcpu->nested->restart_only = true;
+			vmexit->exitcode = VM_EXITCODE_NESTED;
+			return (UNHANDLED);
+		}
 	}
 
 	/*
@@ -3619,7 +3631,9 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	VMX_CTR1(vcpu, "returning from vmx_run: exitcode %d",
 	    vmexit->exitcode);
 
-	VMCLEAR(vmcs);
+	/* Il VMCS CORRENTE: col nested puo' non essere piu' quello caricato
+	 * all'inizio di vmx_run (riflessione L2 -> L1 lo cambia). */
+	VMCLEAR(vcpu->vmcs);
 	vmx_msr_guest_exit(vcpu);
 
 	return (0);

@@ -147,6 +147,8 @@ struct vmx_nested {
 	uint64_t	*vept_root;	/* radice shadow EPT (T2.7), NULL se assente */
 	uint64_t	vept_eptp12;	/* EPTP12 che la shadow rispecchia */
 	uint16_t	vpid2;		/* VPID distinto per L2 (T2.8) */
+	bool		restart_only;	/* uscita L2 gia' riflessa: lo slow path
+					 * deve solo far ripartire vmx_run */
 	/*
 	 * Campi d'uscita CATTURATI col VMCS01 corrente (in vmx_exit_process),
 	 * perche' nel slow path (vm_run, vCPU FROZEN) il VMCS NON e' caricato e

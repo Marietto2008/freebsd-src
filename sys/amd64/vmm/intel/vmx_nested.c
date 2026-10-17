@@ -1115,6 +1115,14 @@ vmx_nested_exit(void *vcpui)
 	SDT_PROBE1(vmm, vmx, nested, slowpath, vcpu);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
 
+	/* Uscita di L2 gia' riflessa all'L1 in vmx_exit_process: qui va solo
+	 * fatto ripartire vmx_run. Il motivo d'uscita e' di L2 (es. VMCALL):
+	 * passarlo allo switch sotto inietterebbe un #UD nell'L1. */
+	if (vcpu->nested != NULL && vcpu->nested->restart_only) {
+		vcpu->nested->restart_only = false;
+		return (0);
+	}
+
 	switch (reason) {
 	case EXIT_REASON_VMXON:		return (nested_vmxon(vcpu));
 	case EXIT_REASON_VMXOFF:	return (nested_vmxoff(vcpu));
