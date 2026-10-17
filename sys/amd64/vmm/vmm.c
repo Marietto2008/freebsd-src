@@ -144,6 +144,8 @@ DEFINE_VMMOPS_IFUNC(int, setdesc, (void *vcpui, int num, struct seg_desc *desc))
 DEFINE_VMMOPS_IFUNC(int, getcap, (void *vcpui, int num, int *retval))
 DEFINE_VMMOPS_IFUNC(int, setcap, (void *vcpui, int num, int val))
 DEFINE_VMMOPS_IFUNC(int, nested_exit, (void *vcpui))
+DEFINE_VMMOPS_IFUNC(int, nested_gpa, (void *vcpui, uint64_t gpa, int prot,
+    uint64_t *l1gpa))
 DEFINE_VMMOPS_IFUNC(struct vmspace *, vmspace_alloc, (vm_offset_t min,
     vm_offset_t max))
 DEFINE_VMMOPS_IFUNC(void, vmspace_free, (struct vmspace *vmspace))
@@ -686,6 +688,12 @@ vm_reset_pptdev(struct vm *vm, int bus, int slot, int func)
 {
 
 	return (ppt_reset_device(vm, bus, slot, func));
+}
+
+int
+vm_nested_gpa(struct vcpu *vcpu, uint64_t gpa, int prot, uint64_t *l1gpa)
+{
+	return (vmmops_nested_gpa(vcpu->cookie, gpa, prot, l1gpa));
 }
 
 int
@@ -1346,6 +1354,14 @@ restart:
 			 * la KASSERT sotto.
 			 */
 			error = vmmops_nested_exit(vcpu->cookie);
+			/*
+			 * L'L2 ha toccato MMIO dell'L1 (EPT dell'L1 lo mappa su
+			 * un indirizzo che non e' RAM): lo slow path lo rimanda
+			 * all'emulazione normale, sul GPA dell'L1, coi registri
+			 * dell'L2. Dispositivi in kernel qui, gli altri a QEMU.
+			 */
+			if (error == 0 && vme->exitcode == VM_EXITCODE_INST_EMUL)
+				error = vm_handle_inst_emul(vcpu, &retu);
 			break;
 		default:
 			retu = true;	/* handled in userland */

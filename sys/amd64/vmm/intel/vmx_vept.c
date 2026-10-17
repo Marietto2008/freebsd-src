@@ -36,6 +36,7 @@
 #include <machine/pte.h>
 
 #include "vmx_cpufunc.h"
+#include "vmx_controls.h"
 #include "vmx.h"
 #include "vmx_nested.h"
 
@@ -142,19 +143,26 @@ vmx_vept_flush(struct vmx_nested *n)
 	}
 }
 
-/* Cammina EPT12 (in memoria dell'L1) per l2gpa. Ritorna 0 con l1gpa e
- * perm; 1 se EPT12 nega (violation da riflettere); -1 su errore d'accesso. */
+/*
+ * Cammina EPT12 (in memoria dell'L1) per l2gpa. Ritorna VEPT_OK con l1gpa e
+ * perm (R/W/X, intersezione dei livelli); VEPT_VIOL se una voce non e'
+ * presente (perm = quelli accumulati fin li', per la qualificazione);
+ * VEPT_MISCONF per una voce malformata (SDM 28.3.3.1: scrivibile senza essere
+ * leggibile, o foglia con tipo di memoria riservato 2/3/7); -1 se una
+ * tabella dell'L1 non e' leggibile.
+ */
 static int
 ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
     uint64_t *l1gpa, uint64_t *perm)
 {
-	uint64_t tbl_gpa, pte, acc;
+	uint64_t tbl_gpa, pte, acc, mt;
 	uint64_t *page;
 	void *cookie;
 	int level, idx;
 
 	tbl_gpa = EPT_ADDR(eptp12);
 	acc = EPT_RWX;
+	*perm = 0;
 	for (level = 3; level >= 0; level--) {
 		idx = EPT_IDX(l2gpa, level);
 		page = vm_gpa_hold(vcpu->vcpu, tbl_gpa, PAGE_SIZE,
@@ -164,22 +172,29 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 		pte = page[idx];
 		vm_gpa_release(cookie);
 		if ((pte & EPT_RWX) == 0)
-			return (1);			/* non presente */
+			return (VEPT_VIOL);		/* non presente */
+		if ((pte & 0x3) == 0x2)
+			return (VEPT_MISCONF);		/* W senza R */
 		acc &= pte;				/* ∩ permessi R/W/X */
 		if (level == 0 || (pte & EPT_PG_PS) != 0) {
 			uint64_t mask = (1ULL << (12 + 9 * level)) - 1;
+
+			mt = (pte >> 3) & 0x7;
+			if (mt == 2 || mt == 3 || mt == 7)
+				return (VEPT_MISCONF);	/* tipo riservato */
 			*l1gpa = (EPT_ADDR(pte) & ~mask) | (l2gpa & mask);
 			*perm = acc & EPT_RWX;
-			return (0);
+			return (VEPT_OK);
 		}
 		tbl_gpa = EPT_ADDR(pte);
 	}
-	return (1);
+	return (VEPT_VIOL);
 }
 
 /* Installa una foglia shadow 4K: l2gpa -> hpa con permessi e memtype WB. */
 static int
-vept_install(struct vmx_nested *n, uint64_t l2gpa, uint64_t hpa, uint64_t perm)
+vept_install(struct vmx_nested *n, uint64_t l2gpa, uint64_t hpa, uint64_t perm,
+    int mt)
 {
 	uint64_t *tbl = n->vept_root;
 	int level, idx;
@@ -195,7 +210,7 @@ vept_install(struct vmx_nested *n, uint64_t l2gpa, uint64_t hpa, uint64_t perm)
 	}
 	idx = EPT_IDX(l2gpa, 0);
 	tbl[idx] = (hpa & ~0xfffULL) | (perm & EPT_RWX) |
-	    EPT_PG_MEMORY_TYPE(6) | EPT_PG_IGNORE_PAT;
+	    EPT_PG_MEMORY_TYPE(mt) | EPT_PG_IGNORE_PAT;
 	return (0);
 }
 
@@ -205,40 +220,84 @@ vept_install(struct vmx_nested *n, uint64_t l2gpa, uint64_t hpa, uint64_t perm)
  * l'accesso va riflesso all'L1 (EPT12 nega o EPT01 non mappa).
  */
 int
-vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa)
+vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
+    uint64_t *l1gpa, uint64_t *perm)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c = nested_current_cache(n);
-	uint64_t eptp12, l1gpa, perm, hpa;
+	uint64_t eptp12, hpa, access;
 	void *p, *ck;
 	int r;
 
 	/*
-	 * SLOW PATH (vCPU FROZEN, fuori dal critical_enter di vm_run): qui si
-	 * puo' dormire (vm_gpa_hold, malloc M_WAITOK). Prima era chiamata dal
-	 * percorso veloce (nested_l2_exit dentro vmx_run): vietato.
+	 * SLOW PATH (vCPU FROZEN, nessun VMCS caricato): qui si puo' dormire
+	 * (vm_gpa_hold, malloc M_WAITOK). Esiti: VEPT_OK shadow installata,
+	 * si riparte in L2; VEPT_VIOL / VEPT_MISCONF da riflettere all'L1;
+	 * VEPT_MMIO l'L1 mappa l'L2 su un suo indirizzo che non e' RAM.
 	 */
 	if (c == NULL)
-		return (1);
+		return (VEPT_VIOL);
 	eptp12 = vmcs12_read_field(c, VMCS_EPTP);
 	if (n->vept_root == NULL || n->vept_eptp12 != eptp12)
-		vmx_vept_prepare(vcpu);	/* allinea radice ed EPTP12 */
+		vmx_vept_prepare(vcpu);		/* allinea radice ed EPTP12 */
 
-	r = ept12_translate(vcpu, eptp12, l2gpa, &l1gpa, &perm);
-	if (r != 0)
-		return (1);			/* EPT12 nega -> violation all'L1 */
+	r = ept12_translate(vcpu, eptp12, l2gpa, l1gpa, perm);
+	if (r < 0)
+		return (VEPT_VIOL);		/* tabella dell'L1 illeggibile */
+	if (r != VEPT_OK)
+		return (r);
+	/*
+	 * Tipo d'accesso (qualificazione: bit 0 R, 1 W, 2 X, stessi bit dei
+	 * permessi EPT) contro i permessi dell'L1. Prima non si confrontava: si
+	 * installava la voce coi permessi dell'L1, l'L2 rifaceva l'accesso,
+	 * l'hardware rifaceva il fault e si girava a vuoto.
+	 */
+	access = qual & EPT_RWX;
+	if ((access & ~*perm) != 0)
+		return (VEPT_VIOL);
 	/*
 	 * Pagina host dell'L1-GPA: vm_gpa_hold la porta in memoria se serve
 	 * (prima pmap_extract sull'EPT01 falliva per una pagina mai toccata
-	 * dall'L1 e la violation finiva, a torto, all'L1). La memoria del guest
-	 * e' wired: la pagina non si sposta dopo il rilascio.
+	 * dall'L1). La memoria del guest e' wired: non si sposta dopo il
+	 * rilascio.
 	 */
-	p = vm_gpa_hold(vcpu->vcpu, l1gpa & ~(uint64_t)PAGE_MASK, PAGE_SIZE,
+	p = vm_gpa_hold(vcpu->vcpu, *l1gpa & ~(uint64_t)PAGE_MASK, PAGE_SIZE,
 	    VM_PROT_READ, &ck);
-	if (p == NULL)
-		return (1);			/* non RAM (MMIO dell'L1): all'L1 */
-	hpa = DMAP_TO_PHYS((vm_offset_t)p);
-	vm_gpa_release(ck);
-	vept_install(n, l2gpa, hpa, perm);
-	return (0);				/* rientra in L2 */
+	if (p != NULL) {
+		hpa = DMAP_TO_PHYS((vm_offset_t)p);
+		vm_gpa_release(ck);
+		vept_install(n, l2gpa, hpa, *perm, 6);	/* RAM: WB */
+		return (VEPT_OK);
+	}
+	/* Non RAM. Se l'EPT01 mappa gia' l'L1-GPA (BAR di un dispositivo in
+	 * passthrough) si usa la stessa pagina host, non cacheable. */
+	hpa = pmap_extract(vcpu->vmx->pmap, *l1gpa);
+	if (hpa != 0) {
+		vept_install(n, l2gpa, hpa, *perm, 0);	/* MMIO: UC */
+		return (VEPT_OK);
+	}
+	return (VEPT_MMIO);			/* dispositivo emulato dell'L1 */
+}
+
+/*
+ * vmmops nested_gpa (vm_gla2gpa, ptp_hold): GPA dell'L2 -> GPA dell'L1, per
+ * emulare un'istruzione dell'L2. Identita' fuori da un L2 o se il VMCS12 non
+ * usa EPT (allora L2-GPA == L1-GPA).
+ */
+int
+vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot, uint64_t *out)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	uint64_t perm;
+
+	*out = gpa;
+	if (n == NULL || !n->in_l2 || (c = nested_current_cache(n)) == NULL ||
+	    (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	    PROCBASED2_ENABLE_EPT) == 0)
+		return (0);
+	if (ept12_translate(vcpu, vmcs12_read_field(c, VMCS_EPTP), gpa, out,
+	    &perm) != VEPT_OK || (prot & ~perm & EPT_RWX) != 0)
+		return (EFAULT);
+	return (0);
 }

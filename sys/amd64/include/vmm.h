@@ -199,6 +199,8 @@ DECLARE_VMMOPS_FUNC(int, setdesc, (void *vcpui, int num,
 DECLARE_VMMOPS_FUNC(int, getcap, (void *vcpui, int num, int *retval));
 DECLARE_VMMOPS_FUNC(int, setcap, (void *vcpui, int num, int val));
 DECLARE_VMMOPS_FUNC(int, nested_exit, (void *vcpui));
+DECLARE_VMMOPS_FUNC(int, nested_gpa, (void *vcpui, uint64_t gpa, int prot,
+    uint64_t *l1gpa));
 DECLARE_VMMOPS_FUNC(struct vmspace *, vmspace_alloc,
     (vm_offset_t min, vm_offset_t max));
 DECLARE_VMMOPS_FUNC(void, vmspace_free, (struct vmspace *vmspace));
@@ -226,6 +228,7 @@ struct vmm_ops {
 	vmmops_getcap_t		getcap;
 	vmmops_setcap_t		setcap;
 	vmmops_nested_exit_t	nested_exit;	/* slow path nested (T1.6) */
+	vmmops_nested_gpa_t	nested_gpa;	/* GPA dell'L2 -> GPA dell'L1 */
 	vmmops_vmspace_alloc_t	vmspace_alloc;
 	vmmops_vmspace_free_t	vmspace_free;
 	vmmops_vlapic_init_t	vlapic_init;
@@ -252,6 +255,12 @@ int vm_assign_pptdev(struct vm *vm, int bus, int slot, int func);
 int vm_unassign_pptdev(struct vm *vm, int bus, int slot, int func);
 int vm_reset_pptdev(struct vm *vm, int bus, int slot, int func);
 
+/*
+ * Nested: traduce un GPA "come lo vede il vCPU" nel GPA dell'L1, l'unico che
+ * vm_gpa_hold conosce. Identita' se il vCPU non e' in un L2 con EPT. 0 ok;
+ * EFAULT se l'EPT dell'L1 non lo concede con i permessi 'prot'.
+ */
+int vm_nested_gpa(struct vcpu *vcpu, uint64_t gpa, int prot, uint64_t *l1gpa);
 int vm_get_register(struct vcpu *vcpu, int reg, uint64_t *retval);
 int vm_set_register(struct vcpu *vcpu, int reg, uint64_t val);
 int vm_get_seg_desc(struct vcpu *vcpu, int reg,

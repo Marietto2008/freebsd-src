@@ -2601,8 +2601,13 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		if (nested_l2_exit(vcpu, vmexit)) {
 			if (vcpu->nested->ept_pending) {
 				/* violation EPT da risolvere nello slow path
-				 * (shadow EPT): si esce da vmx_run in L2 */
+				 * (shadow EPT): si esce da vmx_run in L2. Il
+				 * paging dell'L2 si salva ORA (VMCS02 caricato)
+				 * per l'eventuale emulazione di MMIO dell'L1. */
+				vmexit_inst_emul(&vcpu->nested->ept_emul,
+				    vcpu->nested->ept_gpa, vmcs_gla());
 				vmexit->exitcode = VM_EXITCODE_NESTED;
+				vmexit->inst_length = 0;
 				return (UNHANDLED);
 			}
 			if (vcpu->nested->in_l2)
@@ -4800,6 +4805,12 @@ vmx_restore_tsc(void *vcpui, uint64_t offset)
 }
 #endif
 
+static int
+vmx_nested_gpa(void *vcpui, uint64_t gpa, int prot, uint64_t *l1gpa)
+{
+	return (vmx_vept_l1gpa(vcpui, gpa, prot, l1gpa));
+}
+
 const struct vmm_ops vmm_ops_intel = {
 	.modinit	= vmx_modinit,
 	.modcleanup	= vmx_modcleanup,
@@ -4817,6 +4828,7 @@ const struct vmm_ops vmm_ops_intel = {
 	.getcap		= vmx_getcap,
 	.setcap		= vmx_setcap,
 	.nested_exit	= vmx_nested_exit,
+	.nested_gpa	= vmx_nested_gpa,
 	.vmspace_alloc	= vmx_vmspace_alloc,
 	.vmspace_free	= vmx_vmspace_free,
 	.vlapic_init	= vmx_vlapic_init,

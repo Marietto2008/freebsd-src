@@ -98,7 +98,15 @@ extern uint64_t cr0_ones_mask, cr0_zeros_mask, cr4_ones_mask, cr4_zeros_mask;
 int	nested_compose_vmcs02(struct vmx_vcpu *vcpu);
 int	nested_vmcs02_check(struct vmx_vcpu *vcpu);
 bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
-int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa); /* slow path */
+/* esiti di vmx_vept_fault */
+#define	VEPT_OK		0	/* shadow installata */
+#define	VEPT_VIOL	1	/* EPT violation da riflettere all'L1 */
+#define	VEPT_MISCONF	2	/* EPT misconfiguration da riflettere all'L1 */
+#define	VEPT_MMIO	3	/* MMIO dell'L1: emulazione in L0 */
+int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
+	    uint64_t *l1gpa, uint64_t *perm);			/* slow path */
+int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
+	    uint64_t *out);
 void	vmx_vept_flush(struct vmx_nested *n);
 void	vmx_vept_invept(struct vmx_nested *n);	/* svuota, tiene la radice */
 void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
@@ -175,6 +183,10 @@ struct vmx_nested {
 	bool		ept_pending;	/* EPT violation di L2 da risolvere nello
 					 * slow path (shadow EPT), restando in L2 */
 	uint64_t	ept_gpa;	/* suo GPA di L2, catturato in uscita */
+	uint64_t	ept_qual;	/* sua qualificazione (tipo d'accesso) */
+	struct vm_exit	ept_emul;	/* paging dell'L2 per un'eventuale
+					 * emulazione MMIO (vmexit_inst_emul,
+					 * col VMCS02 ancora caricato) */
 	bool		slow_reflect;	/* riflessione chiamata dallo slow path:
 					 * MSR del guest in guest_msrs[], NON nei
 					 * registri hardware */

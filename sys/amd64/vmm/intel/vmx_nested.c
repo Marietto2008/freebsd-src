@@ -1602,6 +1602,7 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 			 */
 			vcpu->nested->ept_gpa =
 			    vmcs_read(VMCS_GUEST_PHYSICAL_ADDRESS);
+			vcpu->nested->ept_qual = vmcs_read(VMCS_EXIT_QUALIFICATION);
 			vcpu->nested->ept_pending = true;
 			vmexit->inst_length = 0;
 			return (true);
@@ -1663,22 +1664,47 @@ nested_invept(struct vmx_vcpu *vcpu)
 
 /*
  * EPT violation di L2 con shadow EPT, nello slow path (vedi nested_l2_exit).
- * Shadow installata -> si riparte in L2 sulla stessa istruzione. EPT12 nega
- * (o l'L1-GPA non e' RAM) -> violation riflessa all'L1: il VMCS02 conserva i
- * campi d'uscita anche dopo VMCLEAR/VMPTRLD.
+ *  - VEPT_OK: shadow installata, si riparte in L2 sulla stessa istruzione;
+ *  - VEPT_MMIO: l'L2 tocca un dispositivo emulato dell'L1 -> emulazione
+ *    normale di bhyve sul GPA dell'L1 (vm_run: VM_EXITCODE_INST_EMUL);
+ *  - VEPT_VIOL / VEPT_MISCONF: riflessa all'L1 (motivo 48 o 49). Per la
+ *    violation i bit 5:3 della qualificazione sono i permessi dell'EPT
+ *    dell'L1, non quelli della shadow. Il VMCS02 conserva i campi d'uscita
+ *    anche dopo VMCLEAR/VMPTRLD.
  */
 static int
 nested_ept_slow(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vm_exit *vmexit = vm_exitinfo(vcpu->vcpu);
+	struct vmcs12_cache *c;
+	uint64_t l1gpa = 0, perm = 0;
+	int r;
 
-	if (vmx_vept_fault(vcpu, n->ept_gpa) == 0)
+	r = vmx_vept_fault(vcpu, n->ept_gpa, n->ept_qual, &l1gpa, &perm);
+	if (r == VEPT_OK)
 		return (0);
+	if (r == VEPT_MMIO && (n->ept_qual & 0x3) != 0 &&
+	    (n->ept_qual & 0x180) == 0x180) {
+		/* lettura/scrittura dati da un indirizzo lineare (come
+		 * ept_emulation_fault per l'L1) */
+		vmexit->u.inst_emul = n->ept_emul.u.inst_emul;
+		vmexit->u.inst_emul.gpa = l1gpa;
+		vmexit->exitcode = VM_EXITCODE_INST_EMUL;
+		vmexit->inst_length = 0;
+		return (0);
+	}
 	VMPTRLD(vcpu->vmcs);			/* il VMCS02 */
+	vmexit->u.vmx.exit_reason = (r == VEPT_MISCONF) ?
+	    EXIT_REASON_EPT_MISCONFIG : EXIT_REASON_EPT_FAULT;
 	n->slow_reflect = true;
 	nested_reflect_to_l1(vcpu, vmexit);
 	n->slow_reflect = false;
+	c = nested_current_cache(n);
+	if (c != NULL)
+		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION,
+		    (r == VEPT_MISCONF) ? 0 :
+		    ((n->ept_qual & ~0x38ULL) | ((perm & 0x7) << 3)));
 	VMCLEAR(vcpu->vmcs01);			/* niente VMCS attivo nello slow path */
 	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP, vmexit->rip);
 	return (0);

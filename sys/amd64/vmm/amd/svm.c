@@ -2837,6 +2837,14 @@ svm_nested_exit(void *vcpui __unused)
 	return (ENXIO);	/* VMX annidato non esiste su SVM */
 }
 
+static int
+svm_nested_gpa(void *vcpui __unused, uint64_t gpa, int prot __unused,
+    uint64_t *l1gpa)
+{
+	*l1gpa = gpa;	/* niente nested su SVM: identita' */
+	return (0);
+}
+
 const struct vmm_ops vmm_ops_amd = {
 	.modinit	= svm_modinit,
 	.modcleanup	= svm_modcleanup,
@@ -2854,6 +2862,7 @@ const struct vmm_ops vmm_ops_amd = {
 	.getcap		= svm_getcap,
 	.setcap		= svm_setcap,
 	.nested_exit	= svm_nested_exit,
+	.nested_gpa	= svm_nested_gpa,
 	.vmspace_alloc	= svm_vmspace_alloc,
 	.vmspace_free	= svm_vmspace_free,
 	.vlapic_init	= svm_vlapic_init,

@@ -2063,6 +2063,9 @@ ptp_hold(struct vcpu *vcpu, vm_paddr_t ptpphys, size_t len, void **cookie)
 	void *ptr;
 
 	ptp_release(cookie);
+	/* nested: le tabelle dell'L2 stanno a GPA dell'L2 (identita' per l'L1) */
+	if (vm_nested_gpa(vcpu, ptpphys, VM_PROT_READ, &ptpphys) != 0)
+		return (NULL);
 	ptr = vm_gpa_hold(vcpu, ptpphys, len, VM_PROT_RW, cookie);
 	return (ptr);
 }
@@ -2102,7 +2105,7 @@ restart:
 
 	if (paging->paging_mode == PAGING_MODE_FLAT) {
 		*gpa = gla;
-		goto done;
+		goto translate;
 	}
 
 	if (paging->paging_mode == PAGING_MODE_32) {
@@ -2255,6 +2258,11 @@ restart:
 	/* Zero out the lower 'ptpshift' bits and the upper 12 bits */
 	pte >>= ptpshift; pte <<= (ptpshift + 12); pte >>= 12;
 	*gpa = pte | (gla & (pgsize - 1));
+translate:
+	/* nested: il risultato e' un GPA dell'L2, chi lo usa vuole quello
+	 * dell'L1 (vm_copy_setup -> vm_gpa_hold). Identita' fuori da un L2. */
+	if (vm_nested_gpa(vcpu, *gpa, prot, gpa) != 0)
+		retval = EFAULT;
 done:
 	ptp_release(&cookie);
 	KASSERT(retval == 0 || retval == EFAULT, ("%s: unexpected retval %d",
