@@ -17,6 +17,7 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
+#include <sys/proc.h>
 #include <sys/sdt.h>
 
 #include <machine/vmm.h>
@@ -796,6 +797,15 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 * GUEST_RIP di VMCS02 (copiato in compose).
 	 */
 	vcpu->vmcs = vmcs02;
+	/*
+	 * I campi host per-CPU (TR/GDTR/GS base) li scrive solo
+	 * vmx_set_pcpu_defaults, e solo se lastcpu != curcpu: col vCPU sulla
+	 * stessa CPU il VMCS02 restava con basi a 0 -> alla prima uscita da
+	 * L2 l'host caricava GDT/TSS/GS nulli -> triple fault, reset
+	 * istantaneo della macchina (kvm-unit-tests F2a). lastcpu vale per
+	 * VMCS: NOCPU forza la riscrittura nel VMCS02 al prossimo vmx_run.
+	 */
+	vcpu->state.lastcpu = NOCPU;
 	n->in_l2 = true;
 	c->launched = 1;			/* dopo VMLAUNCH il VMCS12 e' launched */
 	vmexit->inst_length = 0;
@@ -878,6 +888,13 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	VMCLEAR(vmcs02);
 	VMPTRLD(vcpu->vmcs01);
 	vcpu->vmcs = vcpu->vmcs01;
+	/* Il VMCS01 riparte su QUESTA CPU, ma il vCPU puo' essere migrato
+	 * mentre era in L2 (la riscrittura e' finita nel VMCS02): riscrivo i
+	 * campi host per-CPU qui, ora che il VMCS01 e' corrente. */
+	vmcs_write(VMCS_HOST_TR_BASE, vmm_get_host_trbase());
+	vmcs_write(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
+	vmcs_write(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
+	vcpu->state.lastcpu = curcpu;
 
 	/* 6. Loading Host State: host di VMCS12 -> guest di VMCS01 */
 	hcr0 = (vmcs12_read_field(c, VMCS_HOST_CR0) | cr0_ones_mask) &
@@ -1282,6 +1299,11 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 		vmwrite(VMCS_EPTP, x->vmx->eptp);
 	/* VPID02 distinto per l2 (T2.8), per non aliasare la TLB con l1 */
 	vmwrite(VMCS_VPID, n->vpid2);
+	/* HOST_RSP: nel VMCS01 lo scrive vmx_init UNA volta (&vcpu->ctx, lo
+	 * stack su cui vmx_exit_guest salva i registri del guest);
+	 * vmcs_init_host non lo tocca, quindi nel VMCS02 valeva 0 -> alla
+	 * prima uscita da L2 l'host ripartiva con RSP=0 -> triple fault. */
+	vmwrite(VMCS_HOST_RSP, (u_long)&x->ctx);
 	/* MSR bitmap: quello dell'L0 (intercetta cio' che serve a L0); la
 	 * fusione con quello dell'L1 e' T6.3. */
 	vmwrite(VMCS_MSR_BITMAP, vtophys(x->vmx->msr_bitmap));
