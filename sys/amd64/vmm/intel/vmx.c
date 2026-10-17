@@ -3057,7 +3057,12 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		    vcpu->nested != NULL && vcpu->nested->in_l2) {
 			/* sonda 8: EPT violation di L2 gestite da L0 */
 			static int traced8;
-			if (traced8 < 16) {
+			static uint64_t last8;
+			/* solo le ripetizioni dello stesso GPA (firma del ciclo) */
+			bool rep = (gpa == last8);
+
+			last8 = gpa;
+			if (rep && traced8 < 16) {
 				traced8++;
 				printf("nested_probe EPT02#%d gpa=%#lx qual=%#lx "
 				    "rip=%#lx proc2=%#lx eptp=%#lx cr0=%#lx "
