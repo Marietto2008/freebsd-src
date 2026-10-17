@@ -218,11 +218,15 @@ nested_vmx_result(struct vmx_vcpu *vcpu, int errnum)
 
 	vm_get_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, &rflags);
 	rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_Z | PSL_N | PSL_V);
-	if (errnum != VMXR_SUCCEED) {		/* VMfailValid(errnum) */
+	if (errnum != VMXR_SUCCEED) {
+		/* SDM VMfail: VMfailValid(errnum) se c'e' un VMCS corrente,
+		 * altrimenti VMfailInvalid (non c'e' dove scrivere l'errore). */
 		struct vmcs12_cache *c = nested_current_cache(vcpu->nested);
-		rflags |= PSL_Z;
-		if (c != NULL)			/* L1 lo legge via VMREAD 0x4400 */
+		if (c != NULL) {		/* L1 lo legge via VMREAD 0x4400 */
+			rflags |= PSL_Z;
 			vmcs12_write_field(c, VMCS_INSTRUCTION_ERROR, errnum);
+		} else
+			rflags |= PSL_C;
 	}
 	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, rflags);
 }
@@ -316,22 +320,90 @@ nested_read_operand_u64(struct vmx_vcpu *vcpu, uint64_t *out)
 	return (0);
 }
 
+/*
+ * CR0/CR4 come li vede l'L1: i bit posseduti da L0 (maschera) vengono dal
+ * read-shadow. Serve perche' bhyve forza bit come CR0.NE e CR4.VMXE nel
+ * registro reale del guest. vm_get_register con VMCS_IDENT fa
+ * VMPTRLD/VMCLEAR da se': sicuro anche nello slow path.
+ */
+static uint64_t
+nested_guest_cr(struct vmx_vcpu *vcpu, int reg, uint32_t mask_enc,
+    uint32_t shadow_enc)
+{
+	uint64_t v, m, s;
+
+	vm_get_register(vcpu->vcpu, reg, &v);
+	vm_get_register(vcpu->vcpu, VMCS_IDENT(mask_enc), &m);
+	vm_get_register(vcpu->vcpu, VMCS_IDENT(shadow_enc), &s);
+	return ((v & ~m) | (s & m));
+}
+
+static bool
+nested_fixed_ok(uint64_t val, uint64_t fixed0, uint64_t fixed1)
+{
+	return ((val & fixed0) == fixed0 && (val & ~fixed1) == 0);
+}
+
 static int
 nested_vmxon(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
-	uint64_t ptr;
+	uint64_t ptr, cr0, cr4;
+	uint32_t *p, rev;
+	void *cookie;
 
+	/*
+	 * In VMX non-root VMXON esce SEMPRE verso L0, prima dei controlli
+	 * dell'SDM: li rifacciamo qui, nell'ordine dell'SDM (come KVM
+	 * handle_vmxon). Verificati da kvm-unit-tests test_vmxon.
+	 */
+	cr0 = nested_guest_cr(vcpu, VM_REG_GUEST_CR0, VMCS_CR0_MASK,
+	    VMCS_CR0_SHADOW);
+	cr4 = nested_guest_cr(vcpu, VM_REG_GUEST_CR4, VMCS_CR4_MASK,
+	    VMCS_CR4_SHADOW);
+	if ((cr4 & CR4_VMXE) == 0) {		/* precede la VM exit: #UD */
+		vm_inject_ud(vcpu->vcpu);
+		return (0);
+	}
+	if (n->exit_paging.cpl != 0) {
+		vm_inject_gp(vcpu->vcpu);
+		return (0);
+	}
 	if (n->vmxon) {
 		nested_vmx_result(vcpu, VMXERR_VMXON_IN_VMX_ROOT);
 		goto done;
 	}
+	if (!nested_fixed_ok(cr0, n->vmx_msr[0x486 - 0x480],
+	    n->vmx_msr[0x487 - 0x480]) ||
+	    !nested_fixed_ok(cr4, n->vmx_msr[0x488 - 0x480],
+	    n->vmx_msr[0x489 - 0x480])) {
+		vm_inject_gp(vcpu->vcpu);
+		return (0);
+	}
+	if ((n->feature_control & (IA32_FEATURE_CONTROL_LOCK |
+	    IA32_FEATURE_CONTROL_VMX_EN)) != (IA32_FEATURE_CONTROL_LOCK |
+	    IA32_FEATURE_CONTROL_VMX_EN)) {
+		vm_inject_gp(vcpu->vcpu);
+		return (0);
+	}
 	if (nested_read_operand_u64(vcpu, &ptr) != 0)
 		return (0);
-	/*
-	 * Controlli SDM completi (CR0/CR4 fixed, CPL, revisione e
-	 * allineamento della VMXON region): limite v1, vedi deviazioni.md.
-	 */
+	/* VMXON region: allineata a 4K, entro MAXPHYADDR, revisione giusta. */
+	if ((ptr & PAGE_MASK) != 0 || (ptr >> cpu_maxphyaddr) != 0) {
+		nested_vmfail_invalid(vcpu);
+		goto done;
+	}
+	p = vm_gpa_hold(vcpu->vcpu, ptr, sizeof(*p), VM_PROT_READ, &cookie);
+	if (p == NULL) {
+		nested_vmfail_invalid(vcpu);
+		goto done;
+	}
+	rev = *p;
+	vm_gpa_release(cookie);
+	if (rev != (uint32_t)(n->vmx_msr[0] & 0x7fffffff)) {
+		nested_vmfail_invalid(vcpu);
+		goto done;
+	}
 	n->vmxon_ptr = ptr;
 	n->vmxon = true;
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
@@ -367,8 +439,12 @@ nested_vmclear(struct vmx_vcpu *vcpu)
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
 	if (nested_read_operand_u64(vcpu, &vmcs12) != 0)
 		return (0);
-	if ((vmcs12 & PAGE_MASK) != 0 || vmcs12 == n->vmxon_ptr) {
+	if ((vmcs12 & PAGE_MASK) != 0 || (vmcs12 >> cpu_maxphyaddr) != 0) {
 		nested_vmx_result(vcpu, VMXERR_VMCLEAR_INVALID_ADDRESS);
+		goto done;
+	}
+	if (vmcs12 == n->vmxon_ptr) {
+		nested_vmx_result(vcpu, VMXERR_VMCLEAR_VMXON_POINTER);
 		goto done;
 	}
 	if (vmcs12 == n->current_vmcs12)
@@ -398,11 +474,37 @@ nested_vmptrld(struct vmx_vcpu *vcpu)
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
 	if (nested_read_operand_u64(vcpu, &vmcs12) != 0)
 		return (0);
-	if ((vmcs12 & PAGE_MASK) != 0 || vmcs12 == n->vmxon_ptr) {
+	if ((vmcs12 & PAGE_MASK) != 0 || (vmcs12 >> cpu_maxphyaddr) != 0) {
 		nested_vmx_result(vcpu, VMXERR_VMPTRLD_INVALID_ADDRESS);
 		goto done;
 	}
-	/* (Verifica della revisione del VMCS12: T1.8.) */
+	if (vmcs12 == n->vmxon_ptr) {
+		nested_vmx_result(vcpu, VMXERR_VMPTRLD_VMXON_POINTER);
+		goto done;
+	}
+	/*
+	 * Revisione del VMCS12 (primi 31 bit) = quella esposta in
+	 * IA32_VMX_BASIC; il bit 31 (shadow-VMCS indicator) e' ammesso solo
+	 * se l'L1 ha il VMCS shadowing, che NON gli esponiamo -> errore.
+	 */
+	{
+		uint32_t *p, rev;
+		void *cookie;
+
+		p = vm_gpa_hold(vcpu->vcpu, vmcs12, sizeof(*p), VM_PROT_READ,
+		    &cookie);
+		if (p == NULL) {
+			nested_vmx_result(vcpu, VMXERR_VMPTRLD_INVALID_ADDRESS);
+			goto done;
+		}
+		rev = *p;
+		vm_gpa_release(cookie);
+		if (rev != (uint32_t)(n->vmx_msr[0] & 0x7fffffff)) {
+			nested_vmx_result(vcpu,
+			    VMXERR_VMPTRLD_INCORRECT_REVISION);
+			goto done;
+		}
+	}
 	slot = -1;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
 		if (n->cache[i].vmcs12_gpa == vmcs12)
