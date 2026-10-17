@@ -1785,6 +1785,16 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 		n->synth = true;
 		nested_reflect_to_l1(vcpu, vmexit);
 		n->synth = false;
+		/*
+		 * Con RFLAGS.TF nell'L2 anche la trappola di passo singolo
+		 * coincide con l'MTF: vince l'uscita MTF e la #DB resta pendente
+		 * (BS, bit 14), come sulla CPU vera (vmx_mtf_test, 'pending debug
+		 * exceptions field after MTF VM-exit').
+		 */
+		if (vmcs12_read_field(c, VMCS_GUEST_RFLAGS) & PSL_T)
+			vmcs12_write_field(c, VMCS_GUEST_PENDING_DBG_EXCEPTIONS,
+			    vmcs12_read_field(c,
+			    VMCS_GUEST_PENDING_DBG_EXCEPTIONS) | (1UL << 14));
 		n->restart_only = true;
 		vmexit->exitcode = VM_EXITCODE_NESTED;
 		return (true);
