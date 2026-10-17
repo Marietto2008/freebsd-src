@@ -3677,7 +3677,14 @@ vmx_vcpu_cleanup(void *vcpui)
 	vpid_free(vcpu->state.vpid);
 	free(vcpu->pir_desc, M_VMX);
 	free(vcpu->apic_page, M_VMX);
-	free(vcpu->vmcs, M_VMX);
+	/*
+	 * Il VMCS allocato da vmx_init e' il VMCS01. Se la VM si chiude col
+	 * vCPU in L2, vcpu->vmcs e' il VMCS02, che libera vmx_nested_free:
+	 * liberare vcpu->vmcs qui era un doppio free (panic "Duplicate free
+	 * ... malloc-4096", spegnimento durante kvm-unit-tests F2a) e perdeva
+	 * il VMCS01.
+	 */
+	free(vcpu->vmcs01, M_VMX);
 	vmx_nested_free(vcpu);
 	free(vcpu, M_VMX);
 }
