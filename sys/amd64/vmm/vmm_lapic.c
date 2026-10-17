@@ -28,6 +28,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/smp.h>
 
 #include <x86/specialreg.h>
@@ -210,21 +211,45 @@ lapic_set_intr(struct vcpu *vcpu, int vector, bool level)
 	return (0);
 }
 
+/*
+ * Misura della "pulizia" dell'IRR che fa l'accel di QEMU (VM_LAPIC_CLEAR_IRR):
+ * quante chiamate e quanti interrupt IN ATTESA ha cancellato davvero, e
+ * l'ultimo vettore cancellato. Con l'IOAPIC nel kernel la sua cache dei
+ * vettori "vivi" resta vuota e la pulizia butta via ogni vettore 32-95.
+ */
+static u_long lapic_scrub_calls, lapic_scrub_lost;
+static int lapic_scrub_lastvec = -1;
+SYSCTL_DECL(_hw_vmm);
+SYSCTL_ULONG(_hw_vmm, OID_AUTO, irr_scrub_calls, CTLFLAG_RD,
+    &lapic_scrub_calls, 0, "chiamate VM_LAPIC_CLEAR_IRR");
+SYSCTL_ULONG(_hw_vmm, OID_AUTO, irr_scrub_lost, CTLFLAG_RD,
+    &lapic_scrub_lost, 0, "interrupt in attesa cancellati da VM_LAPIC_CLEAR_IRR");
+SYSCTL_INT(_hw_vmm, OID_AUTO, irr_scrub_lastvec, CTLFLAG_RD,
+    &lapic_scrub_lastvec, 0, "ultimo vettore in attesa cancellato");
+
 int
 lapic_clear_irr(struct vcpu *vcpu, struct vm_lapic_clear_irr *ci)
 {
 	struct LAPIC *lapic;
-	uint32_t *irrptr;
+	uint32_t *irrptr, was;
 	int i;
 
 	lapic = vlapic_page(vm_lapic(vcpu));
 	if (lapic == NULL)
 		return (EINVAL);
 
+	atomic_add_long(&lapic_scrub_calls, 1);
 	irrptr = &lapic->irr0;
 	for (i = 0; i < 8; i++) {
-		if (ci->irr_mask[i] != 0)
+		if (ci->irr_mask[i] != 0) {
+			was = irrptr[i * 4] & ci->irr_mask[i];
+			if (was != 0) {
+				atomic_add_long(&lapic_scrub_lost,
+				    __builtin_popcount(was));
+				lapic_scrub_lastvec = i * 32 + ffs(was) - 1;
+			}
 			atomic_clear_int(&irrptr[i * 4], ci->irr_mask[i]);
+		}
 	}
 	return (0);
 }

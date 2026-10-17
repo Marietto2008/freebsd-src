@@ -1,0 +1,4 @@
+# eventinj senza nested: vettori 32/33/62 in attesa nell'IRR (riferimento per la
+# "pulizia" dei vettori 32-95 dell'accel). kut-run.sh kut-eventinj.list
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+eventinj | eventinj.flat |  | -cpu max | 1 | 1024 | 60

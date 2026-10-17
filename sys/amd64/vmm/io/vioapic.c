@@ -393,6 +393,22 @@ vioapic_write(struct vioapic *vioapic, struct vcpu *vcpu, uint32_t addr,
 		 * to update their vlapic trigger-mode registers.
 		 */
 		changed = last ^ vioapic->rtbl[pin].reg;
+		/*
+		 * VM_OP_F_KIOAPIC senza APICv: il TMR si imposta all'accettazione
+		 * (vioapic_update_tmr non fa nulla) e il rendezvous e' inutile;
+		 * e nocivo: con QEMU un AP in attesa di SIPI e' parcheggiato in
+		 * spazio utente e non risponde mai. Firmware UEFI con -smp 2
+		 * fermo per sempre in vm_handle_rendezvous da vioapic_mmio_write
+		 * (procstat -kk), e QEMU non piu' terminabile.
+		 */
+		{
+			int vmflags = 0;
+
+			vm_get_flags(vioapic->vm, &vmflags);
+			if ((vmflags & VM_OP_F_KIOAPIC) != 0 &&
+			    !vlapic_tmr_ahead(vm_lapic(vcpu)))
+				changed &= IOART_INTMASK | IOART_INTPOL;
+		}
 		if (changed & ~(IOART_INTMASK | IOART_INTPOL)) {
 			VIOAPIC_CTR1(vioapic, "ioapic pin%d: recalculate "
 			    "vlapic trigger-mode register", pin);
@@ -428,7 +444,24 @@ vioapic_mmio_rw(struct vioapic *vioapic, struct vcpu *vcpu, uint64_t gpa,
 	/*
 	 * The IOAPIC specification allows 32-bit wide accesses to the
 	 * IOREGSEL (offset 0) and IOWIN (offset 16) registers.
+	 *
+	 * IOREGSEL pero' e' un registro a 8 bit (82093AA) e i firmware lo
+	 * scrivono anche a byte: l'IoApicLib di edk2 usa MmioWrite8 (DTrace:
+	 * 'W gpa=fec00000 val=14 size=1'). Scartarla in silenzio lasciava
+	 * selezionato il registro ID: ogni lettura dava 0, la voce del pin 2
+	 * finiva nell'ID e il tick del timer del firmware UEFI non arrivava
+	 * mai (QEMU -accel bhyve con VM_OP_F_KIOAPIC: firmware fermo in
+	 * attesa). Come KVM: IOREGSEL a 1, 2 o 4 byte.
 	 */
+	if (offset == IOREGSEL && (size == 1 || size == 2)) {
+		VIOAPIC_LOCK(vioapic);
+		if (doread)
+			*data = vioapic->ioregsel & (size == 1 ? 0xff : 0xffff);
+		else
+			vioapic->ioregsel = *data & 0xff;
+		VIOAPIC_UNLOCK(vioapic);
+		return (0);
+	}
 	if (size != 4 || (offset != IOREGSEL && offset != IOWIN)) {
 		if (doread)
 			*data = 0;
