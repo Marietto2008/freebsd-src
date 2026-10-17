@@ -180,11 +180,12 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, initialized, CTLFLAG_RD,
  * successivo, cosi' un guasto che resetta l'host si localizza senza dump:
  *  1 = al VMLAUNCH: host-state e controlli di VMCS02 e VMCS01, poi VMfail;
  *  2 = alla prima uscita da L2: motivo, qualificazione, RIP; VM spenta;
- *  3 = dopo la riflessione a L1: stato del VMCS01; VM spenta.
+ *  3 = dopo la riflessione a L1: stato del VMCS01; VM spenta;
+ *  5 = solo traccia: le prime 32 uscite EXTERNAL_INTERRUPT sintetiche.
  */
 int vmx_nested_probe = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_probe, CTLFLAG_RWTUN,
-    &vmx_nested_probe, 0, "nested: sonda d'arresto (0=off, 1..3)");
+    &vmx_nested_probe, 0, "nested: sonda (0=off, 1..3 arresto, 5 traccia EXTINT)");
 
 static int vmx_debug_trace = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, debug_trace, CTLFLAG_RWTUN,

@@ -1165,6 +1165,20 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		vlapic_intr_accepted(vl, vec);
 		n->synth_intr_info = vec | VMCS_INTR_T_HWINTR | VMCS_INTR_VALID;
 	}
+	if (__predict_false(vmx_nested_probe == 5)) {
+		/* sonda 5: traccia le uscite sintetiche (non ferma nulla) */
+		static int traced;
+		if (traced < 32) {
+			traced++;
+			printf("nested_probe EXTINT#%d vec=%d info=%#x "
+			    "pin12=%#lx exit12=%#lx l2rip=%#lx entryinfo12=%#lx\n",
+			    traced, vec, n->synth_intr_info,
+			    vmcs12_read_field(c, VMCS_PIN_BASED_CTLS),
+			    vmcs12_read_field(c, VMCS_EXIT_CTLS),
+			    vmcs_read(VMCS_GUEST_RIP),
+			    vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO));
+		}
+	}
 	vmexit->u.vmx.exit_reason = EXIT_REASON_EXT_INTR;
 	n->synth = true;
 	nested_reflect_to_l1(vcpu, vmexit);
