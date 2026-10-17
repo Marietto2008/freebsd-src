@@ -843,6 +843,247 @@ done:
  * sempre 0: l'esito e' nel RFLAGS dell'L1 (fallimento) o nell'ingresso in L2.
  */
 /*
+ * Controlli SDM 26.2.1 (campi di controllo, VMfailValid 7) e 26.2.2-26.2.4
+ * (stato host e dimensione dello spazio d'indirizzi, VMfailValid 8) sul
+ * VMCS12, contro le capacita' VMX ESPOSTE all'L1 (n->vmx_msr). Prima erano
+ * "rimandati": la composizione aggiunge di suo i bit obbligatori e nascondeva
+ * gli errori dell'L1 (kvm-unit-tests vmx_controls_test,
+ * vmx_host_state_area_test). Slow path: puo' leggere la memoria dell'L1
+ * (VTPR della pagina virtual-APIC). 0 se tutto valido.
+ */
+static bool
+nested_pa_ok(uint64_t pa, uint64_t align)
+{
+	return ((pa & (align - 1)) == 0 && (pa >> cpu_maxphyaddr) == 0);
+}
+
+static bool
+nested_ctl_ok(uint32_t val, uint64_t msr)
+{
+	return ((val & (uint32_t)msr) == (uint32_t)msr &&
+	    (val & ~(uint32_t)(msr >> 32)) == 0);
+}
+
+static bool
+nested_msr_area_ok(struct vmcs12_cache *c, uint32_t addr_f, uint32_t cnt_f)
+{
+	uint64_t a = vmcs12_read_field(c, addr_f);
+	uint64_t n = vmcs12_read_field(c, cnt_f);
+
+	if (n == 0)
+		return (true);
+	return ((a & 0xf) == 0 && ((a + n * 16 - 1) >> cpu_maxphyaddr) == 0);
+}
+
+static int
+nested_check_vmentry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t *m = n->vmx_msr;
+	bool tru = (m[0] >> 55) & 1;
+	uint32_t pin, proc, proc2, exitc, entryc, info;
+	uint64_t misc = m[0x485 - 0x480], cap = m[0x48c - 0x480];
+	uint64_t v, l1efer = 0;
+	bool hostlm;
+	int i;
+
+	pin = (uint32_t)vmcs12_read_field(c, VMCS_PIN_BASED_CTLS);
+	proc = (uint32_t)vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS);
+	proc2 = (proc & PROCBASED_SECONDARY_CONTROLS) ?
+	    (uint32_t)vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) : 0;
+	exitc = (uint32_t)vmcs12_read_field(c, VMCS_EXIT_CTLS);
+	entryc = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_CTLS);
+
+	/* --- 26.2.1.1 controlli d'esecuzione --- */
+	if (!nested_ctl_ok(pin, m[(tru ? 0x48d : 0x481) - 0x480]) ||
+	    !nested_ctl_ok(proc, m[(tru ? 0x48e : 0x482) - 0x480]) ||
+	    ((proc & PROCBASED_SECONDARY_CONTROLS) &&
+	    !nested_ctl_ok(proc2, m[0x48b - 0x480])))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if (vmcs12_read_field(c, VMCS_CR3_TARGET_COUNT) > ((misc >> 16) & 0x1ff))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((proc & PROCBASED_IO_BITMAPS) &&
+	    (!nested_pa_ok(vmcs12_read_field(c, VMCS_IO_BITMAP_A), PAGE_SIZE) ||
+	    !nested_pa_ok(vmcs12_read_field(c, VMCS_IO_BITMAP_B), PAGE_SIZE)))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((proc & PROCBASED_MSR_BITMAPS) &&
+	    !nested_pa_ok(vmcs12_read_field(c, VMCS_MSR_BITMAP), PAGE_SIZE))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if (proc & PROCBASED_USE_TPR_SHADOW) {
+		uint64_t va = vmcs12_read_field(c, VMCS_VIRTUAL_APIC);
+		uint32_t thr = (uint32_t)vmcs12_read_field(c, VMCS_TPR_THRESHOLD);
+
+		if (!nested_pa_ok(va, PAGE_SIZE))
+			return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		if ((proc2 & PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY) == 0) {
+			if ((thr & ~0xfU) != 0)
+				return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+			if ((proc2 & PROCBASED2_VIRTUALIZE_APIC_ACCESSES) == 0) {
+				uint8_t *pg;
+				void *ck;
+				uint8_t vtpr;
+
+				pg = vm_gpa_hold(vcpu->vcpu, va, PAGE_SIZE,
+				    VM_PROT_READ, &ck);
+				if (pg == NULL)
+					return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+				vtpr = pg[0x80];
+				vm_gpa_release(ck);
+				if ((thr & 0xf) > (uint32_t)(vtpr >> 4))
+					return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+			}
+		}
+	} else if (proc2 & (PROCBASED2_VIRTUALIZE_X2APIC_MODE |
+	    PROCBASED2_APIC_REGISTER_VIRTUALIZATION |
+	    PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((pin & PINBASED_NMI_EXITING) == 0 && (pin & PINBASED_VIRTUAL_NMI))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((pin & PINBASED_VIRTUAL_NMI) == 0 &&
+	    (proc & PROCBASED_NMI_WINDOW_EXITING))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((proc2 & PROCBASED2_VIRTUALIZE_APIC_ACCESSES) &&
+	    !nested_pa_ok(vmcs12_read_field(c, VMCS_APIC_ACCESS), PAGE_SIZE))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((proc2 & PROCBASED2_VIRTUALIZE_X2APIC_MODE) &&
+	    (proc2 & PROCBASED2_VIRTUALIZE_APIC_ACCESSES))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((proc2 & PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY) &&
+	    (pin & PINBASED_EXTINT_EXITING) == 0)
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((proc2 & PROCBASED2_ENABLE_VPID) &&
+	    (vmcs12_read_field(c, VMCS_VPID) & 0xffff) == 0)
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if (proc2 & PROCBASED2_ENABLE_EPT) {
+		uint64_t e = vmcs12_read_field(c, VMCS_EPTP);
+		uint64_t mt = e & 7;
+
+		if (!((mt == 0 && (cap & (1ULL << 8))) ||
+		    (mt == 6 && (cap & (1ULL << 14)))) ||
+		    ((e >> 3) & 7) != 3 ||
+		    ((e & (1ULL << 6)) && (cap & (1ULL << 21)) == 0) ||
+		    (e & 0xf80) != 0 || (e >> cpu_maxphyaddr) != 0)
+			return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	}
+	if ((proc2 & PROCBASED2_UNRESTRICTED_GUEST) &&
+	    (proc2 & PROCBASED2_ENABLE_EPT) == 0)
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+
+	/* --- 26.2.1.2 controlli d'uscita --- */
+	if (!nested_ctl_ok(exitc, m[(tru ? 0x48f : 0x483) - 0x480]))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if ((pin & PINBASED_PREMPTION_TIMER) == 0 &&
+	    (exitc & VM_EXIT_SAVE_PREEMPTION_TIMER))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	if (!nested_msr_area_ok(c, VMCS_EXIT_MSR_STORE,
+	    VMCS_EXIT_MSR_STORE_COUNT) ||
+	    !nested_msr_area_ok(c, VMCS_EXIT_MSR_LOAD, VMCS_EXIT_MSR_LOAD_COUNT))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+
+	/* --- 26.2.1.3 controlli d'ingresso --- */
+	if (!nested_ctl_ok(entryc, m[(tru ? 0x490 : 0x484) - 0x480]) ||
+	    (entryc & (VM_ENTRY_INTO_SMM | VM_ENTRY_DEACTIVATE_DUAL_MONITOR)))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+	info = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO);
+	if (info & VMCS_INTR_VALID) {
+		uint32_t type = (info >> 8) & 7, vec = info & 0xff;
+		bool pe = (vmcs12_read_field(c, VMCS_GUEST_CR0) & CR0_PE) != 0;
+		bool ec, want;
+
+		if (type == 1 ||
+		    (type == 7 && (vec != 0 ||
+		    ((m[(tru ? 0x48e : 0x482) - 0x480] >> 32) &
+		    PROCBASED_MTF) == 0)) ||
+		    (type == 2 && vec != 2) || (type == 3 && vec > 31))
+			return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		ec = (info & (1U << 11)) != 0;
+		want = type == 3 && (pe ||
+		    (proc2 & PROCBASED2_UNRESTRICTED_GUEST) == 0) &&
+		    (vec == 8 || (vec >= 10 && vec <= 14) || vec == 17 ||
+		    vec == 21);
+		if (ec != want || (info & 0x7ffff000U) != 0)
+			return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		if (ec && (vmcs12_read_field(c, VMCS_ENTRY_EXCEPTION_ERROR) >>
+		    16) != 0)
+			return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		if (type >= 4 && type <= 6) {
+			v = vmcs12_read_field(c, VMCS_ENTRY_INST_LENGTH);
+			if (v > 15 || (v == 0 && (misc & (1ULL << 30)) == 0))
+				return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		}
+	}
+	if (!nested_msr_area_ok(c, VMCS_ENTRY_MSR_LOAD,
+	    VMCS_ENTRY_MSR_LOAD_COUNT))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+
+	/* --- 26.2.2 stato host --- */
+	if (!nested_fixed_ok(vmcs12_read_field(c, VMCS_HOST_CR0),
+	    m[0x486 - 0x480], m[0x487 - 0x480]) ||
+	    !nested_fixed_ok(vmcs12_read_field(c, VMCS_HOST_CR4),
+	    m[0x488 - 0x480], m[0x489 - 0x480]) ||
+	    (vmcs12_read_field(c, VMCS_HOST_CR3) >> cpu_maxphyaddr) != 0 ||
+	    !nested_canonical(vmcs12_read_field(c,
+	    VMCS_HOST_IA32_SYSENTER_ESP)) ||
+	    !nested_canonical(vmcs12_read_field(c,
+	    VMCS_HOST_IA32_SYSENTER_EIP)))
+		return (VMXERR_ENTRY_INVALID_HOST_STATE);
+	if (exitc & VM_EXIT_LOAD_PAT) {
+		v = vmcs12_read_field(c, VMCS_HOST_IA32_PAT);
+		for (i = 0; i < 8; i++) {
+			uint8_t t = (v >> (i * 8)) & 0xff;
+
+			if (t == 2 || t == 3 || t > 7)
+				return (VMXERR_ENTRY_INVALID_HOST_STATE);
+		}
+	}
+	hostlm = (exitc & VM_EXIT_HOST_LMA) != 0;
+	if (exitc & VM_EXIT_LOAD_EFER) {
+		v = vmcs12_read_field(c, VMCS_HOST_IA32_EFER);
+		if ((v & ~(EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE)) != 0 ||
+		    ((v & EFER_LMA) != 0) != hostlm ||
+		    ((v & EFER_LME) != 0) != hostlm)
+			return (VMXERR_ENTRY_INVALID_HOST_STATE);
+	}
+	{
+		static const uint32_t sel[] = {
+			VMCS_HOST_ES_SELECTOR, VMCS_HOST_CS_SELECTOR,
+			VMCS_HOST_SS_SELECTOR, VMCS_HOST_DS_SELECTOR,
+			VMCS_HOST_FS_SELECTOR, VMCS_HOST_GS_SELECTOR,
+			VMCS_HOST_TR_SELECTOR,
+		};
+		for (i = 0; i < (int)nitems(sel); i++)
+			if (vmcs12_read_field(c, sel[i]) & 0x7)	/* RPL, TI */
+				return (VMXERR_ENTRY_INVALID_HOST_STATE);
+		if (vmcs12_read_field(c, VMCS_HOST_CS_SELECTOR) == 0 ||
+		    vmcs12_read_field(c, VMCS_HOST_TR_SELECTOR) == 0 ||
+		    (!hostlm && vmcs12_read_field(c, VMCS_HOST_SS_SELECTOR) == 0))
+			return (VMXERR_ENTRY_INVALID_HOST_STATE);
+	}
+	if (!nested_canonical(vmcs12_read_field(c, VMCS_HOST_FS_BASE)) ||
+	    !nested_canonical(vmcs12_read_field(c, VMCS_HOST_GS_BASE)) ||
+	    !nested_canonical(vmcs12_read_field(c, VMCS_HOST_GDTR_BASE)) ||
+	    !nested_canonical(vmcs12_read_field(c, VMCS_HOST_IDTR_BASE)) ||
+	    !nested_canonical(vmcs12_read_field(c, VMCS_HOST_TR_BASE)))
+		return (VMXERR_ENTRY_INVALID_HOST_STATE);
+
+	/* --- 26.2.4 dimensione dello spazio d'indirizzi --- */
+	vm_get_register(vcpu->vcpu, VM_REG_GUEST_EFER, &l1efer);
+	if (((l1efer & EFER_LMA) != 0) != hostlm)
+		return (VMXERR_ENTRY_INVALID_HOST_STATE);
+	if (hostlm) {
+		if ((vmcs12_read_field(c, VMCS_HOST_CR4) & CR4_PAE) == 0 ||
+		    !nested_canonical(vmcs12_read_field(c, VMCS_HOST_RIP)))
+			return (VMXERR_ENTRY_INVALID_HOST_STATE);
+	} else {
+		if ((entryc & VM_ENTRY_GUEST_LMA) ||
+		    (vmcs12_read_field(c, VMCS_HOST_CR4) & CR4_PCIDE) ||
+		    (vmcs12_read_field(c, VMCS_HOST_RIP) >> 32) != 0)
+			return (VMXERR_ENTRY_INVALID_HOST_STATE);
+	}
+	return (0);
+}
+
+/*
  * PAE senza EPT nel VMCS12: la CPU vera, al VM-entry, legge i 4 PDPTE dalla
  * memoria di CR3 e ne verifica i bit riservati (SDM 26.3.1.6). Il VMCS02 usa
  * sempre EPT (quella di L0), quindi la CPU li prenderebbe dai campi PDPTE del
@@ -906,6 +1147,19 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		nested_advance_rip(vcpu);
 		return (0);
 	}
+	/* SDM 26.1: VMLAUNCH/VMRESUME nell'ombra di un MOV SS -> VMfail 26,
+	 * prima del controllo sul launch state (vmentry_movss_shadow_test) */
+	{
+		uint64_t gi = 0;
+
+		vm_get_register(vcpu->vcpu,
+		    VMCS_IDENT(VMCS_GUEST_INTERRUPTIBILITY), &gi);
+		if (gi & VMCS_INTERRUPTIBILITY_MOVSS_BLOCKING) {
+			nested_vmx_result(vcpu, VMXERR_ENTRY_MOV_SS_BLOCKING);
+			nested_advance_rip(vcpu);
+			return (0);
+		}
+	}
 	/* launch state: VMLAUNCH vuole clear, VMRESUME vuole launched */
 	if (is_resume && !c->launched) {
 		nested_vmx_result(vcpu, VMXERR_VMRESUME_NONLAUNCHED_VMCS);
@@ -917,10 +1171,13 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		nested_advance_rip(vcpu);
 		return (0);
 	}
-	/*
-	 * Controlli su controlli/host-state di VMCS12 in software (VMfailValid
-	 * 7/8): limite v1, rimandati. Lo stato guest lo verifica l'hardware.
-	 */
+	/* controlli SDM su controlli e stato host del VMCS12 (VMfail 7 / 8);
+	 * lo stato guest lo verifica l'hardware sul VMCS02 */
+	if ((error = nested_check_vmentry(vcpu, c)) != 0) {
+		nested_vmx_result(vcpu, error);
+		nested_advance_rip(vcpu);
+		return (0);
+	}
 
 	/* Bitmap I/O e MSR dell'L1: mappate qui (slow path, si puo' dormire),
 	 * lette dal percorso veloce. Non mappabili -> controllo non valido. */
