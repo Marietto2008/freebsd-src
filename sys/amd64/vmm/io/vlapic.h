@@ -89,6 +89,7 @@ void vlapic_deliver_intr(struct vm *vm, bool level, uint32_t dest, bool phys,
 
 /* Reset the trigger-mode bits for all vectors to be edge-triggered */
 void vlapic_reset_tmr(struct vlapic *vlapic);
+bool vlapic_tmr_ahead(struct vlapic *vlapic);
 
 /*
  * Set the trigger-mode bit associated with 'vector' to level-triggered if

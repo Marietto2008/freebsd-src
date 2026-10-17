@@ -326,6 +326,19 @@ vlapic_set_intr_ready(struct vlapic *vlapic, int vector, bool level)
 	 * the vlapic TMR registers.
 	 */
 	tmrptr = &lapic->tmr0;
+	{
+		int vmflags = 0;
+
+		/* VM_OP_F_KIOAPIC: TMR all'accettazione (vedi
+		 * vioapic_update_tmr); le altre VM come prima */
+		vm_get_flags(vlapic->vm, &vmflags);
+		if (vmflags & VM_OP_F_KIOAPIC) {
+			if (level)
+				atomic_set_int(&tmrptr[idx], mask);
+			else
+				atomic_clear_int(&tmrptr[idx], mask);
+		}
+	}
 	if ((tmrptr[idx] & mask) != (level ? mask : 0)) {
 		VLAPIC_CTR3(vlapic, "vlapic TMR[%d] is 0x%08x but "
 		    "interrupt is %s-triggered", idx / 4, tmrptr[idx],
@@ -1799,6 +1812,13 @@ vlapic_enabled(struct vlapic *vlapic)
 		return (true);
 	else
 		return (false);
+}
+
+/* true se il TMR va aggiornato in anticipo (APICv: bitmap degli EOI) */
+bool
+vlapic_tmr_ahead(struct vlapic *vlapic)
+{
+	return (vlapic->ops.set_tmr != NULL);
 }
 
 static void

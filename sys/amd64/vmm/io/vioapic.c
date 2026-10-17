@@ -255,6 +255,21 @@ vioapic_update_tmr(struct vcpu *vcpu, void *arg)
 	vlapic = vm_lapic(vcpu);
 	vioapic = vm_ioapic(vcpu_vm(vcpu));
 
+	/*
+	 * VM_OP_F_KIOAPIC (QEMU di qemu-nested) senza APICv: il TMR lo imposta
+	 * vlapic_set_intr_ready all'ACCETTAZIONE, come la CPU vera; qui niente
+	 * aggiornamento anticipato (ioapic.flat, 'TMR for ioapic level/edge
+	 * interrupts'). Con APICv (ops.set_tmr) serve anticipato, per la
+	 * bitmap degli EOI. Le altre VM restano come prima.
+	 */
+	{
+		int vmflags = 0;
+
+		vm_get_flags(vcpu_vm(vcpu), &vmflags);
+		if ((vmflags & VM_OP_F_KIOAPIC) != 0 && !vlapic_tmr_ahead(vlapic))
+			return;
+	}
+
 	VIOAPIC_LOCK(vioapic);
 	/*
 	 * Reset all vectors to be edge-triggered.
@@ -330,7 +345,10 @@ vioapic_write(struct vioapic *vioapic, struct vcpu *vcpu, uint32_t addr,
 	regnum = addr & 0xff;
 	switch (regnum) {
 	case IOAPIC_ID:
-		vioapic->id = data & APIC_ID_MASK;
+		/* ID dell'IOAPIC: 4 bit (27:24, 82093AA), non gli 8 dell'APIC
+		 * (kvm-unit-tests ioapic.flat, 'id register only bits [24:27]
+		 * writable') */
+		vioapic->id = data & 0x0f000000;
 		break;
 	case IOAPIC_VER:
 	case IOAPIC_ARB:
