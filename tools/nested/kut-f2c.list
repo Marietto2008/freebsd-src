@@ -1,8 +1,59 @@
-# F2c — L2: il grosso di vmx.flat + EPT.
-# kut-run.sh --nested kut-f2c.list
-# Allineato a x86/unittests.cfg di kvm-unit-tests 5a22134:
-#  [vmx] = vmx.flat con le stesse esclusioni ufficiali;
-#  [ept] = vmx.flat "ept_access*" (NON esiste un ept.flat).
+# F2c — suite VMX completa, UN TEST PER RIGA (generata da x86/vmx_tests.c 5a22134).
+# Esclusioni = voce [vmx] di unittests.cfg. Gli ept_access* richiedono
+# MAXPHYADDR >= 40: sull'i9-9900K (39 bit) vengono saltati anche da KVM.
 # nome | file.flat | args | qemu_params | smp | mem | timeout
-vmx-full | vmx.flat | -exit_monitor_from_l2_test -ept_access* -vmx_smp* -vmx_vmcs_shadow_test -atomic_switch_overflow_msrs_test -vmx_init_signal_test -vmx_apic_passthrough_tpr_threshold_test -apic_reg_virt_test -virt_x2apic_mode_test -vmx_pf_exception_test -vmx_pf_exception_forced_emulation_test -vmx_pf_no_vpid_test -vmx_pf_invvpid_test -vmx_pf_vpid_test -vmx_basic_vid_test -vmx_eoi_virt_test -vmx_posted_interrupts_test | -cpu max | 1 | 1024 | 600
-ept      | vmx.flat | ept_access* | -cpu max | 1 | 2560 | 300
+null                                        | vmx.flat | null                                        | -cpu max | 1 | 1024 | 120
+vmenter                                     | vmx.flat | vmenter                                     | -cpu max | 1 | 1024 | 120
+preemption_timer                            | vmx.flat | preemption_timer                            | -cpu max | 1 | 1024 | 120
+control_field_PAT                           | vmx.flat | control_field_PAT                           | -cpu max | 1 | 1024 | 120
+control_field_EFER                          | vmx.flat | control_field_EFER                          | -cpu max | 1 | 1024 | 120
+CR_shadowing                                | vmx.flat | CR_shadowing                                | -cpu max | 1 | 1024 | 120
+I_O_bitmap                                  | vmx.flat | I/O_bitmap                                  | -cpu max | 1 | 1024 | 120
+instruction_intercept                       | vmx.flat | instruction_intercept                       | -cpu max | 1 | 1024 | 120
+EPT_A_D_disabled                            | vmx.flat | EPT_A/D_disabled                            | -cpu max | 1 | 1024 | 120
+EPT_A_D_enabled                             | vmx.flat | EPT_A/D_enabled                             | -cpu max | 1 | 1024 | 120
+PML                                         | vmx.flat | PML                                         | -cpu max | 1 | 1024 | 120
+interrupt                                   | vmx.flat | interrupt                                   | -cpu max | 1 | 1024 | 120
+nmi_hlt                                     | vmx.flat | nmi_hlt                                     | -cpu max | 1 | 1024 | 120
+debug_controls                              | vmx.flat | debug_controls                              | -cpu max | 1 | 1024 | 120
+MSR_switch                                  | vmx.flat | MSR_switch                                  | -cpu max | 1 | 1024 | 120
+vmmcall                                     | vmx.flat | vmmcall                                     | -cpu max | 1 | 1024 | 120
+disable_RDTSCP                              | vmx.flat | disable_RDTSCP                              | -cpu max | 1 | 1024 | 120
+invalid_msr                                 | vmx.flat | invalid_msr                                 | -cpu max | 1 | 1024 | 120
+v2_null_test                                | vmx.flat | v2_null_test                                | -cpu max | 1 | 1024 | 120
+v2_multiple_entries_test                    | vmx.flat | v2_multiple_entries_test                    | -cpu max | 1 | 1024 | 120
+fixture_test_case1                          | vmx.flat | fixture_test_case1                          | -cpu max | 1 | 1024 | 120
+fixture_test_case2                          | vmx.flat | fixture_test_case2                          | -cpu max | 1 | 1024 | 120
+invvpid_test                                | vmx.flat | invvpid_test                                | -cpu max | 1 | 1024 | 120
+vmx_controls_test                           | vmx.flat | vmx_controls_test                           | -cpu max | 1 | 1024 | 120
+vmx_host_state_area_test                    | vmx.flat | vmx_host_state_area_test                    | -cpu max | 1 | 1024 | 120
+vmx_guest_state_area_test                   | vmx.flat | vmx_guest_state_area_test                   | -cpu max | 1 | 1024 | 120
+vmentry_movss_shadow_test                   | vmx.flat | vmentry_movss_shadow_test                   | -cpu max | 1 | 1024 | 120
+vmentry_unrestricted_guest_test             | vmx.flat | vmentry_unrestricted_guest_test             | -cpu max | 1 | 1024 | 120
+vmx_eoi_bitmap_ioapic_scan_test             | vmx.flat | vmx_eoi_bitmap_ioapic_scan_test             | -cpu max | 1 | 1024 | 120
+vmx_hlt_with_rvi_test                       | vmx.flat | vmx_hlt_with_rvi_test                       | -cpu max | 1 | 1024 | 120
+vmx_apic_passthrough_test                   | vmx.flat | vmx_apic_passthrough_test                   | -cpu max | 1 | 1024 | 120
+vmx_apic_passthrough_thread_test            | vmx.flat | vmx_apic_passthrough_thread_test            | -cpu max | 1 | 1024 | 120
+vmx_sipi_signal_test                        | vmx.flat | vmx_sipi_signal_test                        | -cpu max | 1 | 1024 | 120
+vmx_ldtr_test                               | vmx.flat | vmx_ldtr_test                               | -cpu max | 1 | 1024 | 120
+vmx_cr_load_test                            | vmx.flat | vmx_cr_load_test                            | -cpu max | 1 | 1024 | 120
+vmx_cr4_osxsave_test                        | vmx.flat | vmx_cr4_osxsave_test                        | -cpu max | 1 | 1024 | 120
+vmx_no_nm_test                              | vmx.flat | vmx_no_nm_test                              | -cpu max | 1 | 1024 | 120
+vmx_db_test                                 | vmx.flat | vmx_db_test                                 | -cpu max | 1 | 1024 | 120
+vmx_nmi_window_test                         | vmx.flat | vmx_nmi_window_test                         | -cpu max | 1 | 1024 | 120
+vmx_intr_window_test                        | vmx.flat | vmx_intr_window_test                        | -cpu max | 1 | 1024 | 120
+vmx_pending_event_test                      | vmx.flat | vmx_pending_event_test                      | -cpu max | 1 | 1024 | 120
+vmx_pending_event_hlt_test                  | vmx.flat | vmx_pending_event_hlt_test                  | -cpu max | 1 | 1024 | 120
+vmx_store_tsc_test                          | vmx.flat | vmx_store_tsc_test                          | -cpu max | 1 | 1024 | 120
+vmx_preemption_timer_zero_test              | vmx.flat | vmx_preemption_timer_zero_test              | -cpu max | 1 | 1024 | 120
+vmx_preemption_timer_tf_test                | vmx.flat | vmx_preemption_timer_tf_test                | -cpu max | 1 | 1024 | 120
+vmx_preemption_timer_expiry_test            | vmx.flat | vmx_preemption_timer_expiry_test            | -cpu max | 1 | 1024 | 120
+atomic_switch_max_msrs_test                 | vmx.flat | atomic_switch_max_msrs_test                 | -cpu max | 1 | 1024 | 120
+rdtsc_vmexit_diff_test                      | vmx.flat | rdtsc_vmexit_diff_test                      | -cpu max | 1 | 1024 | 120
+vmx_mtf_test                                | vmx.flat | vmx_mtf_test                                | -cpu max | 1 | 1024 | 120
+vmx_mtf_pdpte_test                          | vmx.flat | vmx_mtf_pdpte_test                          | -cpu max | 1 | 1024 | 120
+vmx_pae_test                                | vmx.flat | vmx_pae_test                                | -cpu max | 1 | 1024 | 120
+vmx_pse_test                                | vmx.flat | vmx_pse_test                                | -cpu max | 1 | 1024 | 120
+vmx_exception_test                          | vmx.flat | vmx_exception_test                          | -cpu max | 1 | 1024 | 120
+vmx_canonical_test                          | vmx.flat | vmx_canonical_test                          | -cpu max | 1 | 1024 | 120
+vmx_cet_test                                | vmx.flat | vmx_cet_test                                | -cpu max | 1 | 1024 | 120
