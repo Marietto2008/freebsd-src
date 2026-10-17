@@ -203,6 +203,9 @@ struct vmx_nested {
 					 * MSR del guest in guest_msrs[], NON nei
 					 * registri hardware */
 	uint64_t	l1_tsc_offset;	/* TSC offset del VMCS01 al VMLAUNCH */
+	uint64_t	l2_exit_rip;	/* RIP dell'L2 all'ultima uscita (~0: nessuna
+					 * dal VMLAUNCH/VMRESUME): se all'ingresso e'
+					 * cambiato, L0 ha completato un'istruzione */
 	uint64_t	exit_tsc;	/* TSC host all'ultima uscita da L2 */
 	uint64_t	pdpte[4];	/* PDPTE dell'L2 letti dalla memoria di CR3 */
 	bool		pdpte_mem;	/* ...da usare nel VMCS02 (PAE senza EPT12) */
@@ -237,7 +240,8 @@ int	vmx_nested_exit(void *vcpui);
 void	nested_vmx_result(struct vmx_vcpu *vcpu, int errnum);
 void	nested_vmfail_invalid(struct vmx_vcpu *vcpu);
 /* Eventi dell'L1 da consegnare prima di rientrare in L2 (vmx_run). */
-bool	nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
+bool	nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
+	    uint64_t rip);
 /* Sonde d'arresto controllato (hw.vmm.vmx.nested_probe, vmx.c). */
 extern int vmx_nested_probe;
 void	nested_probe_dump(const char *tag);

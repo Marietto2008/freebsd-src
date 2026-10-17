@@ -1402,6 +1402,7 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 * 'blocking by STI / MOV-SS'). Il riferimento diventa il RIP dell'L2.
 	 */
 	vcpu->state.nextrip = vmcs12_read_field(c, VMCS_GUEST_RIP);
+	n->l2_exit_rip = ~0UL;		/* nessuna uscita da L2 ancora */
 	/* Load PAT all'ingresso: il PAT virtuale del vCPU diventa quello
 	 * dell'L2 (kvm-unit-tests 'control field PAT': l'L2 lo rilegge con
 	 * RDMSR, che bhyve serve da guest_msrs). */
@@ -1757,7 +1758,8 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
  * (VM_EXITCODE_NESTED + restart_only, come dopo una riflessione).
  */
 bool
-nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
+    uint64_t rip)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c = nested_current_cache(n);
@@ -1766,6 +1768,27 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 
 	if (c == NULL || !n->in_l2)
 		return (false);
+	/*
+	 * MTF pendente (SDM 26.5.2 / come nested_vmx_mtf_pending di KVM): se
+	 * L0 ha completato un'istruzione dell'L2 per conto suo (I/O, MSR, CPUID
+	 * emulati: il RIP e' avanzato dall'ultima uscita) e l'L1 ha il monitor
+	 * trap flag, l'hardware non ha visto l'istruzione e non generera' la
+	 * trappola: uscita MTF sintetica verso l'L1 (kvm-unit-tests
+	 * vmx_mtf_test, 'MTF VM-exit after OUT'). Prima degli interrupt.
+	 */
+	if (n->l2_exit_rip != ~0UL && rip != n->l2_exit_rip &&
+	    (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) & PROCBASED_MTF)) {
+		n->l2_exit_rip = ~0UL;
+		n->synth_intr_info = 0;
+		n->synth_qual = 0;
+		vmexit->u.vmx.exit_reason = EXIT_REASON_MTF;
+		n->synth = true;
+		nested_reflect_to_l1(vcpu, vmexit);
+		n->synth = false;
+		n->restart_only = true;
+		vmexit->exitcode = VM_EXITCODE_NESTED;
+		return (true);
+	}
 	if ((vmcs12_read_field(c, VMCS_PIN_BASED_CTLS) &
 	    PINBASED_EXTINT_EXITING) == 0)
 		return (false);
@@ -2095,11 +2118,19 @@ nested_bitmap_bit(const uint8_t *bm, uint32_t bit)
  * rami dell'L1. ext-int/NMI restano all'L0 (ritorna false: il flusso normale
  * li gestisce e si rientra in L2, con VMCS02 ancora corrente).
  */
+/* RIP dell'L2 a questa uscita, per l'MTF pendente (nested_check_events) */
+static void
+n_exit_rip_record(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+{
+	vcpu->nested->l2_exit_rip = vmexit->rip;
+}
+
 bool
 nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 {
 	uint32_t reason = vmexit->u.vmx.exit_reason & 0xffff;
 
+	n_exit_rip_record(vcpu, vmexit);
 	/* un'uscita normale da L2 = l'ingresso e' riuscito: VMCS12 launched */
 	if ((vmcs_read(VMCS_EXIT_REASON) & 0x80000000) == 0)
 		vcpu->nested->launching = false;

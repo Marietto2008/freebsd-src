@@ -3481,7 +3481,7 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * nulla diventa pendente tra il controllo e l'iniezione.
 		 */
 		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
-		    nested_check_events(vcpu, vmexit)) {
+		    nested_check_events(vcpu, vmexit, rip)) {
 			enable_intr();
 			break;
 		}
