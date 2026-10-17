@@ -1931,8 +1931,20 @@ vmx_get_guest_reg(struct vmx_vcpu *vcpu, int ident)
 		return (vmxctx->guest_rdx);
 	case 3:
 		return (vmxctx->guest_rbx);
-	case 4:
-		return (vmcs_read(VMCS_GUEST_RSP));
+	case 4: {
+		/*
+		 * RSP sta nel VMCS, non in vmxctx. Il nested chiama questa
+		 * funzione anche dallo slow path (vm_run, vCPU FROZEN, VMCS non
+		 * caricato): un vmcs_read grezzo li' panica ("vmcs_read(0x681c)
+		 * error 1", kvm-unit-tests F2a, operando VMX sullo stack).
+		 * vm_get_register fa vmread diretto se il vCPU gira su questa
+		 * CPU, altrimenti VMPTRLD/VMCLEAR.
+		 */
+		uint64_t rsp;
+
+		vm_get_register(vcpu->vcpu, VM_REG_GUEST_RSP, &rsp);
+		return (rsp);
+	}
 	case 5:
 		return (vmxctx->guest_rbp);
 	case 6:
@@ -1980,8 +1992,8 @@ vmx_set_guest_reg(struct vmx_vcpu *vcpu, int ident, uint64_t regval)
 	case 3:
 		vmxctx->guest_rbx = regval;
 		break;
-	case 4:
-		vmcs_write(VMCS_GUEST_RSP, regval);
+	case 4:		/* vedi vmx_get_guest_reg: sicuro anche nello slow path */
+		vm_set_register(vcpu->vcpu, VM_REG_GUEST_RSP, regval);
 		break;
 	case 5:
 		vmxctx->guest_rbp = regval;
