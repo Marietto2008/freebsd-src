@@ -839,6 +839,13 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		return (0);
 	}
 
+	/* DR7/DEBUGCTL dell'L1, letti ORA (VMCS01 ancora vcpu->vmcs; dopo il
+	 * VMPTRLD del VMCS02 vm_get_register lo scaricherebbe): se l'L1 non
+	 * chiede load debug controls, l'L2 li eredita (compose). */
+	vm_get_register(vcpu->vcpu, VM_REG_GUEST_DR7, &n->l1_dr7);
+	vm_get_register(vcpu->vcpu, VMCS_IDENT(VMCS_GUEST_IA32_DEBUGCTL),
+	    &n->l1_debugctl);
+
 	/* host-state fisso del VMCS02 (lascia nessun VMCS corrente) */
 	if ((error = vmx_nested_vmcs02_setup(c)) != 0) {
 		nested_vmx_result(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
@@ -984,6 +991,13 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_PAT)
 		vmcs12_write_field(c, VMCS_GUEST_IA32_PAT,
 		    vcpu->guest_msrs[IDX_MSR_PAT]);
+	/* Save debug controls: DR7/DEBUGCTL dell'L2 nel VMCS12, solo se chiesto. */
+	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_DEBUG_CONTROLS) {
+		vmcs12_write_field(c, VMCS_GUEST_DR7,
+		    vmcs_read(VMCS_GUEST_DR7));
+		vmcs12_write_field(c, VMCS_GUEST_IA32_DEBUGCTL,
+		    vmcs_read(VMCS_GUEST_IA32_DEBUGCTL));
+	}
 	/* [v2] IA-32e mode guest degli entry controls di VMCS12 = EFER.LMA di L2 */
 	efer = vmcs_read(VMCS_GUEST_IA32_EFER);
 
@@ -1036,6 +1050,9 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* EFER/PAT secondo gli exit controls di VMCS12 */
 	efer = vmcs12_read_field(c, VMCS_HOST_IA32_EFER);
 	vmwrite(VMCS_GUEST_IA32_EFER, efer);
+	/* SDM "Loading Host State": all'uscita DR7 = 0x400, DEBUGCTL = 0. */
+	vmwrite(VMCS_GUEST_DR7, 0x400);
+	vmwrite(VMCS_GUEST_IA32_DEBUGCTL, 0);
 	/* Load PAT all'uscita: il PAT virtuale dell'L1 diventa HOST_PAT. */
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_LOAD_PAT)
 		vcpu->guest_msrs[IDX_MSR_PAT] =
@@ -1183,16 +1200,47 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		uint32_t p12;
 		if (cc == NULL) break;
 		p12 = (uint32_t)vmcs12_read_field(cc, VMCS_PRI_PROC_BASED_CTLS);
-		if (p12 & PROCBASED_IO_EXITING) break;	/* uncond -> riflette */
 		if (p12 & PROCBASED_IO_BITMAPS) {
-			uint16_t port = (vmcs_read(VMCS_EXIT_QUALIFICATION) >>
-			    16) & 0xffff;
-			const uint8_t *bm = (port < 0x8000) ?
-			    cc->bm_io_a : cc->bm_io_b;
-			if (nested_bitmap_bit(bm, port & 0x7fff))
+			/*
+			 * SDM: con le bitmap l'I/O "incondizionato" e' ignorato.
+			 * Esce se UNA qualunque delle porte toccate (1, 2 o 4
+			 * byte) ha il bit, o se l'accesso sfora oltre 0xffff.
+			 */
+			uint64_t q = vmcs_read(VMCS_EXIT_QUALIFICATION);
+			uint32_t port = (q >> 16) & 0xffff, size = (q & 7) + 1;
+			uint32_t p;
+			bool hit = false;
+
+			if (port + size - 1 > 0xffff)
+				break;			/* wrap -> riflette */
+			for (p = port; p < port + size && !hit; p++)
+				hit = nested_bitmap_bit(p < 0x8000 ?
+				    cc->bm_io_a : cc->bm_io_b, p & 0x7fff);
+			if (hit)
 				break;			/* L1 intercetta -> riflette */
+			return (false);		/* L0 gestisce con i reg. di L2 */
 		}
+		if (p12 & PROCBASED_IO_EXITING) break;	/* uncond -> riflette */
 		return (false);			/* L0 gestisce con i registri di L2 */
+	}
+	case EXIT_REASON_CR_ACCESS: {
+		/*
+		 * CR8 (TPR): L0 forza le uscite su CR8 nel VMCS02; si riflette
+		 * all'L1 solo se il SUO VMCS12 le chiede, altrimenti L0 emula
+		 * sul TPR del vCPU, che e' cio' che l'L2 vedrebbe sul ferro.
+		 * Gli altri CR (0, 3, 4): riflessi come prima.
+		 */
+		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
+		uint64_t q = vmcs_read(VMCS_EXIT_QUALIFICATION);
+		uint32_t cr = q & 0xf, type = (q >> 4) & 3, p12;
+
+		if (cc == NULL || cr != 8 || type > 1)
+			break;
+		p12 = (uint32_t)vmcs12_read_field(cc, VMCS_PRI_PROC_BASED_CTLS);
+		if (p12 & (type == 0 ? PROCBASED_CR8_LOAD_EXITING :
+		    PROCBASED_CR8_STORE_EXITING))
+			break;			/* L1 intercetta -> riflette */
+		return (false);			/* L0 emula sul TPR */
 	}
 	case EXIT_REASON_RDMSR:
 	case EXIT_REASON_WRMSR: {
@@ -1477,6 +1525,13 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	/* --- resto del guest-state copiato esplicitamente --- */
 	for (i = 0; i < (int)nitems(gstate); i++)
 		vmwrite(gstate[i], vmcs12_read_field(c, gstate[i]));
+	/* Senza load debug controls nel VMCS12, DR7/DEBUGCTL dell'L2 sono quelli
+	 * che l'L1 aveva (kvm-unit-tests 'debug controls'). */
+	if ((vmcs12_read_field(c, VMCS_ENTRY_CTLS) &
+	    VM_ENTRY_LOAD_DEBUG_CONTROLS) == 0) {
+		vmwrite(VMCS_GUEST_DR7, n->l1_dr7);
+		vmwrite(VMCS_GUEST_IA32_DEBUGCTL, n->l1_debugctl);
+	}
 
 	/* --- EPTP, VPID, MSR bitmap, TSC offset, liste MSR, link pointer --- */
 	/* EPTP: shadow EPT se VMCS12 usa EPT (T2.7), altrimenti EPTP01. */

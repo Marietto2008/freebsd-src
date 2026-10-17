@@ -156,6 +156,8 @@ struct vmx_nested {
 	uint16_t	vpid2;		/* VPID distinto per L2 (T2.8) */
 	bool		restart_only;	/* uscita L2 gia' riflessa: lo slow path
 					 * deve solo far ripartire vmx_run */
+	uint64_t	l1_dr7;		/* DR7/DEBUGCTL dell'L1 al VMLAUNCH: */
+	uint64_t	l1_debugctl;	/* li eredita l'L2 senza load debug */
 	/*
 	 * Campi d'uscita CATTURATI col VMCS01 corrente (in vmx_exit_process),
 	 * perche' nel slow path (vm_run, vCPU FROZEN) il VMCS NON e' caricato e
