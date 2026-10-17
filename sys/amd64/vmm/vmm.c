@@ -1042,9 +1042,11 @@ vm_handle_inst_emul(struct vcpu *vcpu, bool *retu)
 		mread = lapic_mmio_read;
 		mwrite = lapic_mmio_write;
 	} else if (gpa >= VIOAPIC_BASE && gpa < VIOAPIC_BASE + VIOAPIC_SIZE) {
-		if (vcpu->vm->flags & VM_OP_F_QEMU) {
+		if ((vcpu->vm->flags & (VM_OP_F_QEMU | VM_OP_F_KIOAPIC)) ==
+		    VM_OP_F_QEMU) {
 			/* In QEMU mode, IOAPIC MMIO goes to userspace so QEMU's
-			 * own IOAPIC model handles RTE programming */
+			 * own IOAPIC model handles RTE programming (salvo
+			 * VM_OP_F_KIOAPIC: allora decide il vioapic qui) */
 			*retu = true;
 			return (0);
 		}

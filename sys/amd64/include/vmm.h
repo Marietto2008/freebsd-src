@@ -131,6 +131,15 @@ enum x2apic_state {
  * smette di funzionare senza errori di compilazione.
  */
 #define VM_OP_F_QEMU (1 << 0)
+/*
+ * Con VM_OP_F_QEMU: l'IOAPIC lo emula il vioapic del KERNEL (MMIO a
+ * 0xfec00000 gestito qui, consegna level con remote IRR, EOI dal vlapic,
+ * TMR, maschere), come in bhyve nativo. Senza, come prima: MMIO a QEMU,
+ * che consegna gli interrupt come MSI edge (ioapic.flat: 9/19 FAIL sui
+ * level). Lo imposta solo il QEMU di qemu-nested: i QEMU che non lo
+ * conoscono restano invariati.
+ */
+#define VM_OP_F_KIOAPIC (1 << 1)
 #ifdef _KERNEL
 #define	VMM_VCPU_MD_FIELDS						\
 	struct vlapic	*vlapic;	/* (i) APIC device model */	\
