@@ -3423,9 +3423,19 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	 * voci shadow nuove non lo richiedono (una EPT violation invalida gia'
 	 * la traduzione del suo GPA, SDM 28.4.3).
 	 */
+	/*
+	 * Shadow EPT solo se e' il VMCS12 a usare EPT. Prima si guardavano i
+	 * secondari del VMCS02, dove EPT e' SEMPRE attivo (serve a L0): con
+	 * una radice shadow residua di un ingresso precedente si "ripristinava"
+	 * l'EPTP shadow sopra quello di L0, e i fault dell'L2 finivano
+	 * nell'EPT di L0, che non li risolveva: ciclo infinito
+	 * (vmx_guest_state_area_test, sonda 8: eptp ...01e, qual 0x784).
+	 */
 	if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
 	    vcpu->nested->vept_root != NULL &&
-	    (vmcs_read(VMCS_SEC_PROC_BASED_CTLS) & PROCBASED2_ENABLE_EPT)) {
+	    nested_current_cache(vcpu->nested) != NULL &&
+	    (vmcs12_proc2(nested_current_cache(vcpu->nested)) &
+	    PROCBASED2_ENABLE_EPT)) {
 		struct invept_desc ed;
 		uint64_t cur = vmcs_read(VMCS_EPTP);
 
