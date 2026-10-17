@@ -808,6 +808,17 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	vcpu->state.lastcpu = NOCPU;
 	n->in_l2 = true;
 	c->launched = 1;			/* dopo VMLAUNCH il VMCS12 e' launched */
+	/*
+	 * vm_run ha GIA' calcolato nextrip = RIP dell'L1 + lunghezza del
+	 * VMLAUNCH, prima di chiamare questo slow path, e vmx_run lo scrive
+	 * nel GUEST_RIP del VMCS corrente: senza questo, l'L2 partiva
+	 * dall'istruzione dell'L1 dopo il VMLAUNCH (kvm-unit-tests F2a:
+	 * "VM-Fail on vmlaunch: unexpected flags 2", stampato DA L2).
+	 * vm_set_register(RIP) scrive nel VMCS02 (ora vcpu->vmcs) e allinea
+	 * nextrip al punto d'ingresso di L2.
+	 */
+	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP,
+	    vmcs12_read_field(c, VMCS_GUEST_RIP));
 	vmexit->inst_length = 0;
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_L2_ENTRIES, 1);
 	return (0);
