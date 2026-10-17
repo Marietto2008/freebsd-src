@@ -1401,7 +1401,9 @@ nested_msr_rw(struct vmx_vcpu *vcpu, uint32_t idx, uint64_t *val, bool wr,
 		 */
 		if (wr)
 			return (EINVAL);
-		*val = rdtsc() + vcpu->nested->l1_tsc_offset;
+		/* all'istante dell'uscita hardware (per una sintetica: ora) */
+		*val = (vcpu->nested->synth ? rdtsc() : vcpu->nested->exit_tsc) +
+		    vcpu->nested->l1_tsc_offset;
 		return (0);
 	default:
 		return (EINVAL);	/* FS/GS_BASE, x2APIC, SMM...: vietati */

@@ -191,6 +191,7 @@ struct vmx_nested {
 					 * MSR del guest in guest_msrs[], NON nei
 					 * registri hardware */
 	uint64_t	l1_tsc_offset;	/* TSC offset del VMCS01 al VMLAUNCH */
+	uint64_t	exit_tsc;	/* TSC host all'ultima uscita da L2 */
 	uint64_t	l1_dr7;		/* DR7/DEBUGCTL dell'L1 al VMLAUNCH: */
 	uint64_t	l1_debugctl;	/* li eredita l'L2 senza load debug */
 	/*

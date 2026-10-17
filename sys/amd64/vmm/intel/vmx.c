@@ -3639,6 +3639,11 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			}
 		}
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
+		/* nested: TSC al momento dell'uscita, per IA32_TSC nella lista
+		 * "store all'uscita" (SDM: valore all'uscita, non alla
+		 * riflessione; rdtsc_vmexit_diff_test tollera 750 cicli) */
+		if (vcpu->nested != NULL && vcpu->nested->in_l2)
+			vcpu->nested->exit_tsc = rdtsc();
 
 		vmx_pmap_deactivate(vmx, pmap);
 		vmx_dr_leave_guest(vmxctx);
