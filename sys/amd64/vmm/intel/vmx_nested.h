@@ -127,6 +127,13 @@ struct vmcs12_cache {
 	bool		control_dirty;	/* controlli da ricomporre */
 	struct vmcs12_field fields[VMCS12_NFIELDS];  /* store software (T1.8) */
 	int		nfields;
+	/*
+	 * Bitmap I/O (A, B) e MSR dell'L1, mappate al VMLAUNCH/VMRESUME nello
+	 * slow path: il percorso veloce (vmx_exit_process) gira in sezione
+	 * critica e non puo' chiamare vm_gpa_hold, che puo' dormire.
+	 */
+	uint8_t		*bm_io_a, *bm_io_b, *bm_msr;
+	void		*ck_io_a, *ck_io_b, *ck_msr;
 };
 
 /*

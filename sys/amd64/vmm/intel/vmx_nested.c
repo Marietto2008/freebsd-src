@@ -42,6 +42,9 @@
 
 MALLOC_DEFINE(M_VMX_NESTED, "vmx_nested", "Intel VMX nested virtualization");
 
+static void	nested_bitmaps_unmap(struct vmcs12_cache *c);
+static int	nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c);
+
 /*
  * Probe SDT del nested. Non si sparano ancora (lo faranno T1.7+); definirle
  * qui le rende visibili da subito a dtrace: vmm:vmx:nested:*.
@@ -190,6 +193,7 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 		return;
 
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
+		nested_bitmaps_unmap(&n->cache[i]);
 		if (n->cache[i].vmcs02 != NULL)
 			free(n->cache[i].vmcs02, M_VMX_NESTED);
 	}
@@ -482,6 +486,7 @@ nested_vmxoff(struct vmx_vcpu *vcpu)
 	n->vmxon = false;
 	n->current_vmcs12 = VMCS12_GPA_NONE;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
+		nested_bitmaps_unmap(&n->cache[i]);
 		n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
 		n->cache[i].launched = 0;
 	}
@@ -512,6 +517,7 @@ nested_vmclear(struct vmx_vcpu *vcpu)
 		n->current_vmcs12 = VMCS12_GPA_NONE;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
 		if (n->cache[i].vmcs12_gpa == vmcs12) {
+			nested_bitmaps_unmap(&n->cache[i]);
 			n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
 			n->cache[i].launched = 0;
 			break;
@@ -576,6 +582,7 @@ nested_vmptrld(struct vmx_vcpu *vcpu)
 	if (i == VMX_NESTED_MAX_VMCS12) {	/* non in cache: creane una voce */
 		if (slot < 0)
 			slot = 0;		/* evizione semplice (v1) */
+		nested_bitmaps_unmap(&n->cache[slot]);	/* evizione */
 		n->cache[slot].vmcs12_gpa = vmcs12;
 		n->cache[slot].launched = 0;
 		n->cache[slot].host_dirty = true;
@@ -824,6 +831,14 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 * 7/8): limite v1, rimandati. Lo stato guest lo verifica l'hardware.
 	 */
 
+	/* Bitmap I/O e MSR dell'L1: mappate qui (slow path, si puo' dormire),
+	 * lette dal percorso veloce. Non mappabili -> controllo non valido. */
+	if (nested_bitmaps_map(vcpu, c) != 0) {
+		nested_vmx_result(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		nested_advance_rip(vcpu);
+		return (0);
+	}
+
 	/* host-state fisso del VMCS02 (lascia nessun VMCS corrente) */
 	if ((error = vmx_nested_vmcs02_setup(c)) != 0) {
 		nested_vmx_result(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
@@ -1058,22 +1073,70 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_REFLECTIONS, 1);
 }
 
-/* Legge un bit in una bitmap in memoria dell'L1 (I/O o MSR). true se
- * impostato o se la pagina non e' accessibile (conservativo: riflette). */
-static bool
-nested_bitmap_bit(struct vmx_vcpu *vcpu, uint64_t bmgpa, uint32_t bit)
+/*
+ * Bitmap I/O e MSR dell'L1. Il percorso veloce (vmx_exit_process, sotto il
+ * critical_enter di vm_run) non puo' chiamare vm_gpa_hold, che puo' dormire:
+ * lo faceva qui (panic "vm_gpa_hold: invalid vcpu state 2", kvm-unit-tests
+ * 'control field PAT', RDMSR di L2). Come KVM, le pagine si mappano una volta
+ * al VMLAUNCH/VMRESUME, nello slow path, e restano tenute finche' la voce del
+ * VMCS12 esiste.
+ */
+static void
+nested_bitmaps_unmap(struct vmcs12_cache *c)
 {
-	uint8_t *b;
-	void *cookie;
-	bool set;
+	if (c->ck_io_a != NULL)
+		vm_gpa_release(c->ck_io_a);
+	if (c->ck_io_b != NULL)
+		vm_gpa_release(c->ck_io_b);
+	if (c->ck_msr != NULL)
+		vm_gpa_release(c->ck_msr);
+	c->bm_io_a = c->bm_io_b = c->bm_msr = NULL;
+	c->ck_io_a = c->ck_io_b = c->ck_msr = NULL;
+}
 
-	b = vm_gpa_hold(vcpu->vcpu, bmgpa + (bit >> 3), 1, VM_PROT_READ,
-	    &cookie);
-	if (b == NULL)
+/* Slow path (vCPU FROZEN). 0 se ok; -1 se una bitmap richiesta dall'L1 non
+ * e' mappabile (indirizzo non allineato o fuori dalla memoria del guest). */
+static int
+nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	uint32_t p12;
+	uint64_t gpa;
+
+	nested_bitmaps_unmap(c);
+	p12 = (uint32_t)vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS);
+	if (p12 & PROCBASED_IO_BITMAPS) {
+		gpa = vmcs12_read_field(c, VMCS_IO_BITMAP_A);
+		if ((gpa & PAGE_MASK) != 0 || (c->bm_io_a = vm_gpa_hold(
+		    vcpu->vcpu, gpa, PAGE_SIZE, VM_PROT_READ, &c->ck_io_a)) ==
+		    NULL)
+			goto fail;
+		gpa = vmcs12_read_field(c, VMCS_IO_BITMAP_B);
+		if ((gpa & PAGE_MASK) != 0 || (c->bm_io_b = vm_gpa_hold(
+		    vcpu->vcpu, gpa, PAGE_SIZE, VM_PROT_READ, &c->ck_io_b)) ==
+		    NULL)
+			goto fail;
+	}
+	if (p12 & PROCBASED_MSR_BITMAPS) {
+		gpa = vmcs12_read_field(c, VMCS_MSR_BITMAP);
+		if ((gpa & PAGE_MASK) != 0 || (c->bm_msr = vm_gpa_hold(
+		    vcpu->vcpu, gpa, PAGE_SIZE, VM_PROT_READ, &c->ck_msr)) ==
+		    NULL)
+			goto fail;
+	}
+	return (0);
+fail:
+	nested_bitmaps_unmap(c);
+	return (-1);
+}
+
+/* Percorso veloce: bit di una bitmap gia' mappata. true se impostato o se la
+ * bitmap non e' mappata (conservativo: riflette all'L1). */
+static bool
+nested_bitmap_bit(const uint8_t *bm, uint32_t bit)
+{
+	if (bm == NULL)
 		return (true);
-	set = (*b >> (bit & 7)) & 1;
-	vm_gpa_release(cookie);
-	return (set);
+	return ((bm[bit >> 3] >> (bit & 7)) & 1);
 }
 
 /*
@@ -1108,10 +1171,9 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		if (p12 & PROCBASED_IO_BITMAPS) {
 			uint16_t port = (vmcs_read(VMCS_EXIT_QUALIFICATION) >>
 			    16) & 0xffff;
-			uint64_t bm = (port < 0x8000) ?
-			    vmcs12_read_field(cc, VMCS_IO_BITMAP_A) :
-			    vmcs12_read_field(cc, VMCS_IO_BITMAP_B);
-			if (nested_bitmap_bit(vcpu, bm, port & 0x7fff))
+			const uint8_t *bm = (port < 0x8000) ?
+			    cc->bm_io_a : cc->bm_io_b;
+			if (nested_bitmap_bit(bm, port & 0x7fff))
 				break;			/* L1 intercetta -> riflette */
 		}
 		return (false);			/* L0 gestisce con i registri di L2 */
@@ -1129,8 +1191,8 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		else if (msr >= 0xc0000000 && msr < 0xc0002000)
 			{ base = wr ? 3072 : 1024; bit = msr - 0xc0000000; }
 		else break;			/* fuori range -> riflette */
-		if (nested_bitmap_bit(vcpu,
-		    vmcs12_read_field(cc, VMCS_MSR_BITMAP) + base, bit))
+		if (nested_bitmap_bit(cc->bm_msr == NULL ? NULL :
+		    cc->bm_msr + base, bit))
 			break;			/* L1 intercetta -> riflette */
 		return (false);			/* L0 gestisce con i registri di L2 */
 	}
