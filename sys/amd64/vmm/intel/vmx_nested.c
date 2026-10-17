@@ -1058,6 +1058,10 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_PAT)
 		vmcs12_write_field(c, VMCS_GUEST_IA32_PAT,
 		    vcpu->guest_msrs[IDX_MSR_PAT]);
+	/* Save preemption timer: il residuo (salvato dal VMCS02) all'L1. */
+	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_PREEMPTION_TIMER)
+		vmcs12_write_field(c, VMCS_PREEMPTION_TIMER_VALUE,
+		    vmcs_read(VMCS_PREEMPTION_TIMER_VALUE));
 	/* Save debug controls: DR7/DEBUGCTL dell'L2 nel VMCS12, solo se chiesto. */
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_DEBUG_CONTROLS) {
 		vmcs12_write_field(c, VMCS_GUEST_DR7,
@@ -1801,11 +1805,24 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	if (c == NULL)
 		return (EINVAL);
 
-	/* --- Pin-based: VMCS12 U {ext-int, NMI exiting}; preempt/posted = 0 --- */
+	/* --- Pin-based: VMCS12 U {ext-int, NMI exiting}; posted = 0;
+	 *     preemption timer SOLO se l'L1 lo chiede --- */
 	pin = (uint32_t)vmcs12_read_field(c, VMCS_PIN_BASED_CTLS);
 	pin |= PINBASED_EXTINT_EXITING | PINBASED_NMI_EXITING;
 	pin = nested_adjust_ctl(pin, MSR_VMX_TRUE_PINBASED_CTLS);
-	pin &= ~(PINBASED_PREMPTION_TIMER | PINBASED_POSTED_INTERRUPT);
+	pin &= ~PINBASED_POSTED_INTERRUPT;
+	/*
+	 * Timer di preemption dell'L1 (prima spento sempre: kvm-unit-tests
+	 * 'preemption timer' girava all'infinito aspettando l'uscita 52). Conta
+	 * alla frequenza vera: all'L1 esponiamo il rate di IA32_VMX_MISC
+	 * dell'host. Il valore iniziale e' quello del VMCS12.
+	 */
+	if ((vmcs12_read_field(c, VMCS_PIN_BASED_CTLS) &
+	    PINBASED_PREMPTION_TIMER) == 0)
+		pin &= ~PINBASED_PREMPTION_TIMER;
+	else
+		vmwrite(VMCS_PREEMPTION_TIMER_VALUE,
+		    vmcs12_read_field(c, VMCS_PREEMPTION_TIMER_VALUE));
 	vmwrite(VMCS_PIN_BASED_CTLS, pin);
 
 	/* --- Primary proc: VMCS12 U requisiti L0; I/O bitmaps=0, TPR shadow=0;
@@ -1855,6 +1872,15 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	exitc = exit_ctls | VM_EXIT_LOAD_PAT;
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_PAT)
 		exitc |= VM_EXIT_SAVE_PAT;
+	/*
+	 * Col timer di preemption attivo il valore residuo si salva SEMPRE: per
+	 * l'L1 le uscite gestite da L0 non esistono, quindi al rientro in L2 il
+	 * conto alla rovescia deve riprendere da dove era. All'L1 lo si passa
+	 * solo se lo chiede (riflessione).
+	 */
+	exitc &= ~VM_EXIT_SAVE_PREEMPTION_TIMER;
+	if (pin & PINBASED_PREMPTION_TIMER)
+		exitc |= VM_EXIT_SAVE_PREEMPTION_TIMER;
 	exitc = nested_adjust_ctl(exitc, MSR_VMX_TRUE_EXIT_CTLS);
 	vmwrite(VMCS_EXIT_CTLS, exitc);
 
