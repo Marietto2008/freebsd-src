@@ -14,6 +14,9 @@ ENV="$HERE/nested.env"
 KUT="$NESTED_ROOT/kut"
 LOGS="$NESTED_ROOT/logs"
 QEMU="$STAGE/current/bin/qemu-system-x86_64"
+# QEMU ignora QEMU_DATADIR: senza -L non trova bios-256k.bin ed esce subito.
+: "${QEMU_SRC:=/mnt/linuxulator2/vm/nested-work/qemu-nested}"
+PCBIOS="$QEMU_SRC/pc-bios"
 NESTED_PROP=""		# vuoto = capability spenta; "nested=on" per accenderla
 
 usage() {
@@ -54,7 +57,7 @@ while IFS='|' read -r name file args qparams smp mem tmo; do
 	ser="$LOGS/kut-$STAMP-$name.serial"
 	err="$LOGS/kut-$STAMP-$name.stderr"
 	cmd="$cpuset_pfx timeout -k 1s ${tmo}s '$QEMU' \
-	  --no-reboot -nodefaults -accel bhyve${NESTED_PROP} \
+	  -L '$PCBIOS' --no-reboot -nodefaults -accel bhyve${NESTED_PROP} \
 	  -device pc-testdev -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
 	  -display none -serial stdio -device pci-testdev \
 	  -smp ${smp} -m ${mem} ${qparams} \
@@ -70,8 +73,10 @@ while IFS='|' read -r name file args qparams smp mem tmo; do
 	rc=$?
 	set -e
 	summary=$(grep '^SUMMARY:' "$ser" 2>/dev/null | tail -1 || true)
+	# rc=1 e' anche il codice di QEMU che fallisce PRIMA di avviare il guest
+	# (es. BIOS non trovato): PASS solo se il guest ha stampato il SUMMARY.
 	case "$rc" in
-	1) verdict=PASS;;
+	1) if [ -n "$summary" ]; then verdict=PASS; else verdict="ERR(qemu,no-summary)"; fi;;
 	3) verdict=FAIL;;
 	124) verdict=TIMEOUT;;
 	*) verdict="ERR($rc)";;
