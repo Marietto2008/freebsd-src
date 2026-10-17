@@ -1095,6 +1095,17 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 
 	if (c == NULL)
 		return;
+	/*
+	 * Motivo d'uscita COMPLETO: vmx_run lo prende con vmcs_exit_reason(),
+	 * che tiene solo i bit 15:0 e scarta il bit 31 (VM-entry fallito).
+	 * L'L1 vedeva un VM-entry fallito del VMCS02 (motivo 33, CR3 con bit
+	 * riservati) come un'uscita normale e saltava un'istruzione
+	 * (kvm-unit-tests vmx_pse_test / vmx_pae_test). Le uscite sintetiche o
+	 * dello slow path hanno gia' il motivo impostato da chi le genera.
+	 */
+	if (!vcpu->nested->synth && !vcpu->nested->slow_reflect)
+		vmexit->u.vmx.exit_reason =
+		    (uint32_t)vmcs_read(VMCS_EXIT_REASON);
 	if (__predict_false(vmx_nested_probe == 6)) {
 		/* sonda 6: traccia le uscite riflesse all'L1 (non ferma nulla) */
 		static int traced6;
