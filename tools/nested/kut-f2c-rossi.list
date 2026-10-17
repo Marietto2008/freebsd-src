@@ -2,14 +2,12 @@
 # Quelli che passano o che la CPU salta (ERR 77) sono tolti; la suite
 # completa resta in kut-f2c.list per i controlli di regressione.
 # nome | file.flat | args | qemu_params | smp | mem | timeout
-invvpid_test                                | vmx.flat | invvpid_test                                | -cpu max | 1 | 1024 | 120
 vmx_controls_test                           | vmx.flat | vmx_controls_test                           | -cpu max | 1 | 1024 | 120
 vmx_host_state_area_test                    | vmx.flat | vmx_host_state_area_test                    | -cpu max | 1 | 1024 | 120
 vmx_guest_state_area_test                   | vmx.flat | vmx_guest_state_area_test                   | -cpu max | 1 | 1024 | 120
 vmentry_movss_shadow_test                   | vmx.flat | vmentry_movss_shadow_test                   | -cpu max | 1 | 1024 | 120
 vmx_apic_passthrough_test                   | vmx.flat | vmx_apic_passthrough_test                   | -cpu max | 1 | 1024 | 120
 vmx_db_test                                 | vmx.flat | vmx_db_test                                 | -cpu max | 1 | 1024 | 120
-atomic_switch_max_msrs_test                 | vmx.flat | atomic_switch_max_msrs_test                 | -cpu max | 1 | 1024 | 120
 vmx_mtf_test                                | vmx.flat | vmx_mtf_test                                | -cpu max | 1 | 1024 | 120
 vmx_pae_test                                | vmx.flat | vmx_pae_test                                | -cpu max | 1 | 1024 | 120
 vmx_pse_test                                | vmx.flat | vmx_pse_test                                | -cpu max | 1 | 1024 | 120

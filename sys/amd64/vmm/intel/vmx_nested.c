@@ -1095,6 +1095,21 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 
 	if (c == NULL)
 		return;
+	if (__predict_false(vmx_nested_probe == 6)) {
+		/* sonda 6: traccia le uscite riflesse all'L1 (non ferma nulla) */
+		static int traced6;
+		if (traced6 < 64) {
+			traced6++;
+			printf("nested_probe REFLECT#%d reason=%#x qual=%#lx "
+			    "l2rip=%#lx l2cr3=%#lx synth=%d slow=%d\n", traced6,
+			    vmexit->u.vmx.exit_reason,
+			    (u_long)(vcpu->nested->synth ? vcpu->nested->synth_qual :
+			    vmcs_read(VMCS_EXIT_QUALIFICATION)),
+			    (u_long)vmcs_read(VMCS_GUEST_RIP),
+			    (u_long)vmcs_read(VMCS_GUEST_CR3),
+			    vcpu->nested->synth, vcpu->nested->slow_reflect);
+		}
+	}
 	/* 1-2. info d'uscita + stato di L2 -> store VMCS12 */
 	vmcs12_write_field(c, VMCS_EXIT_REASON,
 	    vmexit->u.vmx.exit_reason);
