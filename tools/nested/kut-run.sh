@@ -69,7 +69,9 @@ while IFS='|' read -r name file args qparams smp mem tmo; do
 	say "test $name ($file)"
 	# QEMU: exit code = (codice<<1)|1 -> 1=PASS, 3=FAIL, 124=timeout
 	set +e
-	eval "$cmd" > "$ser" 2> "$err"
+	# </dev/null: con -serial stdio QEMU leggerebbe dalla lista stessa (lo
+	# stdin del ciclo), mangiando l'inizio della riga successiva.
+	eval "$cmd" < /dev/null > "$ser" 2> "$err"
 	rc=$?
 	set -e
 	summary=$(grep '^SUMMARY:' "$ser" 2>/dev/null | tail -1 || true)

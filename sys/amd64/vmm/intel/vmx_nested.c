@@ -905,6 +905,12 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 */
 	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP,
 	    vmcs12_read_field(c, VMCS_GUEST_RIP));
+	/* Load PAT all'ingresso: il PAT virtuale del vCPU diventa quello
+	 * dell'L2 (kvm-unit-tests 'control field PAT': l'L2 lo rilegge con
+	 * RDMSR, che bhyve serve da guest_msrs). */
+	if (vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_LOAD_PAT)
+		vcpu->guest_msrs[IDX_MSR_PAT] =
+		    vmcs12_read_field(c, VMCS_GUEST_IA32_PAT);
 	vmexit->inst_length = 0;
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_L2_ENTRIES, 1);
 	return (0);
@@ -942,7 +948,7 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c = nested_current_cache(n);
 	struct vmcs *vmcs02 = vcpu->vmcs;
-	uint64_t efer, pat, hrip, hrsp, hcr0, hcr3, hcr4;
+	uint64_t efer, hrip, hrsp, hcr0, hcr3, hcr4;
 	uint32_t i;
 	/* stato di L2 da ricopiare in VMCS12 cosi' l'L1 lo rilegge con VMREAD */
 	static const uint32_t l2state[] = {
@@ -970,6 +976,14 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	    vmcs_read(VMCS_EXIT_INSTRUCTION_INFO));
 	for (i = 0; i < nitems(l2state); i++)
 		vmcs12_write_field(c, l2state[i], vmcs_read(l2state[i]));
+	/*
+	 * PAT: bhyve lo virtualizza in guest_msrs[IDX_MSR_PAT] (il PAT
+	 * hardware resta quello dell'host, per l'L1 come per l'L2): e' "il PAT
+	 * corrente del vCPU". Save PAT copia quello che l'L2 ha in uso.
+	 */
+	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_PAT)
+		vmcs12_write_field(c, VMCS_GUEST_IA32_PAT,
+		    vcpu->guest_msrs[IDX_MSR_PAT]);
 	/* [v2] IA-32e mode guest degli entry controls di VMCS12 = EFER.LMA di L2 */
 	efer = vmcs_read(VMCS_GUEST_IA32_EFER);
 
@@ -1021,9 +1035,11 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	    vmcs12_read_field(c, VMCS_HOST_IA32_SYSENTER_EIP));
 	/* EFER/PAT secondo gli exit controls di VMCS12 */
 	efer = vmcs12_read_field(c, VMCS_HOST_IA32_EFER);
-	pat = vmcs12_read_field(c, VMCS_HOST_IA32_PAT);
 	vmwrite(VMCS_GUEST_IA32_EFER, efer);
-	vmwrite(VMCS_GUEST_IA32_PAT, pat);
+	/* Load PAT all'uscita: il PAT virtuale dell'L1 diventa HOST_PAT. */
+	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_LOAD_PAT)
+		vcpu->guest_msrs[IDX_MSR_PAT] =
+		    vmcs12_read_field(c, VMCS_HOST_IA32_PAT);
 	/* segmenti host: selettori da VMCS12, basi/limiti/attributi standard */
 	nested_load_seg(VMCS_GUEST_CS_SELECTOR, VMCS_GUEST_CS_BASE,
 	    VMCS_GUEST_CS_LIMIT, VMCS_GUEST_CS_ACCESS_RIGHTS,
@@ -1426,10 +1442,11 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	exitc = nested_adjust_ctl(exitc, MSR_VMX_TRUE_EXIT_CTLS);
 	vmwrite(VMCS_EXIT_CTLS, exitc);
 
-	/* --- Entry controls: IA-32e mode guest = VMCS12; load EFER/dbg=1,
-	 *     load PAT solo se richiesto dall'L1 (vedi sopra) --- */
+	/* --- Entry controls: IA-32e mode guest = VMCS12; load EFER/dbg=1.
+	 *     Mai load PAT: il PAT dell'L2 e' virtuale come quello dell'L1
+	 *     (guest_msrs[IDX_MSR_PAT], impostato in nested_vmlaunch) --- */
 	entryc = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_CTLS) &
-	    (VM_ENTRY_GUEST_LMA | VM_ENTRY_LOAD_PAT);
+	    VM_ENTRY_GUEST_LMA;
 	entryc |= VM_ENTRY_LOAD_DEBUG_CONTROLS | VM_ENTRY_LOAD_EFER;
 	entryc = nested_adjust_ctl(entryc, MSR_VMX_TRUE_ENTRY_CTLS);
 	entryc &= ~(VM_ENTRY_INTO_SMM | VM_ENTRY_DEACTIVATE_DUAL_MONITOR);
