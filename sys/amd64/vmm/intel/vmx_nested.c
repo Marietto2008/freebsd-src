@@ -1383,13 +1383,17 @@ nested_msr_rw(struct vmx_vcpu *vcpu, uint32_t idx, uint64_t *val, bool wr,
 	case MSR_SYSENTER_EIP_MSR: f = VMCS_GUEST_IA32_SYSENTER_EIP; break;
 	case MSR_DEBUGCTLMSR:	f = VMCS_GUEST_IA32_DEBUGCTL; break;
 	case MSR_TSC:
-		/* il TSC del vCPU = host + offset del VMCS corrente (kvm-unit-
-		 * tests vmx_store_tsc_test). In scrittura non e' ammesso. */
+		/*
+		 * Le liste MSR lavorano nel tempo dell'L1 (SDM: il valore NON
+		 * subisce l'offset del VMCS12): TSC host + offset dell'L0 per
+		 * l'L1. Prima si usava l'offset del VMCS02 (L0 + L1->L2): il
+		 * valore salvato era piu' alto dell'offset dell'L2
+		 * (vmx_store_tsc_test, rdtsc_vmexit_diff_test,
+		 * vmx_preemption_timer_expiry_test). In scrittura non ammesso.
+		 */
 		if (wr)
 			return (EINVAL);
-		*val = rdtsc();
-		if (vmcs_read(VMCS_PRI_PROC_BASED_CTLS) & PROCBASED_TSC_OFFSET)
-			*val += vmcs_read(VMCS_TSC_OFFSET);
+		*val = rdtsc() + vcpu->nested->l1_tsc_offset;
 		return (0);
 	default:
 		return (EINVAL);	/* FS/GS_BASE, x2APIC, SMM...: vietati */
