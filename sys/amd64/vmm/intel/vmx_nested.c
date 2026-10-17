@@ -237,7 +237,11 @@ nested_vmx_result(struct vmx_vcpu *vcpu, int errnum)
 		uint64_t rip = 0;
 
 		vm_get_register(vcpu->vcpu, VM_REG_GUEST_RIP, &rip);
-		if (traced7 < 64) {
+		/* solo i casi con un evento da iniettare (gli altri VMfail sono
+		 * in gran parte quelli attesi dal test) */
+		if (traced7 < 64 && cp != NULL &&
+		    (vmcs12_read_field(cp, VMCS_ENTRY_INTR_INFO) &
+		    VMCS_INTR_VALID)) {
 			traced7++;
 			printf("nested_probe VMFAIL#%d err=%d da=%p l1rip=%#lx "
 			    "entryinfo12=%#lx pin=%#lx proc=%#lx proc2=%#lx "
