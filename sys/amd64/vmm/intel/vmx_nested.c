@@ -967,6 +967,14 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 */
 	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP,
 	    vmcs12_read_field(c, VMCS_GUEST_RIP));
+	/*
+	 * vmx_inject_interrupts azzera il blocco STI/MOV-SS se il RIP
+	 * d'ingresso differisce da state.nextrip (l'ultima uscita, dell'L1):
+	 * al VMLAUNCH/VMRESUME il RIP cambia SEMPRE, e cancellava il blocco
+	 * chiesto dall'L1 nel VMCS12 (kvm-unit-tests vmx_intr_window_test,
+	 * 'blocking by STI / MOV-SS'). Il riferimento diventa il RIP dell'L2.
+	 */
+	vcpu->state.nextrip = vmcs12_read_field(c, VMCS_GUEST_RIP);
 	/* Load PAT all'ingresso: il PAT virtuale del vCPU diventa quello
 	 * dell'L2 (kvm-unit-tests 'control field PAT': l'L2 lo rilegge con
 	 * RDMSR, che bhyve serve da guest_msrs). */
