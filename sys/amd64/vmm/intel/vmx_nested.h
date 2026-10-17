@@ -157,6 +157,14 @@ struct vmx_nested {
 	uint64_t	exit_insn_info;	/* VMCS_EXIT_INSTRUCTION_INFO */
 	uint64_t	exit_insn_length; /* VMCS_EXIT_INSTRUCTION_LENGTH */
 	struct vm_guest_paging exit_paging; /* cr3/cpl/cpu_mode/paging_mode */
+	/*
+	 * DIAG backstop timer di preemption (T2.x): rileva un L2 incastrato
+	 * in guest-mode (nessuna uscita) convertendolo in uscite periodiche;
+	 * se il RIP di L2 non avanza per troppe preemption consecutive, panic
+	 * col RIP invece di congelare l'host.
+	 */
+	uint64_t	diag_last_rip;	/* ultimo RIP L2 al preempt-timer */
+	u_int		diag_stuck;	/* preempt consecutivi con stesso RIP */
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);
