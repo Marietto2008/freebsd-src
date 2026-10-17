@@ -331,6 +331,13 @@ nested_advance_rip(struct vmx_vcpu *vcpu)
  * gia' usato da inout_str_* e con KVM/SDM: addrsize 9:7, seg 17:15,
  * index 21:18 (invalido se bit 22), base 26:23 (invalido se bit 27).
  */
+/* indirizzo canonico a 48 bit (LA57 non esposto all'L1) */
+static bool
+nested_canonical(uint64_t a)
+{
+	return ((int64_t)(a << 16) >> 16) == (int64_t)a;
+}
+
 static int
 nested_operand_gpa_at(struct vmx_vcpu *vcpu, int prot, uint64_t add,
     uint64_t *gpa);
@@ -378,6 +385,18 @@ nested_operand_gpa_at(struct vmx_vcpu *vcpu, int prot, uint64_t add,
 	if (vie_calculate_gla(paging.cpu_mode, seg, &desc, offset, 8, addrsize,
 	    prot, &gla) != 0) {
 		/* SDM: riferimento via SS -> #SS(0), altrimenti #GP(0) */
+		if (seg == VM_REG_GUEST_SS)
+			vm_inject_ss(vcpu->vcpu, 0);
+		else
+			vm_inject_gp(vcpu->vcpu);
+		return (-1);
+	}
+	/*
+	 * In modo 64 bit vie_calculate_gla non rifiuta un indirizzo non
+	 * canonico: lo farebbe vm_gla2gpa, ma sempre con #GP. Via SS l'SDM
+	 * vuole #SS(0) (kvm-unit-tests invvpid_test_ss).
+	 */
+	if (paging.cpu_mode == CPU_MODE_64BIT && !nested_canonical(gla)) {
 		if (seg == VM_REG_GUEST_SS)
 			vm_inject_ss(vcpu->vcpu, 0);
 		else
@@ -1700,13 +1719,6 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* ogni break qui sopra significa: rifletti all'L1 */
 	nested_reflect_to_l1(vcpu, vmexit);
 	return (true);
-}
-
-/* indirizzo canonico a 48 bit (LA57 non esposto all'L1) */
-static bool
-nested_canonical(uint64_t a)
-{
-	return ((int64_t)(a << 16) >> 16) == (int64_t)a;
 }
 
 static int
