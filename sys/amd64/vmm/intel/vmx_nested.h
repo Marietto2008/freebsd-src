@@ -134,6 +134,11 @@ struct vmcs12_cache {
 	 */
 	uint8_t		*bm_io_a, *bm_io_b, *bm_msr;
 	void		*ck_io_a, *ck_io_b, *ck_msr;
+	/* Liste MSR d'uscita dell'L1 (store, load), mappate come le bitmap:
+	 * all'uscita da L2 si e' nel percorso veloce. */
+	struct msr_entry *msr_st, *msr_ld;	/* struct di vmcs.h, 16 byte */
+	void		*ck_st, *ck_ld;
+	uint32_t	n_st, n_ld;
 };
 
 /*
@@ -160,6 +165,10 @@ struct vmx_nested {
 					 * hardware): i campi d'uscita per il
 					 * VMCS12 vengono da synth_intr_info */
 	uint32_t	synth_intr_info;
+	uint64_t	synth_qual;	/* qualificazione dell'uscita sintetica */
+	bool		slow_reflect;	/* riflessione chiamata dallo slow path:
+					 * MSR del guest in guest_msrs[], NON nei
+					 * registri hardware */
 	uint64_t	l1_dr7;		/* DR7/DEBUGCTL dell'L1 al VMLAUNCH: */
 	uint64_t	l1_debugctl;	/* li eredita l'L2 senza load debug */
 	/*

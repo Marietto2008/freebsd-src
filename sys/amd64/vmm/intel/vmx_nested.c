@@ -44,6 +44,12 @@ MALLOC_DEFINE(M_VMX_NESTED, "vmx_nested", "Intel VMX nested virtualization");
 
 static void	nested_bitmaps_unmap(struct vmcs12_cache *c);
 static int	nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c);
+static void	nested_msr_list_exit(struct vmx_vcpu *vcpu,
+		    struct vmcs12_cache *c, bool store);
+static uint32_t	nested_msr_list_entry(struct vmx_vcpu *vcpu,
+		    struct vmcs12_cache *c);
+static void	nested_reflect_to_l1(struct vmx_vcpu *vcpu,
+		    struct vm_exit *vmexit);
 
 /*
  * Probe SDT del nested. Non si sparano ancora (lo faranno T1.7+); definirle
@@ -871,6 +877,37 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		nested_advance_rip(vcpu);
 		return (0);
 	}
+	/*
+	 * Lista "carica all'ingresso" del VMCS12 (dopo lo stato guest, SDM
+	 * 26.4). Prima le liste MSR erano azzerate e mai applicate. Un elemento
+	 * non caricabile (es. FS_BASE, vietato) e' un VM-entry fallito: uscita
+	 * verso l'L1 con motivo 34 + bit 31 e qualificazione = indice 1-based.
+	 */
+	{
+		uint32_t fail = nested_msr_list_entry(vcpu, c);
+
+		if (fail != 0) {
+			vcpu->vmcs = vmcs02;	/* la riflessione usa il corrente */
+			n->in_l2 = true;
+			vmexit->u.vmx.exit_reason = EXIT_REASON_INVAL_MSR |
+			    0x80000000;
+			n->synth = true;
+			n->synth_intr_info = 0;
+			n->synth_qual = fail;
+			n->slow_reflect = true;
+			nested_reflect_to_l1(vcpu, vmexit);
+			n->synth = false;
+			n->slow_reflect = false;
+			n->synth_qual = 0;
+			/* slow path: nessun VMCS lasciato attivo sulla CPU, e
+			 * nextrip allineato all'host RIP dell'L1 (vm_run l'aveva
+			 * gia' calcolato sul RIP del VMLAUNCH) */
+			VMCLEAR(vcpu->vmcs01);
+			vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP, vmexit->rip);
+			return (0);
+		}
+	}
+
 	if (__predict_false(vmx_nested_probe == 1)) {
 		/* sonda 1: host-state VMCS02 contro VMCS01, poi VMfail (no L2) */
 		nested_probe_dump("VMCS02");
@@ -972,8 +1009,9 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmcs12_write_field(c, VMCS_EXIT_REASON,
 	    vmexit->u.vmx.exit_reason);
 	if (vcpu->nested->synth) {
-		/* uscita sintetica (nested_check_events): nessun dato hardware */
-		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION, 0);
+		/* uscita sintetica: nessun dato hardware */
+		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION,
+		    vcpu->nested->synth_qual);
 		vmcs12_write_field(c, VMCS_EXIT_INTR_INFO,
 		    vcpu->nested->synth_intr_info);
 		vmcs12_write_field(c, VMCS_EXIT_INTR_ERRCODE, 0);
@@ -1032,6 +1070,11 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		d.vpid = n->vpid2;
 		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
 	}
+	/* Lista "salva all'uscita": MSR dell'L2, col VMCS02 ancora corrente
+	 * (EFER, SYSENTER...). Non su un VM-entry fallito (SDM 27.8). */
+	if ((vmexit->u.vmx.exit_reason & 0x80000000) == 0)
+		nested_msr_list_exit(vcpu, c, true);
+
 	/* 4. commuta a VMCS01 */
 	VMCLEAR(vmcs02);
 	VMPTRLD(vcpu->vmcs01);
@@ -1116,6 +1159,9 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmwrite(VMCS_GUEST_FS_BASE, vmcs12_read_field(c, VMCS_HOST_FS_BASE));
 	vmwrite(VMCS_GUEST_GS_BASE, vmcs12_read_field(c, VMCS_HOST_GS_BASE));
 
+	/* Lista "carica all'uscita": MSR dell'L1, dopo lo stato host (SDM). */
+	nested_msr_list_exit(vcpu, c, false);
+
 	n->in_l2 = false;
 	vmexit->rip = hrip;
 	vmexit->inst_length = 0;
@@ -1160,6 +1206,7 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		return (false);
 
 	n->synth_intr_info = 0;
+	n->synth_qual = 0;
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) &
 	    VM_EXIT_ACKNOWLEDGE_INTERRUPT) {
 		vlapic_intr_accepted(vl, vec);
@@ -1205,8 +1252,151 @@ nested_bitmaps_unmap(struct vmcs12_cache *c)
 		vm_gpa_release(c->ck_io_b);
 	if (c->ck_msr != NULL)
 		vm_gpa_release(c->ck_msr);
+	if (c->ck_st != NULL)
+		vm_gpa_release(c->ck_st);
+	if (c->ck_ld != NULL)
+		vm_gpa_release(c->ck_ld);
 	c->bm_io_a = c->bm_io_b = c->bm_msr = NULL;
 	c->ck_io_a = c->ck_io_b = c->ck_msr = NULL;
+	c->msr_st = c->msr_ld = NULL;
+	c->ck_st = c->ck_ld = NULL;
+	c->n_st = c->n_ld = 0;
+}
+
+/*
+ * Mappa una lista MSR del VMCS12 (SDM 24.7.2): indirizzo allineato a 16,
+ * al massimo 512 elementi e, per semplicita', contenuta in una pagina (le
+ * liste reali sono di pochi elementi). 0 ok o lista vuota; -1 non valida.
+ */
+static int
+nested_msr_list_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c,
+    uint32_t addr_f, uint32_t cnt_f, int prot, struct msr_entry **p,
+    void **ck, uint32_t *n)
+{
+	uint64_t gpa = vmcs12_read_field(c, addr_f);
+	uint64_t cnt = vmcs12_read_field(c, cnt_f);
+
+	*n = 0;
+	if (cnt == 0)
+		return (0);
+	if ((gpa & 0xf) != 0 || cnt > 512 ||
+	    (gpa & PAGE_MASK) + cnt * sizeof(struct msr_entry) > PAGE_SIZE)
+		return (-1);
+	*p = vm_gpa_hold(vcpu->vcpu, gpa, cnt * sizeof(struct msr_entry),
+	    prot, ck);
+	if (*p == NULL)
+		return (-1);
+	*n = (uint32_t)cnt;
+	return (0);
+}
+
+/*
+ * Legge/scrive un MSR "come lo vede il vCPU" per le liste MSR del nested.
+ * live = true dentro vmx_run (uscita da L2): LSTAR, CSTAR, STAR, SF_MASK e
+ * KGSBASE del guest sono nei registri hardware (vmx_msr_guest_enter);
+ * live = false nello slow path (ingresso): sono in guest_msrs[]. PAT e
+ * TSC_AUX stanno sempre in guest_msrs[] (PAT e' virtuale; TSC_AUX e'
+ * commutato solo attorno al VM-entry). EFER, SYSENTER e DEBUGCTL vivono
+ * nel VMCS CORRENTE. 0 ok; EINVAL MSR non gestito (per le liste di
+ * caricamento: non ammesso).
+ */
+static int
+nested_msr_rw(struct vmx_vcpu *vcpu, uint32_t idx, uint64_t *val, bool wr,
+    bool live)
+{
+	int g = -1;
+	uint32_t f = 0;
+
+	switch (idx) {
+	case MSR_LSTAR:		g = IDX_MSR_LSTAR; break;
+	case MSR_CSTAR:		g = IDX_MSR_CSTAR; break;
+	case MSR_STAR:		g = IDX_MSR_STAR; break;
+	case MSR_SF_MASK:	g = IDX_MSR_SF_MASK; break;
+	case MSR_KGSBASE:	g = IDX_MSR_KGSBASE; break;
+	case MSR_PAT:		g = IDX_MSR_PAT; live = false; break;
+	case MSR_TSC_AUX:	g = IDX_MSR_TSC_AUX; live = false; break;
+	case MSR_EFER:		f = VMCS_GUEST_IA32_EFER; break;
+	case MSR_SYSENTER_CS_MSR: f = VMCS_GUEST_IA32_SYSENTER_CS; break;
+	case MSR_SYSENTER_ESP_MSR: f = VMCS_GUEST_IA32_SYSENTER_ESP; break;
+	case MSR_SYSENTER_EIP_MSR: f = VMCS_GUEST_IA32_SYSENTER_EIP; break;
+	case MSR_DEBUGCTLMSR:	f = VMCS_GUEST_IA32_DEBUGCTL; break;
+	default:
+		return (EINVAL);	/* FS/GS_BASE, x2APIC, SMM...: vietati */
+	}
+	if (g >= 0) {
+		if (live) {
+			if (wr)
+				wrmsr(idx, *val);
+			else
+				*val = rdmsr(idx);
+		} else {
+			if (wr)
+				vcpu->guest_msrs[g] = *val;
+			else
+				*val = vcpu->guest_msrs[g];
+		}
+	} else {
+		if (wr)
+			vmwrite(f, idx == MSR_DEBUGCTLMSR ? (*val & 0x3) : *val);
+		else
+			*val = vmcs_read(f);
+	}
+	return (0);
+}
+
+/*
+ * Lista "carica all'ingresso" del VMCS12 (slow path, VMCS02 corrente, dopo
+ * lo stato guest come da SDM). 0 ok; altrimenti indice 1-based
+ * dell'elemento non caricabile (VM-entry fallita, motivo 34).
+ */
+static uint32_t
+nested_msr_list_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	struct msr_entry *l;
+	void *ck;
+	uint64_t v;
+	uint32_t i, n, fail = 0;
+
+	if (nested_msr_list_map(vcpu, c, VMCS_ENTRY_MSR_LOAD,
+	    VMCS_ENTRY_MSR_LOAD_COUNT, VM_PROT_READ, &l, &ck, &n) != 0)
+		return (1);
+	for (i = 0; i < n && fail == 0; i++) {
+		v = l[i].val;
+		if (l[i].reserved != 0 ||
+		    nested_msr_rw(vcpu, l[i].index, &v, true, false) != 0)
+			fail = i + 1;
+	}
+	if (n != 0)
+		vm_gpa_release(ck);
+	return (fail);
+}
+
+/*
+ * Liste d'uscita (percorso veloce, pagine gia' mappate): store = salva gli
+ * MSR dell'L2 (VMCS02 corrente, prima della commutazione); load = carica
+ * quelli dell'L1 (VMCS01 corrente, dopo lo stato host). Un elemento non
+ * gestito si salta: sull'hardware sarebbe un VMX abort.
+ */
+static void
+nested_msr_list_exit(struct vmx_vcpu *vcpu, struct vmcs12_cache *c,
+    bool store)
+{
+	struct msr_entry *l = store ? c->msr_st : c->msr_ld;
+	uint32_t i, n = store ? c->n_st : c->n_ld;
+	bool live = !vcpu->nested->slow_reflect;
+	uint64_t v;
+
+	for (i = 0; i < n; i++) {
+		if (l[i].reserved != 0)
+			continue;
+		if (store) {
+			if (nested_msr_rw(vcpu, l[i].index, &v, false, live) == 0)
+				l[i].val = v;
+		} else {
+			v = l[i].val;
+			(void)nested_msr_rw(vcpu, l[i].index, &v, true, live);
+		}
+	}
 }
 
 /* Slow path (vCPU FROZEN). 0 se ok; -1 se una bitmap richiesta dall'L1 non
@@ -1238,6 +1428,14 @@ nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 		    NULL)
 			goto fail;
 	}
+	/* liste MSR d'uscita: usate dalla riflessione, nel percorso veloce */
+	if (nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_STORE,
+	    VMCS_EXIT_MSR_STORE_COUNT, VM_PROT_READ | VM_PROT_WRITE,
+	    &c->msr_st, &c->ck_st, &c->n_st) != 0 ||
+	    nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_LOAD,
+	    VMCS_EXIT_MSR_LOAD_COUNT, VM_PROT_READ,
+	    &c->msr_ld, &c->ck_ld, &c->n_ld) != 0)
+		goto fail;
 	return (0);
 fail:
 	nested_bitmaps_unmap(c);
