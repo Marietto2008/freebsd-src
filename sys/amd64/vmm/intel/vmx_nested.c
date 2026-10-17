@@ -332,7 +332,20 @@ nested_advance_rip(struct vmx_vcpu *vcpu)
  * index 21:18 (invalido se bit 22), base 26:23 (invalido se bit 27).
  */
 static int
+nested_operand_gpa_at(struct vmx_vcpu *vcpu, int prot, uint64_t add,
+    uint64_t *gpa);
+
+static int
 nested_operand_gpa(struct vmx_vcpu *vcpu, int prot, uint64_t *gpa)
+{
+	return (nested_operand_gpa_at(vcpu, prot, 0, gpa));
+}
+
+/* Come sopra, per gli 8 byte a 'add' byte dall'inizio dell'operando
+ * (descrittori di INVVPID/INVEPT: 16 byte, letti in due meta'). */
+static int
+nested_operand_gpa_at(struct vmx_vcpu *vcpu, int prot, uint64_t add,
+    uint64_t *gpa)
 {
 	struct vm_guest_paging paging;
 	struct seg_desc desc;
@@ -352,7 +365,7 @@ nested_operand_gpa(struct vmx_vcpu *vcpu, int prot, uint64_t *gpa)
 	}
 	seg = vm_segment_name((info >> 15) & 0x7);
 
-	offset = qual;				/* displacement */
+	offset = qual + add;			/* displacement */
 	if (((info >> 27) & 0x1) == 0)		/* BaseReg valido */
 		offset += vmx_get_guest_reg(vcpu, (info >> 23) & 0xf);
 	if (((info >> 22) & 0x1) == 0)		/* IndexReg valido */
@@ -364,7 +377,11 @@ nested_operand_gpa(struct vmx_vcpu *vcpu, int prot, uint64_t *gpa)
 	paging = vcpu->nested->exit_paging;	/* catturato col VMCS corrente */
 	if (vie_calculate_gla(paging.cpu_mode, seg, &desc, offset, 8, addrsize,
 	    prot, &gla) != 0) {
-		vm_inject_gp(vcpu->vcpu);
+		/* SDM: riferimento via SS -> #SS(0), altrimenti #GP(0) */
+		if (seg == VM_REG_GUEST_SS)
+			vm_inject_ss(vcpu->vcpu, 0);
+		else
+			vm_inject_gp(vcpu->vcpu);
 		return (-1);
 	}
 	if (vm_gla2gpa(vcpu->vcpu, &paging, gla, prot, gpa, &fault) != 0 || fault)
@@ -1685,14 +1702,54 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	return (true);
 }
 
+/* indirizzo canonico a 48 bit (LA57 non esposto all'L1) */
+static bool
+nested_canonical(uint64_t a)
+{
+	return ((int64_t)(a << 16) >> 16) == (int64_t)a;
+}
+
 static int
 nested_invvpid(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct invvpid_desc d;
+	uint32_t info = (uint32_t)n->exit_insn_info;
+	uint64_t type, cap = n->vmx_msr[0x48c - 0x480], q[2], gpa, *p;
+	void *ck;
+	int i;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
-	/* flush delle mappature VPID02 di L2 (semplificato: single-context) */
+	/*
+	 * Emulazione completa (prima: flush e VMsucceed qualunque operando;
+	 * kvm-unit-tests invvpid_test, 897 fallimenti). Descrittore di 16
+	 * byte in memoria: VPID nei bit 15:0, bit 63:16 riservati, poi
+	 * l'indirizzo lineare. Tipo nel registro (bit 31:28 di insn_info).
+	 */
+	type = vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
+	for (i = 0; i < 2; i++) {
+		if (nested_operand_gpa_at(vcpu, VM_PROT_READ, i * 8, &gpa) != 0)
+			return (0);		/* #PF/#GP/#SS gia' iniettata */
+		p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t),
+		    VM_PROT_READ, &ck);
+		if (p == NULL) {
+			nested_vmfail_invalid(vcpu);
+			return (0);
+		}
+		q[i] = *p;
+		vm_gpa_release(ck);
+	}
+	/* tipi annunciati nell'EPT/VPID cap: bit 40 + tipo (0..3) */
+	if (type > 3 || (cap & (1ULL << (40 + type))) == 0 ||
+	    (q[0] >> 16) != 0 ||				/* riservati */
+	    (type != 2 && (q[0] & 0xffff) == 0) ||		/* VPID 0 */
+	    (type == 0 && !nested_canonical(q[1]))) {		/* indirizzo */
+		nested_vmx_result(vcpu, VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID);
+		nested_advance_rip(vcpu);
+		return (0);
+	}
+	/* tutti i VPID dell'L1 condividono il VPID02 dell'L2: qualunque tipo
+	 * e' soddisfatto (per eccesso) da un flush single-context di vpid2 */
 	bzero(&d, sizeof(d));
 	d.vpid = n->vpid2;
 	invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
