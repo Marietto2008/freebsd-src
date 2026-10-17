@@ -1028,6 +1028,12 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		    vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH));
 		vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_INFO,
 		    vmcs_read(VMCS_EXIT_INSTRUCTION_INFO));
+		/* EPT violation/misconfig: il GPA (e il lineare) che l'L1 deve
+		 * conoscere per gestirla. */
+		vmcs12_write_field(c, VMCS_GUEST_PHYSICAL_ADDRESS,
+		    vmcs_read(VMCS_GUEST_PHYSICAL_ADDRESS));
+		vmcs12_write_field(c, VMCS_GUEST_LINEAR_ADDRESS,
+		    vmcs_read(VMCS_GUEST_LINEAR_ADDRESS));
 	}
 	/*
 	 * SDM: ogni VM exit azzera il bit valid del VM-entry
@@ -1575,13 +1581,20 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
 		if (cc != NULL && (vmcs12_read_field(cc,
 		    VMCS_SEC_PROC_BASED_CTLS) & PROCBASED2_ENABLE_EPT)) {
-			if (vmx_vept_fault(vcpu) == 0)
-				return (true);	/* shadow installata: HANDLED ->
-						 * vmx_run RI-ESEGUE il VMCS02 (L2).
-						 * (prima: return false -> l'uscita
-						 * veniva rielaborata come EPT fault
-						 * L0 sul pmap sbagliato -> giro) */
-			nested_reflect_to_l1(vcpu, vmexit);
+			if (reason == EXIT_REASON_EPT_MISCONFIG)
+				break;		/* -> riflette all'L1 */
+			/*
+			 * Violation con shadow EPT: si risolve nello SLOW PATH.
+			 * Qui (dentro vmx_run, sotto critical_enter) non si puo'
+			 * dormire, e vmx_vept_fault ne ha bisogno (vm_gpa_hold
+			 * sulle tabelle dell'L1, malloc). Si cattura il GPA, si
+			 * esce da vmx_run RESTANDO in L2 (vmx.c vede ept_pending)
+			 * e si riesegue l'istruzione (inst_length 0).
+			 */
+			vcpu->nested->ept_gpa =
+			    vmcs_read(VMCS_GUEST_PHYSICAL_ADDRESS);
+			vcpu->nested->ept_pending = true;
+			vmexit->inst_length = 0;
 			return (true);
 		}
 		/* VMCS12 senza EPT: L2-GPA == L1-GPA, gestione L0 normale */
@@ -1612,6 +1625,57 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 }
 
 /*
+ * INVEPT dell'L1 (prima non instradata: finiva in userland). Si svuota la
+ * shadow EPT per intero, qualunque sia il tipo (single-context o all-context
+ * sono entrambi soddisfatti da un flush completo); il TLB dell'EPTP shadow lo
+ * invalida vmx_run al prossimo ingresso in L2. Tipo non annunciato nell'EPT
+ * cap esposto all'L1 (bit 25 single, 26 all) -> VMfail 28.
+ */
+static int
+nested_invept(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint32_t info = (uint32_t)n->exit_insn_info;
+	uint64_t type, cap = n->vmx_msr[0x48c - 0x480];
+
+	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
+	type = vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
+	if (!((type == 1 && (cap & (1ULL << 25))) ||
+	    (type == 2 && (cap & (1ULL << 26))))) {
+		nested_vmx_result(vcpu, VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID);
+		nested_advance_rip(vcpu);
+		return (0);
+	}
+	vmx_vept_invept(n);
+	nested_vmx_result(vcpu, VMXR_SUCCEED);
+	nested_advance_rip(vcpu);
+	return (0);
+}
+
+/*
+ * EPT violation di L2 con shadow EPT, nello slow path (vedi nested_l2_exit).
+ * Shadow installata -> si riparte in L2 sulla stessa istruzione. EPT12 nega
+ * (o l'L1-GPA non e' RAM) -> violation riflessa all'L1: il VMCS02 conserva i
+ * campi d'uscita anche dopo VMCLEAR/VMPTRLD.
+ */
+static int
+nested_ept_slow(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vm_exit *vmexit = vm_exitinfo(vcpu->vcpu);
+
+	if (vmx_vept_fault(vcpu, n->ept_gpa) == 0)
+		return (0);
+	VMPTRLD(vcpu->vmcs);			/* il VMCS02 */
+	n->slow_reflect = true;
+	nested_reflect_to_l1(vcpu, vmexit);
+	n->slow_reflect = false;
+	VMCLEAR(vcpu->vmcs01);			/* niente VMCS attivo nello slow path */
+	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP, vmexit->rip);
+	return (0);
+}
+
+/*
  * Slow path del nested (op vmmops_nested_exit): dispatch sull'istruzione VMX
  * che ha causato l'uscita, col vCPU FROZEN. VMLAUNCH/VMRESUME (T2.4),
  * VMREAD/VMWRITE (T1.8) e VMCALL non sono ancora qui: per ora #UD.
@@ -1633,6 +1697,11 @@ vmx_nested_exit(void *vcpui)
 		vcpu->nested->restart_only = false;
 		return (0);
 	}
+	/* EPT violation di L2 con shadow EPT, rimandata qui dal percorso veloce */
+	if (vcpu->nested != NULL && vcpu->nested->ept_pending) {
+		vcpu->nested->ept_pending = false;
+		return (nested_ept_slow(vcpu));
+	}
 
 	switch (reason) {
 	case EXIT_REASON_VMXON:		return (nested_vmxon(vcpu));
@@ -1645,6 +1714,7 @@ vmx_nested_exit(void *vcpui)
 	case EXIT_REASON_VMLAUNCH:	return (nested_vmlaunch(vcpu, false));
 	case EXIT_REASON_VMRESUME:	return (nested_vmlaunch(vcpu, true));
 	case EXIT_REASON_INVVPID:	return (nested_invvpid(vcpu));
+	case EXIT_REASON_INVEPT:	return (nested_invept(vcpu));
 	default:
 		vm_inject_ud(vcpu->vcpu);
 		return (0);

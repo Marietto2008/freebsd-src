@@ -1,0 +1,5 @@
+# F2b — L2: intercetti, interrupt, MSR. UN TEST PER RIGA (un QEMU per test).
+# kut-run.sh --nested kut-f2b.list
+# Il nome (1a colonna) finisce nel nome del file di log: niente '/'.
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+interrupt             | vmx.flat | interrupt              | -cpu max | 1 | 1024 | 60

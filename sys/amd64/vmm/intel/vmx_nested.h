@@ -98,8 +98,9 @@ extern uint64_t cr0_ones_mask, cr0_zeros_mask, cr4_ones_mask, cr4_zeros_mask;
 int	nested_compose_vmcs02(struct vmx_vcpu *vcpu);
 int	nested_vmcs02_check(struct vmx_vcpu *vcpu);
 bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
-int	vmx_vept_fault(struct vmx_vcpu *vcpu);	/* EPT violation in L2 (T2.7) */
+int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa); /* slow path */
 void	vmx_vept_flush(struct vmx_nested *n);
+void	vmx_vept_invept(struct vmx_nested *n);	/* svuota, tiene la radice */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
 struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
 uint64_t vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc);
@@ -166,6 +167,9 @@ struct vmx_nested {
 					 * VMCS12 vengono da synth_intr_info */
 	uint32_t	synth_intr_info;
 	uint64_t	synth_qual;	/* qualificazione dell'uscita sintetica */
+	bool		ept_pending;	/* EPT violation di L2 da risolvere nello
+					 * slow path (shadow EPT), restando in L2 */
+	uint64_t	ept_gpa;	/* suo GPA di L2, catturato in uscita */
 	bool		slow_reflect;	/* riflessione chiamata dallo slow path:
 					 * MSR del guest in guest_msrs[], NON nei
 					 * registri hardware */

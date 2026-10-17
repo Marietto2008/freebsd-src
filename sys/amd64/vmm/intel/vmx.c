@@ -2599,6 +2599,12 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 			return (HANDLED);	/* il ciclo vede la sospensione */
 		}
 		if (nested_l2_exit(vcpu, vmexit)) {
+			if (vcpu->nested->ept_pending) {
+				/* violation EPT da risolvere nello slow path
+				 * (shadow EPT): si esce da vmx_run in L2 */
+				vmexit->exitcode = VM_EXITCODE_NESTED;
+				return (UNHANDLED);
+			}
 			if (vcpu->nested->in_l2)
 				return (HANDLED); /* gestita in L0, resta in L2 */
 			/*
@@ -3115,6 +3121,8 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	case EXIT_REASON_VMWRITE:
 	case EXIT_REASON_VMXOFF:
 	case EXIT_REASON_VMXON:
+	case EXIT_REASON_INVEPT:	/* prima mancavano: finivano in userland */
+	case EXIT_REASON_INVVPID:
 		SDT_PROBE3(vmm, vmx, exit, vminsn, vmx, vcpuid, vmexit);
 		/*
 		 * Con la capability nested attiva le istruzioni VMX vanno al
@@ -3377,6 +3385,20 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 
 	vmcs_write(VMCS_GUEST_RIP, rip);
 	vmx_set_pcpu_defaults(vmx, vcpu, pmap);
+	/*
+	 * L2 con shadow EPT: invalida il TLB dell'EPTP shadow a ogni (ri)ingresso
+	 * via vm_run (INVEPT dell'L1, migrazione del vCPU, EPT12 cambiato). Le
+	 * voci shadow nuove non lo richiedono (una EPT violation invalida gia'
+	 * la traduzione del suo GPA, SDM 28.4.3).
+	 */
+	if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+	    vcpu->nested->vept_root != NULL) {
+		struct invept_desc ed;
+
+		ed.eptp = vmcs_read(VMCS_EPTP);
+		ed._res = 0;
+		invept(INVEPT_TYPE_SINGLE_CONTEXT, ed);
+	}
 	do {
 		/*
 		 * Anti-freeze del loop interno: se con il nested un'uscita L2

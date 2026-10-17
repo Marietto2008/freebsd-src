@@ -60,14 +60,44 @@ vmx_vept_eptp(struct vmx_vcpu *vcpu)
 	 * vmx_vept_fault. Fisso vept_eptp12 al VMCS12 corrente cosi' il primo
 	 * fault non la scarta e non cambia l'indirizzo gia' scritto nel VMCS02.
 	 */
-	if (n->vept_root == NULL) {
-		struct vmcs12_cache *c = nested_current_cache(n);
+	struct vmcs12_cache *c = nested_current_cache(n);
+	uint64_t eptp12 = (c != NULL) ? vmcs12_read_field(c, VMCS_EPTP) : 0;
 
+	if (n->vept_root == NULL) {
 		n->vept_root = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
 		    M_VMX_VEPT, M_WAITOK | M_ZERO);
-		n->vept_eptp12 = (c != NULL) ? vmcs12_read_field(c, VMCS_EPTP) : 0;
+		n->vept_eptp12 = eptp12;
+	} else if (n->vept_eptp12 != eptp12) {
+		/* l'L1 ha cambiato EPT: la shadow rispecchia quello vecchio.
+		 * Si svuota tenendo la radice (l'EPTP del VMCS02 resta valido). */
+		vmx_vept_invept(n);
+		n->vept_eptp12 = eptp12;
 	}
 	return (vtophys(n->vept_root) | EPT_PG_MEMORY_TYPE(6) | (3UL << 3));
+}
+
+/* Svuota le sottotabelle della radice (non la radice) e la azzera. */
+static void vept_free_level(uint64_t *tbl, int level);
+
+/*
+ * INVEPT dell'L1, o EPT12 cambiato: svuota la shadow TENENDO la radice, cosi'
+ * l'EPTP gia' scritto nel VMCS02 resta valido. Il TLB per l'EPTP shadow lo
+ * invalida vmx_run a ogni rientro in L2 (INVEPT single-context).
+ */
+void
+vmx_vept_invept(struct vmx_nested *n)
+{
+	uint64_t *root = n->vept_root;
+	int i;
+
+	if (root == NULL)
+		return;
+	for (i = 0; i < 512; i++) {
+		if ((root[i] & EPT_RWX) != 0 && (root[i] & EPT_PG_PS) == 0)
+			vept_free_level((uint64_t *)PHYS_TO_DMAP(
+			    EPT_ADDR(root[i])), 2);
+		root[i] = 0;
+	}
 }
 
 /* Libera le tabelle shadow (ricorsiva sui livelli interni). */
@@ -161,34 +191,40 @@ vept_install(struct vmx_nested *n, uint64_t l2gpa, uint64_t hpa, uint64_t perm)
  * l'accesso va riflesso all'L1 (EPT12 nega o EPT01 non mappa).
  */
 int
-vmx_vept_fault(struct vmx_vcpu *vcpu)
+vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c = nested_current_cache(n);
-	uint64_t l2gpa, eptp12, l1gpa, perm, hpa;
+	uint64_t eptp12, l1gpa, perm, hpa;
+	void *p, *ck;
 	int r;
 
+	/*
+	 * SLOW PATH (vCPU FROZEN, fuori dal critical_enter di vm_run): qui si
+	 * puo' dormire (vm_gpa_hold, malloc M_WAITOK). Prima era chiamata dal
+	 * percorso veloce (nested_l2_exit dentro vmx_run): vietato.
+	 */
 	if (c == NULL)
 		return (1);
-	l2gpa = vmcs_read(VMCS_GUEST_PHYSICAL_ADDRESS);
 	eptp12 = vmcs12_read_field(c, VMCS_EPTP);
-
-	/* radice shadow per questo EPTP12 (ricostruisci se cambia) */
-	if (n->vept_root != NULL && n->vept_eptp12 != eptp12)
-		vmx_vept_flush(n);
-	if (n->vept_root == NULL) {
-		n->vept_root = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
-		    M_VMX_VEPT, M_WAITOK | M_ZERO);
-		n->vept_eptp12 = eptp12;
-	}
+	if (n->vept_root == NULL || n->vept_eptp12 != eptp12)
+		(void)vmx_vept_eptp(vcpu);	/* allinea radice ed EPTP12 */
 
 	r = ept12_translate(vcpu, eptp12, l2gpa, &l1gpa, &perm);
-	if (r != 0) {
-			return (1);			/* EPT12 nega -> violation all'L1 */
-	}
-	hpa = pmap_extract(vcpu->vmx->pmap, l1gpa);
-	if (hpa == 0)
-		return (1);			/* EPT01 miss -> all'L1 (§6.7.4, scaffold) */
+	if (r != 0)
+		return (1);			/* EPT12 nega -> violation all'L1 */
+	/*
+	 * Pagina host dell'L1-GPA: vm_gpa_hold la porta in memoria se serve
+	 * (prima pmap_extract sull'EPT01 falliva per una pagina mai toccata
+	 * dall'L1 e la violation finiva, a torto, all'L1). La memoria del guest
+	 * e' wired: la pagina non si sposta dopo il rilascio.
+	 */
+	p = vm_gpa_hold(vcpu->vcpu, l1gpa & ~(uint64_t)PAGE_MASK, PAGE_SIZE,
+	    VM_PROT_READ, &ck);
+	if (p == NULL)
+		return (1);			/* non RAM (MMIO dell'L1): all'L1 */
+	hpa = DMAP_TO_PHYS((vm_offset_t)p);
+	vm_gpa_release(ck);
 	vept_install(n, l2gpa, hpa, perm);
 	return (0);				/* rientra in L2 */
 }
