@@ -851,6 +851,18 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	vm_get_register(vcpu->vcpu, VM_REG_GUEST_DR7, &n->l1_dr7);
 	vm_get_register(vcpu->vcpu, VMCS_IDENT(VMCS_GUEST_IA32_DEBUGCTL),
 	    &n->l1_debugctl);
+	/* TSC dell'L1 = TSC host + offset del VMCS01 (se usato): l'L2 vede
+	 * quello dell'L1 + l'offset del VMCS12. Si legge ORA, come DR7. */
+	{
+		uint64_t p01 = 0, o01 = 0;
+
+		vm_get_register(vcpu->vcpu,
+		    VMCS_IDENT(VMCS_PRI_PROC_BASED_CTLS), &p01);
+		if (p01 & PROCBASED_TSC_OFFSET)
+			vm_get_register(vcpu->vcpu,
+			    VMCS_IDENT(VMCS_TSC_OFFSET), &o01);
+		n->l1_tsc_offset = o01;
+	}
 
 	/* host-state fisso del VMCS02 (lascia nessun VMCS corrente) */
 	if ((error = vmx_nested_vmcs02_setup(c)) != 0) {
@@ -1001,11 +1013,38 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	uint64_t efer, hrip, hrsp, hcr0, hcr3, hcr4;
 	uint32_t i;
 	/* stato di L2 da ricopiare in VMCS12 cosi' l'L1 lo rilegge con VMREAD */
+	/*
+	 * SDM 28.3: all'uscita si salva TUTTO lo stato guest. Prima solo 11
+	 * campi: l'L1 rileggeva segmenti, GDTR/IDTR, SYSENTER, LDTR, PDPTE
+	 * dell'L2 come li aveva scritti lui (kvm-unit-tests vmx_ldtr_test,
+	 * vmx_mtf_pdpte_test); Hyper-V li usa per emulare la partizione root.
+	 * PAT, DR7 e DEBUGCTL solo coi rispettivi save controls (piu' sotto).
+	 */
 	static const uint32_t l2state[] = {
 		VMCS_GUEST_RIP, VMCS_GUEST_RSP, VMCS_GUEST_RFLAGS,
 		VMCS_GUEST_CR0, VMCS_GUEST_CR3, VMCS_GUEST_CR4,
 		VMCS_GUEST_IA32_EFER,
-		VMCS_GUEST_CS_SELECTOR, VMCS_GUEST_SS_SELECTOR,
+		VMCS_GUEST_ES_SELECTOR, VMCS_GUEST_CS_SELECTOR,
+		VMCS_GUEST_SS_SELECTOR, VMCS_GUEST_DS_SELECTOR,
+		VMCS_GUEST_FS_SELECTOR, VMCS_GUEST_GS_SELECTOR,
+		VMCS_GUEST_LDTR_SELECTOR, VMCS_GUEST_TR_SELECTOR,
+		VMCS_GUEST_ES_LIMIT, VMCS_GUEST_CS_LIMIT, VMCS_GUEST_SS_LIMIT,
+		VMCS_GUEST_DS_LIMIT, VMCS_GUEST_FS_LIMIT, VMCS_GUEST_GS_LIMIT,
+		VMCS_GUEST_LDTR_LIMIT, VMCS_GUEST_TR_LIMIT,
+		VMCS_GUEST_GDTR_LIMIT, VMCS_GUEST_IDTR_LIMIT,
+		VMCS_GUEST_ES_ACCESS_RIGHTS, VMCS_GUEST_CS_ACCESS_RIGHTS,
+		VMCS_GUEST_SS_ACCESS_RIGHTS, VMCS_GUEST_DS_ACCESS_RIGHTS,
+		VMCS_GUEST_FS_ACCESS_RIGHTS, VMCS_GUEST_GS_ACCESS_RIGHTS,
+		VMCS_GUEST_LDTR_ACCESS_RIGHTS, VMCS_GUEST_TR_ACCESS_RIGHTS,
+		VMCS_GUEST_ES_BASE, VMCS_GUEST_CS_BASE, VMCS_GUEST_SS_BASE,
+		VMCS_GUEST_DS_BASE, VMCS_GUEST_FS_BASE, VMCS_GUEST_GS_BASE,
+		VMCS_GUEST_LDTR_BASE, VMCS_GUEST_TR_BASE,
+		VMCS_GUEST_GDTR_BASE, VMCS_GUEST_IDTR_BASE,
+		VMCS_GUEST_PENDING_DBG_EXCEPTIONS,
+		VMCS_GUEST_IA32_SYSENTER_CS, VMCS_GUEST_IA32_SYSENTER_ESP,
+		VMCS_GUEST_IA32_SYSENTER_EIP,
+		VMCS_GUEST_PDPTE0, VMCS_GUEST_PDPTE1,
+		VMCS_GUEST_PDPTE2, VMCS_GUEST_PDPTE3,
 		VMCS_GUEST_INTERRUPTIBILITY, VMCS_GUEST_ACTIVITY,
 	};
 
@@ -1168,6 +1207,11 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	    VMCS_GUEST_TR_LIMIT, VMCS_GUEST_TR_ACCESS_RIGHTS,
 	    vmcs12_read_field(c, VMCS_HOST_TR_SELECTOR),
 	    vmcs12_read_field(c, VMCS_HOST_TR_BASE), 0x67, NESTED_AR_TR);
+	/* SDM 28.5.2: all'uscita LDTR = 0, inutilizzabile (prima restava
+	 * quella dell'L2: kvm-unit-tests vmx_ldtr_test) */
+	nested_load_seg(VMCS_GUEST_LDTR_SELECTOR, VMCS_GUEST_LDTR_BASE,
+	    VMCS_GUEST_LDTR_LIMIT, VMCS_GUEST_LDTR_ACCESS_RIGHTS, 0, 0, 0,
+	    0x10000);
 	vmwrite(VMCS_GUEST_GDTR_BASE, vmcs12_read_field(c, VMCS_HOST_GDTR_BASE));
 	vmwrite(VMCS_GUEST_GDTR_LIMIT, 0xffff);
 	vmwrite(VMCS_GUEST_IDTR_BASE, vmcs12_read_field(c, VMCS_HOST_IDTR_BASE));
@@ -1338,6 +1382,15 @@ nested_msr_rw(struct vmx_vcpu *vcpu, uint32_t idx, uint64_t *val, bool wr,
 	case MSR_SYSENTER_ESP_MSR: f = VMCS_GUEST_IA32_SYSENTER_ESP; break;
 	case MSR_SYSENTER_EIP_MSR: f = VMCS_GUEST_IA32_SYSENTER_EIP; break;
 	case MSR_DEBUGCTLMSR:	f = VMCS_GUEST_IA32_DEBUGCTL; break;
+	case MSR_TSC:
+		/* il TSC del vCPU = host + offset del VMCS corrente (kvm-unit-
+		 * tests vmx_store_tsc_test). In scrittura non e' ammesso. */
+		if (wr)
+			return (EINVAL);
+		*val = rdtsc();
+		if (vmcs_read(VMCS_PRI_PROC_BASED_CTLS) & PROCBASED_TSC_OFFSET)
+			*val += vmcs_read(VMCS_TSC_OFFSET);
+		return (0);
 	default:
 		return (EINVAL);	/* FS/GS_BASE, x2APIC, SMM...: vietati */
 	}
@@ -1830,6 +1883,9 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 		VMCS_GUEST_IA32_SYSENTER_EIP, VMCS_GUEST_IA32_DEBUGCTL,
 		VMCS_GUEST_IA32_PAT, VMCS_GUEST_IA32_EFER,
 		VMCS_GUEST_INTERRUPTIBILITY, VMCS_GUEST_ACTIVITY,
+		/* con EPT e paging PAE la CPU prende i PDPTE da qui */
+		VMCS_GUEST_PDPTE0, VMCS_GUEST_PDPTE1,
+		VMCS_GUEST_PDPTE2, VMCS_GUEST_PDPTE3,
 	};
 
 	c = nested_current_cache(n);
@@ -1975,8 +2031,24 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	/* MSR bitmap: quello dell'L0 (intercetta cio' che serve a L0); la
 	 * fusione con quello dell'L1 e' T6.3. */
 	vmwrite(VMCS_MSR_BITMAP, vtophys(x->vmx->msr_bitmap));
-	/* TSC offset: quello di VMCS12 (l'offset dell'L0 si somma in T2). */
-	vmwrite(VMCS_TSC_OFFSET, vmcs12_read_field(c, VMCS_TSC_OFFSET));
+	/*
+	 * TSC offset = quello dell'L0 per l'L1 + quello dell'L1 per l'L2 (se
+	 * l'L1 lo usa). Prima solo il secondo: l'L2 vedeva il TSC dell'host,
+	 * non quello dell'L1 (kvm-unit-tests rdtsc_vmexit_diff_test). Il
+	 * controllo TSC offsetting va acceso se l'offset non e' nullo.
+	 */
+	{
+		uint64_t off = n->l1_tsc_offset;
+
+		if (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+		    PROCBASED_TSC_OFFSET)
+			off += vmcs12_read_field(c, VMCS_TSC_OFFSET);
+		vmwrite(VMCS_TSC_OFFSET, off);
+		if (off != 0)
+			vmwrite(VMCS_PRI_PROC_BASED_CTLS,
+			    vmcs_read(VMCS_PRI_PROC_BASED_CTLS) |
+			    PROCBASED_TSC_OFFSET);
+	}
 	/* liste MSR a 0 (applicate in software nello slow path, §6.3). */
 	vmwrite(VMCS_EXIT_MSR_STORE_COUNT, 0);
 	vmwrite(VMCS_EXIT_MSR_LOAD_COUNT, 0);

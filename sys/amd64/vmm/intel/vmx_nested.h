@@ -190,6 +190,7 @@ struct vmx_nested {
 	bool		slow_reflect;	/* riflessione chiamata dallo slow path:
 					 * MSR del guest in guest_msrs[], NON nei
 					 * registri hardware */
+	uint64_t	l1_tsc_offset;	/* TSC offset del VMCS01 al VMLAUNCH */
 	uint64_t	l1_dr7;		/* DR7/DEBUGCTL dell'L1 al VMLAUNCH: */
 	uint64_t	l1_debugctl;	/* li eredita l'L2 senza load debug */
 	/*
