@@ -128,6 +128,18 @@ struct vmcs12_field {
 	uint64_t	val;
 };
 
+/*
+ * Lista MSR del VMCS12 (SDM 24.7.2): fino a 512 voci da 16 byte = 8 KB,
+ * allineata a 16, quindi su al massimo 3 pagine; una voce non scavalca mai
+ * il confine di pagina.
+ */
+struct nested_msr_list {
+	uint64_t	gpa;
+	uint32_t	n;
+	uint8_t		*pg[3];
+	void		*ck[3];
+};
+
 struct vmcs12_cache {
 	uint64_t	vmcs12_gpa;	/* GPA del VMCS12; VMCS12_GPA_NONE = libera */
 	void		*vmcs02;	/* pagina VMCS02, allocata pigramente (T1.8) */
@@ -146,13 +158,9 @@ struct vmcs12_cache {
 	void		*ck_io_a, *ck_io_b, *ck_msr;
 	/* Liste MSR d'uscita dell'L1 (store, load), mappate come le bitmap:
 	 * all'uscita da L2 si e' nel percorso veloce. */
-	struct msr_entry *msr_st, *msr_ld;	/* struct di vmcs.h, 16 byte */
-	void		*ck_st, *ck_ld;
-	uint32_t	n_st, n_ld;
-	/* lista d'ingresso: mappata PRIMA del VMPTRLD (che fa critical_enter) */
-	struct msr_entry *msr_en;
-	void		*ck_en;
-	uint32_t	n_en;
+	/* store/load all'uscita, load all'ingresso: mappate PRIMA del VMPTRLD
+	 * (che fa critical_enter) e lette anche dal percorso veloce */
+	struct nested_msr_list ml_st, ml_ld, ml_en;
 };
 
 /*
@@ -192,6 +200,11 @@ struct vmx_nested {
 					 * registri hardware */
 	uint64_t	l1_tsc_offset;	/* TSC offset del VMCS01 al VMLAUNCH */
 	uint64_t	exit_tsc;	/* TSC host all'ultima uscita da L2 */
+	bool		l1_tsc_dirty;	/* l1_tsc_offset cambiato (IA32_TSC in una
+					 * lista d'ingresso): da riportare nel
+					 * VMCS01 alla prossima uscita */
+	int		msr_phase;	/* 1 lista d'ingresso (VMCS02 corrente),
+					 * 2 lista load d'uscita (VMCS01) */
 	uint64_t	l1_dr7;		/* DR7/DEBUGCTL dell'L1 al VMLAUNCH: */
 	uint64_t	l1_debugctl;	/* li eredita l'L2 senza load debug */
 	/*

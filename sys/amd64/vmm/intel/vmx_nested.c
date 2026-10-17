@@ -43,6 +43,7 @@
 MALLOC_DEFINE(M_VMX_NESTED, "vmx_nested", "Intel VMX nested virtualization");
 
 static void	nested_bitmaps_unmap(struct vmcs12_cache *c);
+static void	nested_msr_list_unmap(struct nested_msr_list *l);
 static int	nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c);
 static void	nested_msr_list_exit(struct vmx_vcpu *vcpu,
 		    struct vmcs12_cache *c, bool store);
@@ -1263,8 +1264,15 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmwrite(VMCS_GUEST_FS_BASE, vmcs12_read_field(c, VMCS_HOST_FS_BASE));
 	vmwrite(VMCS_GUEST_GS_BASE, vmcs12_read_field(c, VMCS_HOST_GS_BASE));
 
+	/* TSC dell'L1 cambiato da una lista d'ingresso: nel VMCS01 ora */
+	if (n->l1_tsc_dirty) {
+		vmx_set_tsc_offset(vcpu, n->l1_tsc_offset);
+		n->l1_tsc_dirty = false;
+	}
 	/* Lista "carica all'uscita": MSR dell'L1, dopo lo stato host (SDM). */
+	n->msr_phase = 2;
 	nested_msr_list_exit(vcpu, c, false);
+	n->msr_phase = 0;
 
 	n->in_l2 = false;
 	vmexit->rip = hrip;
@@ -1356,44 +1364,67 @@ nested_bitmaps_unmap(struct vmcs12_cache *c)
 		vm_gpa_release(c->ck_io_b);
 	if (c->ck_msr != NULL)
 		vm_gpa_release(c->ck_msr);
-	if (c->ck_st != NULL)
-		vm_gpa_release(c->ck_st);
-	if (c->ck_ld != NULL)
-		vm_gpa_release(c->ck_ld);
-	if (c->ck_en != NULL)
-		vm_gpa_release(c->ck_en);
+	nested_msr_list_unmap(&c->ml_st);
+	nested_msr_list_unmap(&c->ml_ld);
+	nested_msr_list_unmap(&c->ml_en);
 	c->bm_io_a = c->bm_io_b = c->bm_msr = NULL;
 	c->ck_io_a = c->ck_io_b = c->ck_msr = NULL;
-	c->msr_st = c->msr_ld = c->msr_en = NULL;
-	c->ck_st = c->ck_ld = c->ck_en = NULL;
-	c->n_st = c->n_ld = c->n_en = 0;
 }
 
 /*
- * Mappa una lista MSR del VMCS12 (SDM 24.7.2): indirizzo allineato a 16,
- * al massimo 512 elementi e, per semplicita', contenuta in una pagina (le
- * liste reali sono di pochi elementi). 0 ok o lista vuota; -1 non valida.
+ * Mappa una lista MSR del VMCS12 (SDM 24.7.2): indirizzo allineato a 16, al
+ * massimo 512 elementi, pagina per pagina (prima una sola pagina: le liste
+ * da 512 voci di atomic_switch_max_msrs_test facevano fallire il VMLAUNCH).
+ * 0 ok o lista vuota; -1 non valida.
  */
 static int
 nested_msr_list_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c,
-    uint32_t addr_f, uint32_t cnt_f, int prot, struct msr_entry **p,
-    void **ck, uint32_t *n)
+    uint32_t addr_f, uint32_t cnt_f, int prot, struct nested_msr_list *l)
 {
 	uint64_t gpa = vmcs12_read_field(c, addr_f);
 	uint64_t cnt = vmcs12_read_field(c, cnt_f);
+	uint64_t first, last, pg;
+	int i;
 
-	*n = 0;
+	bzero(l, sizeof(*l));
 	if (cnt == 0)
 		return (0);
-	if ((gpa & 0xf) != 0 || cnt > 512 ||
-	    (gpa & PAGE_MASK) + cnt * sizeof(struct msr_entry) > PAGE_SIZE)
+	if ((gpa & 0xf) != 0 || cnt > 512)
 		return (-1);
-	*p = vm_gpa_hold(vcpu->vcpu, gpa, cnt * sizeof(struct msr_entry),
-	    prot, ck);
-	if (*p == NULL)
-		return (-1);
-	*n = (uint32_t)cnt;
+	first = trunc_page(gpa);
+	last = trunc_page(gpa + cnt * sizeof(struct msr_entry) - 1);
+	for (pg = first, i = 0; pg <= last; pg += PAGE_SIZE, i++) {
+		l->pg[i] = vm_gpa_hold(vcpu->vcpu, pg, PAGE_SIZE, prot,
+		    &l->ck[i]);
+		if (l->pg[i] == NULL) {
+			nested_msr_list_unmap(l);
+			return (-1);
+		}
+	}
+	l->gpa = gpa;
+	l->n = (uint32_t)cnt;
 	return (0);
+}
+
+static void
+nested_msr_list_unmap(struct nested_msr_list *l)
+{
+	int i;
+
+	for (i = 0; i < 3; i++)
+		if (l->ck[i] != NULL)
+			vm_gpa_release(l->ck[i]);
+	bzero(l, sizeof(*l));
+}
+
+/* voce i della lista (gia' mappata) */
+static struct msr_entry *
+nested_msr_ent(struct nested_msr_list *l, uint32_t i)
+{
+	uint64_t off = (l->gpa & PAGE_MASK) + (uint64_t)i * sizeof(struct msr_entry);
+
+	return ((struct msr_entry *)(l->pg[off >> PAGE_SHIFT] +
+	    (off & PAGE_MASK)));
 }
 
 /*
@@ -1435,8 +1466,35 @@ nested_msr_rw(struct vmx_vcpu *vcpu, uint32_t idx, uint64_t *val, bool wr,
 		 * (vmx_store_tsc_test, rdtsc_vmexit_diff_test,
 		 * vmx_preemption_timer_expiry_test). In scrittura non ammesso.
 		 */
-		if (wr)
-			return (EINVAL);
+		if (wr) {
+			/*
+			 * Scrivere IA32_TSC = WRMSR dell'L1: cambia l'offset che
+			 * L0 da' all'L1 (come vmx_wrmsr). Nella lista d'ingresso
+			 * il VMCS corrente e' il VMCS02: si ricalcola il suo
+			 * offset e il VMCS01 si aggiorna all'uscita; nella lista
+			 * load d'uscita il VMCS01 e' gia' corrente.
+			 */
+			struct vmx_nested *nn = vcpu->nested;
+			struct vmcs12_cache *cc = nested_current_cache(nn);
+			uint64_t off;
+
+			nn->l1_tsc_offset = *val - rdtsc();
+			if (nn->msr_phase == 2) {
+				vmx_set_tsc_offset(vcpu, nn->l1_tsc_offset);
+				nn->l1_tsc_dirty = false;
+				return (0);
+			}
+			off = nn->l1_tsc_offset;
+			if (cc != NULL && (vmcs12_read_field(cc,
+			    VMCS_PRI_PROC_BASED_CTLS) & PROCBASED_TSC_OFFSET))
+				off += vmcs12_read_field(cc, VMCS_TSC_OFFSET);
+			vmwrite(VMCS_TSC_OFFSET, off);
+			vmwrite(VMCS_PRI_PROC_BASED_CTLS,
+			    vmcs_read(VMCS_PRI_PROC_BASED_CTLS) |
+			    PROCBASED_TSC_OFFSET);
+			nn->l1_tsc_dirty = true;
+			return (0);
+		}
 		/* all'istante dell'uscita hardware (per una sintetica: ora) */
 		*val = (vcpu->nested->synth ? rdtsc() : vcpu->nested->exit_tsc) +
 		    vcpu->nested->l1_tsc_offset;
@@ -1473,16 +1531,20 @@ nested_msr_rw(struct vmx_vcpu *vcpu, uint32_t idx, uint64_t *val, bool wr,
 static uint32_t
 nested_msr_list_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 {
-	struct msr_entry *l = c->msr_en;	/* mappata da nested_bitmaps_map */
+	struct nested_msr_list *ml = &c->ml_en;	/* da nested_bitmaps_map */
+	struct msr_entry *e;
 	uint64_t v;
 	uint32_t i, fail = 0;
 
-	for (i = 0; i < c->n_en && fail == 0; i++) {
-		v = l[i].val;
-		if (l[i].reserved != 0 ||
-		    nested_msr_rw(vcpu, l[i].index, &v, true, false) != 0)
+	vcpu->nested->msr_phase = 1;
+	for (i = 0; i < ml->n && fail == 0; i++) {
+		e = nested_msr_ent(ml, i);
+		v = e->val;
+		if (e->reserved != 0 ||
+		    nested_msr_rw(vcpu, e->index, &v, true, false) != 0)
 			fail = i + 1;
 	}
+	vcpu->nested->msr_phase = 0;
 	return (fail);
 }
 
@@ -1496,20 +1558,22 @@ static void
 nested_msr_list_exit(struct vmx_vcpu *vcpu, struct vmcs12_cache *c,
     bool store)
 {
-	struct msr_entry *l = store ? c->msr_st : c->msr_ld;
-	uint32_t i, n = store ? c->n_st : c->n_ld;
+	struct nested_msr_list *ml = store ? &c->ml_st : &c->ml_ld;
+	struct msr_entry *l;
+	uint32_t i, n = ml->n;
 	bool live = !vcpu->nested->slow_reflect;
 	uint64_t v;
 
 	for (i = 0; i < n; i++) {
-		if (l[i].reserved != 0)
+		l = nested_msr_ent(ml, i);
+		if (l->reserved != 0)
 			continue;
 		if (store) {
-			if (nested_msr_rw(vcpu, l[i].index, &v, false, live) == 0)
-				l[i].val = v;
+			if (nested_msr_rw(vcpu, l->index, &v, false, live) == 0)
+				l->val = v;
 		} else {
-			v = l[i].val;
-			(void)nested_msr_rw(vcpu, l[i].index, &v, true, live);
+			v = l->val;
+			(void)nested_msr_rw(vcpu, l->index, &v, true, live);
 		}
 	}
 }
@@ -1546,13 +1610,13 @@ nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	/* liste MSR d'uscita: usate dalla riflessione, nel percorso veloce */
 	if (nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_STORE,
 	    VMCS_EXIT_MSR_STORE_COUNT, VM_PROT_READ | VM_PROT_WRITE,
-	    &c->msr_st, &c->ck_st, &c->n_st) != 0 ||
+	    &c->ml_st) != 0 ||
 	    nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_LOAD,
 	    VMCS_EXIT_MSR_LOAD_COUNT, VM_PROT_READ,
-	    &c->msr_ld, &c->ck_ld, &c->n_ld) != 0 ||
+	    &c->ml_ld) != 0 ||
 	    nested_msr_list_map(vcpu, c, VMCS_ENTRY_MSR_LOAD,
 	    VMCS_ENTRY_MSR_LOAD_COUNT, VM_PROT_READ,
-	    &c->msr_en, &c->ck_en, &c->n_en) != 0)
+	    &c->ml_en) != 0)
 		goto fail;
 	return (0);
 fail:
