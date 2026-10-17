@@ -991,6 +991,19 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_INFO,
 		    vmcs_read(VMCS_EXIT_INSTRUCTION_INFO));
 	}
+	/*
+	 * SDM: ogni VM exit azzera il bit valid del VM-entry
+	 * interruption-information. Senza, ogni VMRESUME successivo
+	 * re-iniettava l'evento in L2 (kvm-unit-tests 'Inject an event to a
+	 * halted guest': #GP in L2 a rip 0xa). L'IDT-vectoring info dice
+	 * all'L1 se l'uscita ha interrotto la consegna di un evento.
+	 */
+	vmcs12_write_field(c, VMCS_ENTRY_INTR_INFO,
+	    vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO) & ~VMCS_INTR_VALID);
+	vmcs12_write_field(c, VMCS_IDT_VECTORING_INFO, vcpu->nested->synth ?
+	    0 : vmcs_read(VMCS_IDT_VECTORING_INFO));
+	vmcs12_write_field(c, VMCS_IDT_VECTORING_ERROR, vcpu->nested->synth ?
+	    0 : vmcs_read(VMCS_IDT_VECTORING_ERROR));
 	for (i = 0; i < nitems(l2state); i++)
 		vmcs12_write_field(c, l2state[i], vmcs_read(l2state[i]));
 	/*
@@ -1631,8 +1644,14 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	vmwrite(VMCS_ENTRY_MSR_LOAD_COUNT, 0);
 	vmwrite(VMCS_LINK_POINTER, ~0UL);
 
-	/* entry interruption info: VMCS12 (prima entry dopo VMLAUNCH/VMRESUME). */
+	/* Evento da iniettare in L2 richiesto dall'L1 (VMCS12): info, codice
+	 * d'errore e lunghezza istruzione (interrupt/eccezioni software). Il
+	 * bit valid lo azzera la riflessione a ogni uscita, come l'hardware. */
 	vmwrite(VMCS_ENTRY_INTR_INFO, vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO));
+	vmwrite(VMCS_ENTRY_EXCEPTION_ERROR,
+	    vmcs12_read_field(c, VMCS_ENTRY_EXCEPTION_ERROR));
+	vmwrite(VMCS_ENTRY_INST_LENGTH,
+	    vmcs12_read_field(c, VMCS_ENTRY_INST_LENGTH));
 
 	c->control_dirty = false;
 	SDT_PROBE1(vmm, vmx, nested, enter_l2, vcpu);
