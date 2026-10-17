@@ -1045,6 +1045,11 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 */
 	vcpu->state.lastcpu = NOCPU;
 	n->in_l2 = true;
+	/* launched solo se l'ingresso RIESCE (SDM): un VM-entry fallito lascia
+	 * il VMCS clear. Si segna ora e si annulla nella riflessione se il
+	 * primo ingresso fallisce (n->launching). */
+	if (!is_resume)
+		n->launching = true;
 	c->launched = 1;			/* dopo VMLAUNCH il VMCS12 e' launched */
 	/*
 	 * vm_run ha GIA' calcolato nextrip = RIP dell'L1 + lunghezza del
@@ -1159,6 +1164,17 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	if (!vcpu->nested->synth && !vcpu->nested->slow_reflect)
 		vmexit->u.vmx.exit_reason =
 		    (uint32_t)vmcs_read(VMCS_EXIT_REASON);
+	/*
+	 * VM-entry fallito sul VMLAUNCH: il VMCS12 resta clear (SDM 26.7/26.8).
+	 * Prima restava launched e ogni VMLAUNCH successivo rispondeva VMfail 4
+	 * invece di valutare i controlli (kvm-unit-tests vmx_controls_test /
+	 * vmx_host_state_area_test: 1411 + 537 fallimenti in gran parte a
+	 * catena).
+	 */
+	if ((vmexit->u.vmx.exit_reason & 0x80000000) != 0 &&
+	    vcpu->nested->launching)
+		c->launched = 0;
+	vcpu->nested->launching = false;
 	if (__predict_false(vmx_nested_probe == 6)) {
 		/* sonda 6: traccia le uscite riflesse all'L1 (non ferma nulla) */
 		static int traced6;
@@ -1724,6 +1740,10 @@ bool
 nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 {
 	uint32_t reason = vmexit->u.vmx.exit_reason & 0xffff;
+
+	/* un'uscita normale da L2 = l'ingresso e' riuscito: VMCS12 launched */
+	if ((vmcs_read(VMCS_EXIT_REASON) & 0x80000000) == 0)
+		vcpu->nested->launching = false;
 
 	switch (reason) {
 	case EXIT_REASON_EXT_INTR:

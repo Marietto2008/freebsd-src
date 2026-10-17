@@ -9,5 +9,3 @@ vmentry_movss_shadow_test                   | vmx.flat | vmentry_movss_shadow_te
 vmx_apic_passthrough_test                   | vmx.flat | vmx_apic_passthrough_test                   | -cpu max | 1 | 1024 | 120
 vmx_db_test                                 | vmx.flat | vmx_db_test                                 | -cpu max | 1 | 1024 | 120
 vmx_mtf_test                                | vmx.flat | vmx_mtf_test                                | -cpu max | 1 | 1024 | 120
-vmx_pae_test                                | vmx.flat | vmx_pae_test                                | -cpu max | 1 | 1024 | 120
-vmx_pse_test                                | vmx.flat | vmx_pse_test                                | -cpu max | 1 | 1024 | 120
