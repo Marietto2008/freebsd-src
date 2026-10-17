@@ -594,6 +594,38 @@ vmcs12_write_field(struct vmcs12_cache *c, uint32_t enc, uint64_t val)
 }
 
 /*
+ * Encoding VMCS dell'L1. All'L1 esponiamo la stessa CPU (VMCS_ENUM compreso):
+ * un campo e' supportato se e solo se un VMREAD reale di quell'encoding
+ * riesce (vm_get_register con VMCS_IDENT fa VMPTRLD/VMCLEAR da se').
+ * Prima lo store accettava QUALUNQUE encoding (kvm-unit-tests: MAX_INDEX
+ * 0x1ff invece di 0x17).
+ */
+static bool
+nested_field_ok(struct vmx_vcpu *vcpu, uint32_t field)
+{
+	uint64_t tmp;
+
+	if ((field & 0xffff8000) != 0)		/* bit 31:15 riservati */
+		return (false);
+	return (vm_get_register(vcpu->vcpu, VMCS_IDENT(field), &tmp) == 0);
+}
+
+/* Larghezza del campo (bit 14:13): 0=16, 1=64, 2=32, 3=naturale. */
+#define	NESTED_FIELD_WIDTH(f)	(((f) >> 13) & 3)
+/* Accesso HIGH (bit 0) di un campo a 64 bit = meta' alta dello stesso campo. */
+#define	NESTED_FIELD_HIGH(f)	(NESTED_FIELD_WIDTH(f) == 1 && ((f) & 1) != 0)
+
+static uint64_t
+nested_field_mask(uint32_t field)
+{
+	switch (NESTED_FIELD_WIDTH(field)) {
+	case 0:	return (0xffffULL);
+	case 2:	return (0xffffffffULL);
+	default: return (~0ULL);
+	}
+}
+
+/*
  * VMREAD/VMWRITE dell'L1. Tutte le istruzioni escono (nessuno shadowing
  * hardware ancora: §6.2 e' un'ottimizzazione rimandata a T2) e si gestiscono
  * in software sullo store del VMCS12 corrente. Decode dell'operando: campo
@@ -615,7 +647,14 @@ nested_vmread(struct vmx_vcpu *vcpu)
 
 	info = (uint32_t)vcpu->nested->exit_insn_info; /* catturato */
 	field = (uint32_t)vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
-	val = vmcs12_read_field(c, field);
+	if (!nested_field_ok(vcpu, field)) {
+		nested_vmx_result(vcpu, VMXERR_UNSUPPORTED_VMCS_COMPONENT);
+		goto done;
+	}
+	if (NESTED_FIELD_HIGH(field))
+		val = vmcs12_read_field(c, field & ~1U) >> 32;
+	else
+		val = vmcs12_read_field(c, field) & nested_field_mask(field);
 
 	if ((info >> 10) & 0x1) {
 		vmx_set_guest_reg(vcpu, (info >> 3) & 0xf, val);
@@ -661,6 +700,16 @@ nested_vmwrite(struct vmx_vcpu *vcpu)
 		val = *p;
 		vm_gpa_release(cookie);
 	}
+	if (!nested_field_ok(vcpu, field)) {
+		nested_vmx_result(vcpu, VMXERR_UNSUPPORTED_VMCS_COMPONENT);
+		goto done;
+	}
+	if (NESTED_FIELD_HIGH(field)) {		/* scrive la meta' alta */
+		field &= ~1U;
+		val = (vmcs12_read_field(c, field) & 0xffffffffULL) |
+		    (val << 32);
+	} else
+		val &= nested_field_mask(field);
 	/* F0: VMWRITE su ogni campo (MISC bit 29) = SI -> niente rifiuto RO. */
 	if (vmcs12_write_field(c, field, val) != 0) {
 		nested_vmx_result(vcpu, VMXERR_UNSUPPORTED_VMCS_COMPONENT);
