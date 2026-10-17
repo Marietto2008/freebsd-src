@@ -1,0 +1,4 @@
+# IOAPIC senza nested (riferimento per vmx_apic_passthrough_test: remote IRR).
+# kut-run.sh kut-ioapic.list   (SENZA --nested)
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+ioapic | ioapic.flat |  | -cpu qemu64,+x2apic | 1 | 1024 | 60
