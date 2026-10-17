@@ -42,6 +42,15 @@
 
 MALLOC_DEFINE(M_VMX_NESTED, "vmx_nested", "Intel VMX nested virtualization");
 
+uint32_t
+vmcs12_proc2(struct vmcs12_cache *c)
+{
+	if ((vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+	    PROCBASED_SECONDARY_CONTROLS) == 0)
+		return (0);
+	return ((uint32_t)vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS));
+}
+
 static void	nested_bitmaps_unmap(struct vmcs12_cache *c);
 static void	nested_msr_list_unmap(struct nested_msr_list *l);
 static int	nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c);
@@ -250,7 +259,7 @@ nested_vmx_result(struct vmx_vcpu *vcpu, int errnum)
 			    cp ? (u_long)vmcs12_read_field(cp, VMCS_ENTRY_INTR_INFO) : 0,
 			    cp ? (u_long)vmcs12_read_field(cp, VMCS_PIN_BASED_CTLS) : 0,
 			    cp ? (u_long)vmcs12_read_field(cp, VMCS_PRI_PROC_BASED_CTLS) : 0,
-			    cp ? (u_long)vmcs12_read_field(cp, VMCS_SEC_PROC_BASED_CTLS) : 0,
+			    cp ? (u_long)vmcs12_proc2(cp) : 0,
 			    cp ? (u_long)vmcs12_read_field(cp, VMCS_EXIT_CTLS) : 0,
 			    cp ? (u_long)vmcs12_read_field(cp, VMCS_ENTRY_CTLS) : 0);
 		}
@@ -915,7 +924,7 @@ nested_check_vmentry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	pin = (uint32_t)vmcs12_read_field(c, VMCS_PIN_BASED_CTLS);
 	proc = (uint32_t)vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS);
 	proc2 = (proc & PROCBASED_SECONDARY_CONTROLS) ?
-	    (uint32_t)vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) : 0;
+	    (uint32_t)vmcs12_proc2(c) : 0;
 	exitc = (uint32_t)vmcs12_read_field(c, VMCS_EXIT_CTLS);
 	entryc = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_CTLS);
 
@@ -1133,7 +1142,7 @@ nested_load_pdptes(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	cr4 = vmcs12_read_field(c, VMCS_GUEST_CR4);
 	if ((vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
 	    PROCBASED_SECONDARY_CONTROLS) != 0 &&
-	    (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	    (vmcs12_proc2(c) &
 	    PROCBASED2_ENABLE_EPT) != 0)
 		return;				/* con EPT12: dal VMCS12 */
 	if ((cr0 & CR0_PG) == 0 || (cr4 & CR4_PAE) == 0 ||
@@ -1265,7 +1274,7 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 
 	/* Shadow EPT: radice preparata QUI, dove si puo' dormire. Da VMPTRLD
 	 * in poi si e' in sezione critica (niente malloc ne' vm_gpa_hold). */
-	if (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	if (vmcs12_proc2(c) &
 	    PROCBASED2_ENABLE_EPT)
 		vmx_vept_prepare(vcpu);
 
@@ -1564,7 +1573,7 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	efer = vmcs_read(VMCS_GUEST_IA32_EFER);
 
 	/* 3. se VMCS12 non usa VPID, flush del VPID02 (§6.6) */
-	if ((vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	if ((vmcs12_proc2(c) &
 	    PROCBASED2_ENABLE_VPID) == 0) {
 		struct invvpid_desc d;
 		bzero(&d, sizeof(d));
@@ -2187,8 +2196,7 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	case EXIT_REASON_EPT_FAULT:
 	case EXIT_REASON_EPT_MISCONFIG: {
 		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
-		if (cc != NULL && (vmcs12_read_field(cc,
-		    VMCS_SEC_PROC_BASED_CTLS) & PROCBASED2_ENABLE_EPT)) {
+		if (cc != NULL && (vmcs12_proc2(cc) & PROCBASED2_ENABLE_EPT)) {
 			if (reason == EXIT_REASON_EPT_MISCONFIG)
 				break;		/* -> riflette all'L1 */
 			/*
@@ -2513,7 +2521,20 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	vmwrite(VMCS_PRI_PROC_BASED_CTLS, proc);
 
 	/* --- Secondary proc: EPT=1, VPID=1, shadowing=0, APIC-virt=0 --- */
-	proc2 = (uint32_t)vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS);
+	/*
+	 * Secondari dell'L1 solo se li ha attivati (bit 31 dei primari) e solo
+	 * quelli che gli esponiamo: altrimenti il campo del VMCS12 va ignorato
+	 * (SDM) e puo' contenere residui. Prima lo si copiava sempre nel VMCS02
+	 * (dove i secondari sono sempre attivi per l'EPT di L0): con residui
+	 * come il mode-based execute control l'L2 prendeva EPT violation di
+	 * esecuzione a ciclo continuo, 264.000/s (vmx_guest_state_area_test,
+	 * DTrace: vm_fault a 0x40a000 tipo 4, nessuna riflessione).
+	 */
+	proc2 = 0;
+	if (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+	    PROCBASED_SECONDARY_CONTROLS)
+		proc2 = (uint32_t)vmcs12_proc2(c) &
+		    (uint32_t)(n->vmx_msr[0x48b - 0x480] >> 32);
 	proc2 |= PROCBASED2_ENABLE_EPT | PROCBASED2_ENABLE_VPID;
 	proc2 = nested_adjust_ctl(proc2, MSR_VMX_PROCBASED_CTLS2);
 	proc2 &= ~(PROCBASED2_VMCS_SHADOWING |
@@ -2618,7 +2639,7 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 
 	/* --- EPTP, VPID, MSR bitmap, TSC offset, liste MSR, link pointer --- */
 	/* EPTP: shadow EPT se VMCS12 usa EPT (T2.7), altrimenti EPTP01. */
-	if (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	if (vmcs12_proc2(c) &
 	    PROCBASED2_ENABLE_EPT)
 		vmwrite(VMCS_EPTP, vmx_vept_eptp(vcpu));
 	else

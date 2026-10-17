@@ -293,7 +293,7 @@ vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot, uint64_t *out)
 
 	*out = gpa;
 	if (n == NULL || !n->in_l2 || (c = nested_current_cache(n)) == NULL ||
-	    (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	    (vmcs12_proc2(c) &
 	    PROCBASED2_ENABLE_EPT) == 0)
 		return (0);
 	if (ept12_translate(vcpu, vmcs12_read_field(c, VMCS_EPTP), gpa, out,

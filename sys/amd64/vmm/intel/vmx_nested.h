@@ -113,6 +113,9 @@ void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
 struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
 uint64_t vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc);
+/* Secondari del VMCS12 come li vede la CPU: 0 se i primari non li attivano
+ * (SDM: il campo e' allora ignorato e puo' contenere residui). */
+uint32_t vmcs12_proc2(struct vmcs12_cache *c);
 uint16_t vpid_alloc(int vcpuid);
 void vpid_free(int vpid);
 
