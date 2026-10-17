@@ -3416,6 +3416,18 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * pmap_invalidate_ept().
 		 */
 		disable_intr();
+		/*
+		 * Nested: un interrupt dell'L1 che l'L1 intercetta (EXTINT
+		 * exiting nel VMCS12) NON va iniettato in L2 ma consegnato
+		 * all'L1 con un'uscita sintetica. Il VMCS corrente cambia: si
+		 * esce come dopo una riflessione. Qui, a interrupt spenti, cosi'
+		 * nulla diventa pendente tra il controllo e l'iniezione.
+		 */
+		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+		    nested_check_events(vcpu, vmexit)) {
+			enable_intr();
+			break;
+		}
 		vmx_inject_interrupts(vcpu, vlapic, rip);
 
 		/*

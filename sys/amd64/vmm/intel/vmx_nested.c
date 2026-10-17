@@ -971,16 +971,26 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* 1-2. info d'uscita + stato di L2 -> store VMCS12 */
 	vmcs12_write_field(c, VMCS_EXIT_REASON,
 	    vmexit->u.vmx.exit_reason);
-	vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION,
-	    vmcs_read(VMCS_EXIT_QUALIFICATION));
-	vmcs12_write_field(c, VMCS_EXIT_INTR_INFO,
-	    vmcs_read(VMCS_EXIT_INTR_INFO));
-	vmcs12_write_field(c, VMCS_EXIT_INTR_ERRCODE,
-	    vmcs_read(VMCS_EXIT_INTR_ERRCODE));
-	vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_LENGTH,
-	    vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH));
-	vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_INFO,
-	    vmcs_read(VMCS_EXIT_INSTRUCTION_INFO));
+	if (vcpu->nested->synth) {
+		/* uscita sintetica (nested_check_events): nessun dato hardware */
+		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION, 0);
+		vmcs12_write_field(c, VMCS_EXIT_INTR_INFO,
+		    vcpu->nested->synth_intr_info);
+		vmcs12_write_field(c, VMCS_EXIT_INTR_ERRCODE, 0);
+		vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_LENGTH, 0);
+		vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_INFO, 0);
+	} else {
+		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION,
+		    vmcs_read(VMCS_EXIT_QUALIFICATION));
+		vmcs12_write_field(c, VMCS_EXIT_INTR_INFO,
+		    vmcs_read(VMCS_EXIT_INTR_INFO));
+		vmcs12_write_field(c, VMCS_EXIT_INTR_ERRCODE,
+		    vmcs_read(VMCS_EXIT_INTR_ERRCODE));
+		vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_LENGTH,
+		    vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH));
+		vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_INFO,
+		    vmcs_read(VMCS_EXIT_INSTRUCTION_INFO));
+	}
 	for (i = 0; i < nitems(l2state); i++)
 		vmcs12_write_field(c, l2state[i], vmcs_read(l2state[i]));
 	/*
@@ -1107,6 +1117,51 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 }
 
 /*
+ * Eventi dell'L1 mentre il vCPU e' in L2 (come vmx_check_nested_events di
+ * KVM). Chiamata da vmx_run PRIMA di ogni ingresso in L2, col VMCS02
+ * corrente. Se l'L1 ha un interrupt pendente e il suo VMCS12 chiede
+ * l'uscita sugli interrupt esterni, l'hardware vero uscirebbe verso l'L1
+ * con motivo EXTERNAL_INTERRUPT, qualunque sia l'IF di L2: si fa
+ * un'uscita SINTETICA. Prima l'interrupt veniva iniettato in L2
+ * (kvm-unit-tests 'interrupt': "intercepted interrupt while running
+ * guest", poi exit reason 7 non richiesta). Con "acknowledge interrupt on
+ * exit" il vettore e' accettato dall'APIC e va nelle info d'uscita;
+ * senza, resta pendente e l'L1 lo prende riabilitando gli interrupt.
+ * Ritorna true se l'uscita e' stata fatta: vmx_run deve uscire
+ * (VM_EXITCODE_NESTED + restart_only, come dopo una riflessione).
+ */
+bool
+nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c = nested_current_cache(n);
+	struct vlapic *vl = vm_lapic(vcpu->vcpu);
+	int vec;
+
+	if (c == NULL || !n->in_l2)
+		return (false);
+	if ((vmcs12_read_field(c, VMCS_PIN_BASED_CTLS) &
+	    PINBASED_EXTINT_EXITING) == 0)
+		return (false);
+	if (!vlapic_pending_intr(vl, &vec))
+		return (false);
+
+	n->synth_intr_info = 0;
+	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) &
+	    VM_EXIT_ACKNOWLEDGE_INTERRUPT) {
+		vlapic_intr_accepted(vl, vec);
+		n->synth_intr_info = vec | VMCS_INTR_T_HWINTR | VMCS_INTR_VALID;
+	}
+	vmexit->u.vmx.exit_reason = EXIT_REASON_EXT_INTR;
+	n->synth = true;
+	nested_reflect_to_l1(vcpu, vmexit);
+	n->synth = false;
+	n->restart_only = true;
+	vmexit->exitcode = VM_EXITCODE_NESTED;
+	return (true);
+}
+
+/*
  * Bitmap I/O e MSR dell'L1. Il percorso veloce (vmx_exit_process, sotto il
  * critical_enter di vm_run) non puo' chiamare vm_gpa_hold, che puo' dormire:
  * lo faceva qui (panic "vm_gpa_hold: invalid vcpu state 2", kvm-unit-tests
@@ -1222,6 +1277,24 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		}
 		if (p12 & PROCBASED_IO_EXITING) break;	/* uncond -> riflette */
 		return (false);			/* L0 gestisce con i registri di L2 */
+	}
+	case EXIT_REASON_INTR_WINDOW:
+	case EXIT_REASON_NMI_WINDOW: {
+		/*
+		 * L0 apre queste finestre per iniettare eventi in L2: all'L1
+		 * solo se il SUO VMCS12 le chiede. Prima si riflettevano
+		 * sempre (kvm-unit-tests 'interrupt': "Unknown exit reason
+		 * 0x7" nell'L1). Altrimenti la gestisce il flusso normale
+		 * (chiude la finestra, inietta, si rientra in L2).
+		 */
+		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
+		uint32_t flag = (reason == EXIT_REASON_INTR_WINDOW) ?
+		    PROCBASED_INT_WINDOW_EXITING : PROCBASED_NMI_WINDOW_EXITING;
+
+		if (cc != NULL && (vmcs12_read_field(cc,
+		    VMCS_PRI_PROC_BASED_CTLS) & flag))
+			break;			/* L1 la chiede -> riflette */
+		return (false);
 	}
 	case EXIT_REASON_CR_ACCESS: {
 		/*

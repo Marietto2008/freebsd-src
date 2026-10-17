@@ -156,6 +156,10 @@ struct vmx_nested {
 	uint16_t	vpid2;		/* VPID distinto per L2 (T2.8) */
 	bool		restart_only;	/* uscita L2 gia' riflessa: lo slow path
 					 * deve solo far ripartire vmx_run */
+	bool		synth;		/* uscita L2->L1 SINTETICA (nessuna uscita
+					 * hardware): i campi d'uscita per il
+					 * VMCS12 vengono da synth_intr_info */
+	uint32_t	synth_intr_info;
 	uint64_t	l1_dr7;		/* DR7/DEBUGCTL dell'L1 al VMLAUNCH: */
 	uint64_t	l1_debugctl;	/* li eredita l'L2 senza load debug */
 	/*
@@ -174,6 +178,8 @@ int	vmx_nested_init(struct vmx_vcpu *vcpu);
 int	vmx_nested_exit(void *vcpui);
 void	nested_vmx_result(struct vmx_vcpu *vcpu, int errnum);
 void	nested_vmfail_invalid(struct vmx_vcpu *vcpu);
+/* Eventi dell'L1 da consegnare prima di rientrare in L2 (vmx_run). */
+bool	nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
 /* Sonde d'arresto controllato (hw.vmm.vmx.nested_probe, vmx.c). */
 extern int vmx_nested_probe;
 void	nested_probe_dump(const char *tag);
