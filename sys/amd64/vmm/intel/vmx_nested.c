@@ -232,6 +232,66 @@ nested_vmx_result(struct vmx_vcpu *vcpu, int errnum)
 	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, rflags);
 }
 
+/*
+ * Sonda: stampa host-state, controlli e campi d'uscita del VMCS CORRENTE
+ * (vmread grezzo: chiamarla solo con un VMCS caricato). Con
+ * hw.vmm.vmx.nested_probe=1..3, vedi vmx.c.
+ */
+void
+nested_probe_dump(const char *tag)
+{
+	static const struct { uint32_t enc; const char *nm; } f[] = {
+		{ VMCS_HOST_CR0, "H_CR0" }, { VMCS_HOST_CR3, "H_CR3" },
+		{ VMCS_HOST_CR4, "H_CR4" }, { VMCS_HOST_RSP, "H_RSP" },
+		{ VMCS_HOST_RIP, "H_RIP" }, { VMCS_HOST_CS_SELECTOR, "H_CS" },
+		{ VMCS_HOST_SS_SELECTOR, "H_SS" }, { VMCS_HOST_DS_SELECTOR, "H_DS" },
+		{ VMCS_HOST_ES_SELECTOR, "H_ES" }, { VMCS_HOST_FS_SELECTOR, "H_FS" },
+		{ VMCS_HOST_GS_SELECTOR, "H_GS" }, { VMCS_HOST_TR_SELECTOR, "H_TR" },
+		{ VMCS_HOST_FS_BASE, "H_FSB" }, { VMCS_HOST_GS_BASE, "H_GSB" },
+		{ VMCS_HOST_TR_BASE, "H_TRB" }, { VMCS_HOST_GDTR_BASE, "H_GDTRB" },
+		{ VMCS_HOST_IDTR_BASE, "H_IDTRB" },
+		{ VMCS_HOST_IA32_SYSENTER_CS, "H_SECS" },
+		{ VMCS_HOST_IA32_SYSENTER_ESP, "H_SESP" },
+		{ VMCS_HOST_IA32_SYSENTER_EIP, "H_SEIP" },
+		{ VMCS_HOST_IA32_EFER, "H_EFER" }, { VMCS_HOST_IA32_PAT, "H_PAT" },
+		{ VMCS_HOST_IA32_PERF_GLOBAL_CTRL, "H_PGC" },
+		{ VMCS_PIN_BASED_CTLS, "PIN" }, { VMCS_PRI_PROC_BASED_CTLS, "PROC" },
+		{ VMCS_SEC_PROC_BASED_CTLS, "PROC2" }, { VMCS_EXIT_CTLS, "EXIT" },
+		{ VMCS_ENTRY_CTLS, "ENTRY" }, { VMCS_EPTP, "EPTP" },
+		{ VMCS_VPID, "VPID" }, { VMCS_LINK_POINTER, "LINK" },
+		{ VMCS_MSR_BITMAP, "MSRBM" },
+		{ VMCS_EXIT_MSR_LOAD_COUNT, "XMLC" },
+		{ VMCS_EXIT_MSR_STORE_COUNT, "XMSC" },
+		{ VMCS_ENTRY_MSR_LOAD_COUNT, "NMLC" },
+		{ VMCS_GUEST_RIP, "G_RIP" }, { VMCS_GUEST_RSP, "G_RSP" },
+		{ VMCS_GUEST_RFLAGS, "G_RFL" }, { VMCS_GUEST_CR0, "G_CR0" },
+		{ VMCS_GUEST_CR3, "G_CR3" }, { VMCS_GUEST_CR4, "G_CR4" },
+		{ VMCS_GUEST_IA32_EFER, "G_EFER" },
+		{ VMCS_GUEST_CS_SELECTOR, "G_CS" },
+		{ VMCS_GUEST_CS_ACCESS_RIGHTS, "G_CSAR" },
+		{ VMCS_GUEST_TR_ACCESS_RIGHTS, "G_TRAR" },
+		{ VMCS_GUEST_ACTIVITY, "G_ACT" },
+		{ VMCS_GUEST_INTERRUPTIBILITY, "G_INTR" },
+		{ VMCS_ENTRY_INTR_INFO, "N_INTINFO" },
+		{ VMCS_EXIT_REASON, "X_REASON" },
+		{ VMCS_EXIT_QUALIFICATION, "X_QUAL" },
+		{ VMCS_EXIT_INTR_INFO, "X_INTINFO" },
+		{ VMCS_IDT_VECTORING_INFO, "X_IDTVEC" },
+	};
+	uint64_t v;
+	int i;
+
+	for (i = 0; i < (int)nitems(f); i++) {
+		if (i % 6 == 0)
+			printf("%snested_probe %s:", i ? "\n" : "", tag);
+		if (vmread(f[i].enc, &v) == 0)
+			printf(" %s=%#lx", f[i].nm, v);
+		else
+			printf(" %s=ERR", f[i].nm);
+	}
+	printf("\n");
+}
+
 void
 nested_vmfail_invalid(struct vmx_vcpu *vcpu)
 {
@@ -789,6 +849,17 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		nested_advance_rip(vcpu);
 		return (0);
 	}
+	if (__predict_false(vmx_nested_probe == 1)) {
+		/* sonda 1: host-state VMCS02 contro VMCS01, poi VMfail (no L2) */
+		nested_probe_dump("VMCS02");
+		VMCLEAR(vmcs02);
+		VMPTRLD(vcpu->vmcs01);
+		nested_probe_dump("VMCS01");
+		VMCLEAR(vcpu->vmcs01);
+		nested_vmx_result(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+		nested_advance_rip(vcpu);
+		return (0);
+	}
 	VMCLEAR(vmcs02);			/* vmx_run lo ricarichera' */
 
 	/*
@@ -978,6 +1049,11 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmexit->rip = hrip;
 	vmexit->inst_length = 0;
 	vm_exit_intinfo(vcpu->vcpu, 0);
+	if (__predict_false(vmx_nested_probe == 3)) {
+		/* sonda 3: riflessione completata, VMCS01 pronto per l'L1 */
+		nested_probe_dump("REFLECT-VMCS01");
+		vm_suspend(vcpu->vmx->vm, VM_SUSPEND_POWEROFF);
+	}
 	SDT_PROBE1(vmm, vmx, nested, reflect, vcpu);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_REFLECTIONS, 1);
 }

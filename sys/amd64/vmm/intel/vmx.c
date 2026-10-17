@@ -174,6 +174,18 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, initialized, CTLFLAG_RD,
  *     sysctl hw.vmm.vmx.debug_trace=1
  * oppure hw.vmm.vmx.debug_trace="1" in /boot/loader.conf.
  */
+/*
+ * Sonde d'arresto controllato del nested (diagnostica, default 0). Ognuna
+ * stampa lo stato nel log del kernel e ferma la VM PRIMA del punto
+ * successivo, cosi' un guasto che resetta l'host si localizza senza dump:
+ *  1 = al VMLAUNCH: host-state e controlli di VMCS02 e VMCS01, poi VMfail;
+ *  2 = alla prima uscita da L2: motivo, qualificazione, RIP; VM spenta;
+ *  3 = dopo la riflessione a L1: stato del VMCS01; VM spenta.
+ */
+int vmx_nested_probe = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_probe, CTLFLAG_RWTUN,
+    &vmx_nested_probe, 0, "nested: sonda d'arresto (0=off, 1..3)");
+
 static int vmx_debug_trace = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, debug_trace, CTLFLAG_RWTUN,
     &vmx_debug_trace, 0,
@@ -2579,6 +2591,12 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* Uscite mentre il vCPU e' in L2: instradamento nested (§6.4) prima
 	 * dei rami dell'L1. Se riflessa all'L1, l'uscita e' gestita. */
 	if (vcpu->nested != NULL && vcpu->nested->in_l2) {
+		if (__predict_false(vmx_nested_probe == 2)) {
+			/* sonda 2: la prima uscita da L2 e' arrivata viva */
+			nested_probe_dump("L2-EXIT");
+			vm_suspend(vmx->vm, VM_SUSPEND_POWEROFF);
+			return (HANDLED);	/* il ciclo vede la sospensione */
+		}
 		if (nested_l2_exit(vcpu, vmexit)) {
 			if (vcpu->nested->in_l2)
 				return (HANDLED); /* gestita in L0, resta in L2 */

@@ -1,4 +1,9 @@
-# F2a — primo L2: ingresso base e campi di controllo.
+# F2a — primo L2: ingresso base e campi di controllo, UN TEST PER RIGA (un QEMU
+# per test), cosi' un crash indica esattamente quale test.
 # kut-run.sh --nested kut-f2a.list
 # nome | file.flat | args | qemu_params | smp | mem | timeout
-vmx | vmx.flat | null vmenter control_field_PAT control_field_EFER CR_shadowing | -cpu max | 1 | 1024 | 180
+null              | vmx.flat | null              | -cpu max | 1 | 1024 | 60
+vmenter           | vmx.flat | vmenter           | -cpu max | 1 | 1024 | 60
+control_field_PAT | vmx.flat | control_field_PAT | -cpu max | 1 | 1024 | 60
+control_field_EFER| vmx.flat | control_field_EFER| -cpu max | 1 | 1024 | 60
+CR_shadowing      | vmx.flat | CR_shadowing      | -cpu max | 1 | 1024 | 60
