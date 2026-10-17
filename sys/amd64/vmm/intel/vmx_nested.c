@@ -119,10 +119,17 @@ vmx_nested_init_msrs(struct vmx_nested *n)
 	/* proc-based primary, exit, entry: come l'host. */
 	m[0x482 - 0x480] = rdmsr(MSR_VMX_PROCBASED_CTLS);
 	m[0x48e - 0x480] = rdmsr(MSR_VMX_TRUE_PROCBASED_CTLS);
-	m[0x483 - 0x480] = rdmsr(MSR_VMX_EXIT_CTLS);
-	m[0x48f - 0x480] = rdmsr(MSR_VMX_TRUE_EXIT_CTLS);
-	m[0x484 - 0x480] = rdmsr(MSR_VMX_ENTRY_CTLS);
-	m[0x490 - 0x480] = rdmsr(MSR_VMX_TRUE_ENTRY_CTLS);
+	/*
+	 * Exit/entry: niente "clear IA32_BNDCFGS" (exit bit 23) ne' "load
+	 * IA32_BNDCFGS" (entry bit 16): lo stato MPX non e' commutato ne'
+	 * verificato per l'L2 (come KVM senza MPX). Prima li esponevamo e
+	 * l'L1 si vedeva accettare GUEST_BNDCFGS non validi
+	 * (vmx_guest_state_area_test).
+	 */
+	m[0x483 - 0x480] = rdmsr(MSR_VMX_EXIT_CTLS) & ~((1ULL << 23) << 32);
+	m[0x48f - 0x480] = rdmsr(MSR_VMX_TRUE_EXIT_CTLS) & ~((1ULL << 23) << 32);
+	m[0x484 - 0x480] = rdmsr(MSR_VMX_ENTRY_CTLS) & ~((1ULL << 16) << 32);
+	m[0x490 - 0x480] = rdmsr(MSR_VMX_TRUE_ENTRY_CTLS) & ~((1ULL << 16) << 32);
 
 	/* MISC: host senza PT (14), SMBASE (15), VMXOFF-unblock-SMI (28).
 	 * TENGO il rate del preemption timer (bit 0-4): se lo azzero, Hyper-V
@@ -1149,6 +1156,16 @@ nested_load_pdptes(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	    (vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_GUEST_LMA) != 0)
 		return;				/* non e' paging PAE */
 	efer = vmcs12_read_field(c, VMCS_GUEST_IA32_EFER);
+	/*
+	 * L'hardware verifica EFER PRIMA dei PDPTE: con load EFER e un EFER
+	 * incoerente (LMA o LME accesi per un L2 non IA-32e) l'ingresso fallisce
+	 * con qualificazione 0, non 2. Qui non si valutano i PDPTE: ci pensa
+	 * l'hardware sul VMCS02 (vmx_guest_state_area_test, 'EFER_LMA/LME
+	 * ... controls off').
+	 */
+	if ((vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_LOAD_EFER) &&
+	    (efer & (EFER_LMA | EFER_LME)) != 0)
+		return;
 	cr3 = vmcs12_read_field(c, VMCS_GUEST_CR3) & 0xffffffe0UL;
 	rsvd = 0x1e6ULL | (((1ULL << 63) - 1) & ~((1ULL << cpu_maxphyaddr) - 1));
 	if ((efer & EFER_NXE) == 0)
