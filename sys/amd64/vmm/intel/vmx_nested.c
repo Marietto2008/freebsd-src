@@ -230,6 +230,27 @@ nested_vmx_result(struct vmx_vcpu *vcpu, int errnum)
 
 	vm_get_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, &rflags);
 	rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_Z | PSL_N | PSL_V);
+	if (errnum != VMXR_SUCCEED && __predict_false(vmx_nested_probe == 7)) {
+		/* sonda 7: traccia i VMfail dati all'L1 (non ferma nulla) */
+		static int traced7;
+		struct vmcs12_cache *cp = nested_current_cache(vcpu->nested);
+		uint64_t rip = 0;
+
+		vm_get_register(vcpu->vcpu, VM_REG_GUEST_RIP, &rip);
+		if (traced7 < 64) {
+			traced7++;
+			printf("nested_probe VMFAIL#%d err=%d da=%p l1rip=%#lx "
+			    "entryinfo12=%#lx pin=%#lx proc=%#lx proc2=%#lx "
+			    "exit=%#lx entry=%#lx\n", traced7, errnum,
+			    __builtin_return_address(0), (u_long)rip,
+			    cp ? (u_long)vmcs12_read_field(cp, VMCS_ENTRY_INTR_INFO) : 0,
+			    cp ? (u_long)vmcs12_read_field(cp, VMCS_PIN_BASED_CTLS) : 0,
+			    cp ? (u_long)vmcs12_read_field(cp, VMCS_PRI_PROC_BASED_CTLS) : 0,
+			    cp ? (u_long)vmcs12_read_field(cp, VMCS_SEC_PROC_BASED_CTLS) : 0,
+			    cp ? (u_long)vmcs12_read_field(cp, VMCS_EXIT_CTLS) : 0,
+			    cp ? (u_long)vmcs12_read_field(cp, VMCS_ENTRY_CTLS) : 0);
+		}
+	}
 	if (errnum != VMXR_SUCCEED) {
 		/* SDM VMfail: VMfailValid(errnum) se c'e' un VMCS corrente,
 		 * altrimenti VMfailInvalid (non c'e' dove scrivere l'errore). */
