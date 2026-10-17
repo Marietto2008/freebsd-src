@@ -842,6 +842,54 @@ done:
  * VMfail all'L1 (in bring-up, piu' sicuro di sospendere la VM). Ritorna
  * sempre 0: l'esito e' nel RFLAGS dell'L1 (fallimento) o nell'ingresso in L2.
  */
+/*
+ * PAE senza EPT nel VMCS12: la CPU vera, al VM-entry, legge i 4 PDPTE dalla
+ * memoria di CR3 e ne verifica i bit riservati (SDM 26.3.1.6). Il VMCS02 usa
+ * sempre EPT (quella di L0), quindi la CPU li prenderebbe dai campi PDPTE del
+ * VMCS: li si legge qui (slow path, PRIMA del VMPTRLD: vm_gpa_hold puo'
+ * dormire) e la composizione li scrive. Prima si copiavano i campi PDPTE del
+ * VMCS12, senza senso in questo caso (kvm-unit-tests vmx_pae_test, che poi si
+ * bloccava). Riservati: bit 2:1, 8:5, da MAXPHYADDR a 62, e 63 senza EFER.NX.
+ */
+static void
+nested_load_pdptes(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t cr0, cr4, efer, cr3, *p, rsvd;
+	void *ck;
+	int i;
+
+	n->pdpte_mem = n->pdpte_bad = false;
+	cr0 = vmcs12_read_field(c, VMCS_GUEST_CR0);
+	cr4 = vmcs12_read_field(c, VMCS_GUEST_CR4);
+	if ((vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+	    PROCBASED_SECONDARY_CONTROLS) != 0 &&
+	    (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	    PROCBASED2_ENABLE_EPT) != 0)
+		return;				/* con EPT12: dal VMCS12 */
+	if ((cr0 & CR0_PG) == 0 || (cr4 & CR4_PAE) == 0 ||
+	    (vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_GUEST_LMA) != 0)
+		return;				/* non e' paging PAE */
+	efer = vmcs12_read_field(c, VMCS_GUEST_IA32_EFER);
+	cr3 = vmcs12_read_field(c, VMCS_GUEST_CR3) & 0xffffffe0UL;
+	rsvd = 0x1e6ULL | (((1ULL << 63) - 1) & ~((1ULL << cpu_maxphyaddr) - 1));
+	if ((efer & EFER_NXE) == 0)
+		rsvd |= 1ULL << 63;
+	p = vm_gpa_hold(vcpu->vcpu, cr3, 4 * sizeof(uint64_t), VM_PROT_READ,
+	    &ck);
+	if (p == NULL) {
+		n->pdpte_bad = true;
+		return;
+	}
+	for (i = 0; i < 4; i++) {
+		n->pdpte[i] = p[i];
+		if ((p[i] & 1) != 0 && (p[i] & rsvd) != 0)
+			n->pdpte_bad = true;
+	}
+	vm_gpa_release(ck);
+	n->pdpte_mem = true;
+}
+
 static int
 nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 {
@@ -909,6 +957,8 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	}
 	vmcs02 = (struct vmcs *)c->vmcs02;
 
+	nested_load_pdptes(vcpu, c);		/* puo' dormire: prima del VMPTRLD */
+
 	/* Shadow EPT: radice preparata QUI, dove si puo' dormire. Da VMPTRLD
 	 * in poi si e' in sezione critica (niente malloc ne' vm_gpa_hold). */
 	if (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
@@ -939,13 +989,16 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 * verso l'L1 con motivo 34 + bit 31 e qualificazione = indice 1-based.
 	 */
 	{
-		uint32_t fail = nested_msr_list_entry(vcpu, c);
+		/* PDPTE non validi: stato guest non valido (33), qualificazione 2,
+		 * PRIMA delle liste MSR (SDM: i controlli di stato vengono prima) */
+		uint32_t fail = n->pdpte_bad ? 2 : nested_msr_list_entry(vcpu, c);
+		uint32_t why = n->pdpte_bad ? EXIT_REASON_INVAL_VMCS :
+		    EXIT_REASON_INVAL_MSR;
 
 		if (fail != 0) {
 			vcpu->vmcs = vmcs02;	/* la riflessione usa il corrente */
 			n->in_l2 = true;
-			vmexit->u.vmx.exit_reason = EXIT_REASON_INVAL_MSR |
-			    0x80000000;
+			vmexit->u.vmx.exit_reason = why | 0x80000000;
 			n->synth = true;
 			n->synth_intr_info = 0;
 			n->synth_qual = fail;
@@ -2179,6 +2232,12 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	/* --- resto del guest-state copiato esplicitamente --- */
 	for (i = 0; i < (int)nitems(gstate); i++)
 		vmwrite(gstate[i], vmcs12_read_field(c, gstate[i]));
+	if (n->pdpte_mem) {			/* PAE senza EPT12: dalla memoria */
+		vmwrite(VMCS_GUEST_PDPTE0, n->pdpte[0]);
+		vmwrite(VMCS_GUEST_PDPTE1, n->pdpte[1]);
+		vmwrite(VMCS_GUEST_PDPTE2, n->pdpte[2]);
+		vmwrite(VMCS_GUEST_PDPTE3, n->pdpte[3]);
+	}
 	/* Senza load debug controls nel VMCS12, DR7/DEBUGCTL dell'L2 sono quelli
 	 * che l'L1 aveva (kvm-unit-tests 'debug controls'). */
 	if ((vmcs12_read_field(c, VMCS_ENTRY_CTLS) &

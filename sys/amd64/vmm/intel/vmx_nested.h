@@ -200,6 +200,9 @@ struct vmx_nested {
 					 * registri hardware */
 	uint64_t	l1_tsc_offset;	/* TSC offset del VMCS01 al VMLAUNCH */
 	uint64_t	exit_tsc;	/* TSC host all'ultima uscita da L2 */
+	uint64_t	pdpte[4];	/* PDPTE dell'L2 letti dalla memoria di CR3 */
+	bool		pdpte_mem;	/* ...da usare nel VMCS02 (PAE senza EPT12) */
+	bool		pdpte_bad;	/* uno ha bit riservati: VM-entry fallito */
 	bool		l1_tsc_dirty;	/* l1_tsc_offset cambiato (IA32_TSC in una
 					 * lista d'ingresso): da riportare nel
 					 * VMCS01 alla prossima uscita */
