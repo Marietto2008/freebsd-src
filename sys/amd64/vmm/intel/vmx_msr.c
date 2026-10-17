@@ -434,6 +434,16 @@ vmx_rdmsr(struct vmx_vcpu *vcpu, u_int num, uint64_t *val, bool *retu)
 	case MSR_PAT:
 		*val = vcpu->guest_msrs[IDX_MSR_PAT];
 		break;
+	case MSR_DEBUGCTLMSR:
+		/*
+		 * Il DEBUGCTL del guest vive nel VMCS (GUEST_IA32_DEBUGCTL, con
+		 * load/save debug controls). Prima non era gestito: il RDMSR
+		 * finiva in userland e QEMU rispondeva da una sua cache
+		 * scollegata dal VMCS (kvm-unit-tests 'debug controls').
+		 */
+		error = vm_get_register(vcpu->vcpu,
+		    VMCS_IDENT(VMCS_GUEST_IA32_DEBUGCTL), val);
+		break;
 	case MSR_IA32_FEATURE_CONTROL:
 		if (vcpu->nested != NULL)
 			*val = vcpu->nested->feature_control;
@@ -520,6 +530,15 @@ vmx_wrmsr(struct vmx_vcpu *vcpu, u_int num, uint64_t val, bool *retu)
 			vcpu->guest_msrs[IDX_MSR_TSC_AUX] = val;
 		else
 			vm_inject_gp(vcpu->vcpu);
+		break;
+	case MSR_DEBUGCTLMSR:
+		/*
+		 * Solo LBR (bit 0) e BTF (bit 1): BTS/trace e simili farebbero
+		 * scrivere la CPU in aree (IA32_DS_AREA) non commutate tra guest
+		 * e host. Gli altri bit si ignorano.
+		 */
+		error = vm_set_register(vcpu->vcpu,
+		    VMCS_IDENT(VMCS_GUEST_IA32_DEBUGCTL), val & 0x3);
 		break;
 	case MSR_IA32_FEATURE_CONTROL:
 		if (vcpu->nested != NULL) {
