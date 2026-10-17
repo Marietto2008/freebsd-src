@@ -207,6 +207,9 @@ struct vmx_nested {
 					 * dal VMLAUNCH/VMRESUME): se all'ingresso e'
 					 * cambiato, L0 ha completato un'istruzione */
 	uint64_t	exit_tsc;	/* TSC host all'ultima uscita da L2 */
+	bool		preempt_on;	/* timer di preemption dell'L1 attivo */
+	uint64_t	preempt_deadline; /* sua scadenza, TSC host assoluto */
+	int		preempt_rate;	/* IA32_VMX_MISC[4:0] */
 	uint64_t	pdpte[4];	/* PDPTE dell'L2 letti dalla memoria di CR3 */
 	bool		pdpte_mem;	/* ...da usare nel VMCS02 (PAE senza EPT12) */
 	bool		pdpte_bad;	/* uno ha bit riservati: VM-entry fallito */
@@ -240,6 +243,7 @@ int	vmx_nested_exit(void *vcpui);
 void	nested_vmx_result(struct vmx_vcpu *vcpu, int errnum);
 void	nested_vmfail_invalid(struct vmx_vcpu *vcpu);
 /* Eventi dell'L1 da consegnare prima di rientrare in L2 (vmx_run). */
+void	nested_preempt_refresh(struct vmx_vcpu *vcpu);
 bool	nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 	    uint64_t rip);
 /* Sonde d'arresto controllato (hw.vmm.vmx.nested_probe, vmx.c). */

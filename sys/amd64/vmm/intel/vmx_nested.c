@@ -1757,6 +1757,25 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
  * Ritorna true se l'uscita e' stata fatta: vmx_run deve uscire
  * (VM_EXITCODE_NESTED + restart_only, come dopo una riflessione).
  */
+/*
+ * Prima di ogni ingresso in L2 (vmx_run, interrupt spenti, VMCS02 corrente):
+ * residuo del timer di preemption dell'L1 = scadenza assoluta - adesso.
+ */
+void
+nested_preempt_refresh(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t now = rdtsc(), rem = 0;
+
+	if (!n->preempt_on)
+		return;
+	if (n->preempt_deadline > now)
+		rem = (n->preempt_deadline - now) >> n->preempt_rate;
+	if (rem > 0xffffffffULL)
+		rem = 0xffffffffULL;
+	vmwrite(VMCS_PREEMPTION_TIMER_VALUE, rem);
+}
+
 bool
 nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
     uint64_t rip)
@@ -2550,11 +2569,27 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	 * dell'host. Il valore iniziale e' quello del VMCS12.
 	 */
 	if ((vmcs12_read_field(c, VMCS_PIN_BASED_CTLS) &
-	    PINBASED_PREMPTION_TIMER) == 0)
+	    PINBASED_PREMPTION_TIMER) == 0) {
 		pin &= ~PINBASED_PREMPTION_TIMER;
-	else
-		vmwrite(VMCS_PREEMPTION_TIMER_VALUE,
-		    vmcs12_read_field(c, VMCS_PREEMPTION_TIMER_VALUE));
+		n->preempt_on = false;
+	} else
+	{
+		/*
+		 * Scadenza ASSOLUTA (TSC dell'host), come KVM: il timer
+		 * hardware si ferma mentre L0 gestisce un'uscita dell'L2, ma il
+		 * TSC dell'L2 avanza; senza correzione il timer scadeva in
+		 * ritardo di tutto il tempo passato in L0 (kvm-unit-tests
+		 * vmx_preemption_timer_expiry_test, 'Last stored guest TSC <
+		 * TSC deadline', intermittente). vmx_run riscrive il residuo a
+		 * ogni rientro (nested_preempt_refresh).
+		 */
+		uint64_t val = vmcs12_read_field(c, VMCS_PREEMPTION_TIMER_VALUE);
+
+		n->preempt_rate = (int)(n->vmx_msr[0x485 - 0x480] & 0x1f);
+		n->preempt_deadline = rdtsc() + (val << n->preempt_rate);
+		n->preempt_on = true;
+		vmwrite(VMCS_PREEMPTION_TIMER_VALUE, val);
+	}
 	vmwrite(VMCS_PIN_BASED_CTLS, pin);
 
 	/* --- Primary proc: VMCS12 U requisiti L0; I/O bitmaps=0, TPR shadow=0;
