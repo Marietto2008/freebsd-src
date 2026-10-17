@@ -860,6 +860,12 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	}
 	vmcs02 = (struct vmcs *)c->vmcs02;
 
+	/* Shadow EPT: radice preparata QUI, dove si puo' dormire. Da VMPTRLD
+	 * in poi si e' in sezione critica (niente malloc ne' vm_gpa_hold). */
+	if (vmcs12_read_field(c, VMCS_SEC_PROC_BASED_CTLS) &
+	    PROCBASED2_ENABLE_EPT)
+		vmx_vept_prepare(vcpu);
+
 	VMPTRLD(vmcs02);
 	nested_compose_vmcs02(vcpu);
 	/* host-state PER-CPU + HOST_CR3 (dipendono dalla CPU d'ingresso) */
@@ -1266,11 +1272,13 @@ nested_bitmaps_unmap(struct vmcs12_cache *c)
 		vm_gpa_release(c->ck_st);
 	if (c->ck_ld != NULL)
 		vm_gpa_release(c->ck_ld);
+	if (c->ck_en != NULL)
+		vm_gpa_release(c->ck_en);
 	c->bm_io_a = c->bm_io_b = c->bm_msr = NULL;
 	c->ck_io_a = c->ck_io_b = c->ck_msr = NULL;
-	c->msr_st = c->msr_ld = NULL;
-	c->ck_st = c->ck_ld = NULL;
-	c->n_st = c->n_ld = 0;
+	c->msr_st = c->msr_ld = c->msr_en = NULL;
+	c->ck_st = c->ck_ld = c->ck_en = NULL;
+	c->n_st = c->n_ld = c->n_en = 0;
 }
 
 /*
@@ -1362,22 +1370,16 @@ nested_msr_rw(struct vmx_vcpu *vcpu, uint32_t idx, uint64_t *val, bool wr,
 static uint32_t
 nested_msr_list_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 {
-	struct msr_entry *l;
-	void *ck;
+	struct msr_entry *l = c->msr_en;	/* mappata da nested_bitmaps_map */
 	uint64_t v;
-	uint32_t i, n, fail = 0;
+	uint32_t i, fail = 0;
 
-	if (nested_msr_list_map(vcpu, c, VMCS_ENTRY_MSR_LOAD,
-	    VMCS_ENTRY_MSR_LOAD_COUNT, VM_PROT_READ, &l, &ck, &n) != 0)
-		return (1);
-	for (i = 0; i < n && fail == 0; i++) {
+	for (i = 0; i < c->n_en && fail == 0; i++) {
 		v = l[i].val;
 		if (l[i].reserved != 0 ||
 		    nested_msr_rw(vcpu, l[i].index, &v, true, false) != 0)
 			fail = i + 1;
 	}
-	if (n != 0)
-		vm_gpa_release(ck);
 	return (fail);
 }
 
@@ -1444,7 +1446,10 @@ nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	    &c->msr_st, &c->ck_st, &c->n_st) != 0 ||
 	    nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_LOAD,
 	    VMCS_EXIT_MSR_LOAD_COUNT, VM_PROT_READ,
-	    &c->msr_ld, &c->ck_ld, &c->n_ld) != 0)
+	    &c->msr_ld, &c->ck_ld, &c->n_ld) != 0 ||
+	    nested_msr_list_map(vcpu, c, VMCS_ENTRY_MSR_LOAD,
+	    VMCS_ENTRY_MSR_LOAD_COUNT, VM_PROT_READ,
+	    &c->msr_en, &c->ck_en, &c->n_en) != 0)
 		goto fail;
 	return (0);
 fail:

@@ -45,21 +45,19 @@ MALLOC_DEFINE(M_VMX_VEPT, "vmx_vept", "Intel VMX nested shadow EPT");
 #define	EPT_ADDR(e)	((e) & 0x000ffffffffff000ULL)
 #define	EPT_IDX(gpa, lvl)	(((gpa) >> (12 + 9 * (lvl))) & 0x1ff)
 
-/* Shadow EPTP (radice) da usare in VMCS02: WB, 4 livelli. */
-uint64_t
-vmx_vept_eptp(struct vmx_vcpu *vcpu)
+/*
+ * Prepara la radice shadow per l'EPTP12 corrente: la alloca VUOTA se manca, la
+ * svuota (tenendola) se l'L1 ha cambiato EPT. PUO' DORMIRE (malloc/free):
+ * va chiamata nello slow path PRIMA del VMPTRLD del VMCS02, perche' VMPTRLD
+ * fa critical_enter (panic "malloc: called with spinlock or critical section
+ * held", kvm-unit-tests 'EPT A/D disabled'). Con radice valida l'L2 entra e la
+ * shadow si riempie a domanda in vmx_vept_fault; tornare un EPTP invalido
+ * farebbe fallire ogni ingresso (uovo-e-gallina).
+ */
+void
+vmx_vept_prepare(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
-
-	/*
-	 * Alloca la radice shadow VUOTA ORA (prima del VMLAUNCH), se manca.
-	 * Tornare 0 darebbe un EPTP invalido: il VM-entry dell'L2 fallirebbe,
-	 * l'L2 non girerebbe mai, quindi nessuna EPT violation -> la radice
-	 * non verrebbe MAI allocata (uovo-e-gallina -> hang dell'host).
-	 * Con radice valida l'L2 entra e la shadow si riempie a domanda in
-	 * vmx_vept_fault. Fisso vept_eptp12 al VMCS12 corrente cosi' il primo
-	 * fault non la scarta e non cambia l'indirizzo gia' scritto nel VMCS02.
-	 */
 	struct vmcs12_cache *c = nested_current_cache(n);
 	uint64_t eptp12 = (c != NULL) ? vmcs12_read_field(c, VMCS_EPTP) : 0;
 
@@ -68,11 +66,21 @@ vmx_vept_eptp(struct vmx_vcpu *vcpu)
 		    M_VMX_VEPT, M_WAITOK | M_ZERO);
 		n->vept_eptp12 = eptp12;
 	} else if (n->vept_eptp12 != eptp12) {
-		/* l'L1 ha cambiato EPT: la shadow rispecchia quello vecchio.
-		 * Si svuota tenendo la radice (l'EPTP del VMCS02 resta valido). */
+		/* l'L1 ha cambiato EPT: la shadow rispecchia quello vecchio */
 		vmx_vept_invept(n);
 		n->vept_eptp12 = eptp12;
 	}
+}
+
+/* Shadow EPTP (radice) da scrivere nel VMCS02: WB, 4 livelli. Non dorme:
+ * la radice l'ha gia' preparata vmx_vept_prepare. */
+uint64_t
+vmx_vept_eptp(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+
+	KASSERT(n->vept_root != NULL, ("%s: radice shadow non preparata",
+	    __func__));
 	return (vtophys(n->vept_root) | EPT_PG_MEMORY_TYPE(6) | (3UL << 3));
 }
 
@@ -208,7 +216,7 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa)
 		return (1);
 	eptp12 = vmcs12_read_field(c, VMCS_EPTP);
 	if (n->vept_root == NULL || n->vept_eptp12 != eptp12)
-		(void)vmx_vept_eptp(vcpu);	/* allinea radice ed EPTP12 */
+		vmx_vept_prepare(vcpu);	/* allinea radice ed EPTP12 */
 
 	r = ept12_translate(vcpu, eptp12, l2gpa, &l1gpa, &perm);
 	if (r != 0)

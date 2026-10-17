@@ -101,6 +101,7 @@ bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa); /* slow path */
 void	vmx_vept_flush(struct vmx_nested *n);
 void	vmx_vept_invept(struct vmx_nested *n);	/* svuota, tiene la radice */
+void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
 struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
 uint64_t vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc);
@@ -140,6 +141,10 @@ struct vmcs12_cache {
 	struct msr_entry *msr_st, *msr_ld;	/* struct di vmcs.h, 16 byte */
 	void		*ck_st, *ck_ld;
 	uint32_t	n_st, n_ld;
+	/* lista d'ingresso: mappata PRIMA del VMPTRLD (che fa critical_enter) */
+	struct msr_entry *msr_en;
+	void		*ck_en;
+	uint32_t	n_en;
 };
 
 /*
