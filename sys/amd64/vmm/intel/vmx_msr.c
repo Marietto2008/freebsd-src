@@ -522,9 +522,27 @@ vmx_wrmsr(struct vmx_vcpu *vcpu, u_int num, uint64_t val, bool *retu)
 			vm_inject_gp(vcpu->vcpu);
 		break;
 	case MSR_IA32_FEATURE_CONTROL:
-		if (vcpu->nested != NULL)
-			vm_inject_gp(vcpu->vcpu);	/* bloccata da LOCK */
-		else
+		if (vcpu->nested != NULL) {
+			/*
+			 * L'MSR si presenta gia' bloccato (LOCK|VMX_EN) perche'
+			 * edk2-bhyve non lo scrive. SeaBIOS/OVMF sotto QEMU invece
+			 * lo riscrivono SEMPRE all'avvio (fw_cfg
+			 * etc/msr_feature_control = LOCKED|VMXON_OUTSIDE_SMX
+			 * [+LMCE/SGX]): un #GP li', senza IDT, e' un triple fault
+			 * nel BIOS (kvm-unit-tests F1 non partiva). Accetto la
+			 * riscrittura che conferma lo stato; i bit che non
+			 * emuliamo (SMX, LMCE, SGX) si ignorano. Togliere LOCK o
+			 * VMX_EN, o bit ignoti -> #GP come sull'hardware.
+			 */
+			uint64_t keep = IA32_FEATURE_CONTROL_LOCK |
+			    IA32_FEATURE_CONTROL_VMX_EN;
+			uint64_t ign = IA32_FEATURE_CONTROL_SMX_EN |
+			    IA32_FEATURE_CONTROL_LMCE_EN |
+			    (1UL << 17) | (1UL << 18);	/* SGX_LC, SGX */
+			if ((val & keep) != keep || (val & ~(keep | ign)) != 0)
+				vm_inject_gp(vcpu->vcpu);
+			/* altrimenti: conferma idempotente, valore invariato */
+		} else
 			error = EINVAL;
 		break;
 	case MSR_VMX_BASIC ... MSR_VMX_BASIC + 0x11:	/* MSR VMX: sola lettura */
