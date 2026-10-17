@@ -1590,9 +1590,37 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	    vmcs12_read_field(c, VMCS_HOST_IA32_SYSENTER_ESP));
 	vmwrite(VMCS_GUEST_IA32_SYSENTER_EIP,
 	    vmcs12_read_field(c, VMCS_HOST_IA32_SYSENTER_EIP));
-	/* EFER/PAT secondo gli exit controls di VMCS12 */
-	efer = vmcs12_read_field(c, VMCS_HOST_IA32_EFER);
-	vmwrite(VMCS_GUEST_IA32_EFER, efer);
+	/*
+	 * EFER (SDM 28.5.1): HOST_EFER solo con "load IA32_EFER"; altrimenti
+	 * resta quello dell'L1 (ancora nel VMCS01) con LMA = LME = host
+	 * address-space size. Prima HOST_EFER si caricava sempre: con valori
+	 * di prova senza load EFER l'L1 ripartiva con un EFER incoerente, il
+	 * VM-entry nel VMCS01 falliva (motivo 33) e QEMU riprovava
+	 * all'infinito (kvm-unit-tests vmx_host_state_area_test, 470 MB di
+	 * seriale). Il controllo "IA-32e mode guest" del VMCS01 deve
+	 * coincidere con EFER.LMA.
+	 */
+	{
+		bool lm = (vmcs12_read_field(c, VMCS_EXIT_CTLS) &
+		    VM_EXIT_HOST_LMA) != 0;
+		uint32_t ent01;
+
+		if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_LOAD_EFER)
+			efer = vmcs12_read_field(c, VMCS_HOST_IA32_EFER);
+		else {
+			efer = vmcs_read(VMCS_GUEST_IA32_EFER);
+			efer &= ~(EFER_LMA | EFER_LME);
+			if (lm)
+				efer |= EFER_LMA | EFER_LME;
+		}
+		vmwrite(VMCS_GUEST_IA32_EFER, efer);
+		ent01 = (uint32_t)vmcs_read(VMCS_ENTRY_CTLS);
+		if (lm)
+			ent01 |= VM_ENTRY_GUEST_LMA;
+		else
+			ent01 &= ~VM_ENTRY_GUEST_LMA;
+		vmwrite(VMCS_ENTRY_CTLS, ent01);
+	}
 	/* SDM "Loading Host State": all'uscita DR7 = 0x400, DEBUGCTL = 0. */
 	vmwrite(VMCS_GUEST_DR7, 0x400);
 	vmwrite(VMCS_GUEST_IA32_DEBUGCTL, 0);

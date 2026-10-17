@@ -1,0 +1,5 @@
+# F2c — suite VMX completa, UN TEST PER RIGA (generata da x86/vmx_tests.c 5a22134).
+# Esclusioni = voce [vmx] di unittests.cfg. Gli ept_access* richiedono
+# MAXPHYADDR >= 40: sull'i9-9900K (39 bit) vengono saltati anche da KVM.
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+vmx_host_state_area_test                    | vmx.flat | vmx_host_state_area_test                    | -cpu max | 1 | 1024 | 120
