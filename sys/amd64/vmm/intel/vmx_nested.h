@@ -204,6 +204,10 @@ struct vmx_nested {
 	uint64_t	pdpte[4];	/* PDPTE dell'L2 letti dalla memoria di CR3 */
 	bool		pdpte_mem;	/* ...da usare nel VMCS02 (PAE senza EPT12) */
 	bool		pdpte_bad;	/* uno ha bit riservati: VM-entry fallito */
+	bool		gs_bad;		/* stato guest non valido rilevato in
+					 * software (campi che il VMCS02 non usa
+					 * cosi' come sono: GUEST_PAT) */
+	uint64_t	l1_efer;	/* EFER dell'L1 al VMLAUNCH */
 	bool		launching;	/* VMLAUNCH in corso: se il primo ingresso
 					 * fallisce il VMCS12 torna clear */
 	bool		l1_tsc_dirty;	/* l1_tsc_offset cambiato (IA32_TSC in una

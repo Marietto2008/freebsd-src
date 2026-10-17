@@ -1243,6 +1243,25 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	vmcs02 = (struct vmcs *)c->vmcs02;
 
 	nested_load_pdptes(vcpu, c);		/* puo' dormire: prima del VMPTRLD */
+	vm_get_register(vcpu->vcpu, VM_REG_GUEST_EFER, &n->l1_efer);
+	/*
+	 * Stato guest che l'hardware NON puo' verificare sul VMCS02 perche' la
+	 * composizione non lo copia: il PAT dell'L2 e' virtuale (guest_msrs),
+	 * il VMCS02 non lo carica mai. Con load PAT ogni byte di GUEST_PAT
+	 * dev'essere un tipo valido (SDM 26.3.1.1; vmx_guest_state_area_test).
+	 */
+	n->gs_bad = false;
+	if (vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_LOAD_PAT) {
+		uint64_t pat = vmcs12_read_field(c, VMCS_GUEST_IA32_PAT);
+		int b;
+
+		for (b = 0; b < 8; b++) {
+			uint8_t t = (pat >> (b * 8)) & 0xff;
+
+			if (t == 2 || t == 3 || t > 7)
+				n->gs_bad = true;
+		}
+	}
 
 	/* Shadow EPT: radice preparata QUI, dove si puo' dormire. Da VMPTRLD
 	 * in poi si e' in sezione critica (niente malloc ne' vm_gpa_hold). */
@@ -1276,11 +1295,13 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	{
 		/* PDPTE non validi: stato guest non valido (33), qualificazione 2,
 		 * PRIMA delle liste MSR (SDM: i controlli di stato vengono prima) */
-		uint32_t fail = n->pdpte_bad ? 2 : nested_msr_list_entry(vcpu, c);
-		uint32_t why = n->pdpte_bad ? EXIT_REASON_INVAL_VMCS :
+		bool st = n->gs_bad || n->pdpte_bad;
+		uint32_t fail = n->gs_bad ? 0 : n->pdpte_bad ? 2 :
+		    nested_msr_list_entry(vcpu, c);
+		uint32_t why = st ? EXIT_REASON_INVAL_VMCS :
 		    EXIT_REASON_INVAL_MSR;
 
-		if (fail != 0) {
+		if (st || fail != 0) {
 			vcpu->vmcs = vmcs02;	/* la riflessione usa il corrente */
 			n->in_l2 = true;
 			vmexit->u.vmx.exit_reason = why | 0x80000000;
@@ -2564,6 +2585,23 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	/* --- resto del guest-state copiato esplicitamente --- */
 	for (i = 0; i < (int)nitems(gstate); i++)
 		vmwrite(gstate[i], vmcs12_read_field(c, gstate[i]));
+	/*
+	 * Senza "load IA32_EFER" nel VMCS12 l'EFER dell'L2 NON viene dal
+	 * VMCS12 (SDM 26.3.2.1): resta quello dell'L1, con LMA = IA-32e mode
+	 * guest e, se CR0.PG, anche LME. Il VMCS02 carica EFER comunque: prima
+	 * vi finiva GUEST_EFER del VMCS12 e l'hardware rifiutava l'ingresso
+	 * (vmx_guest_state_area_test, 'VM-Exit failure on vmresume').
+	 */
+	if ((vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_LOAD_EFER) == 0) {
+		uint64_t e = n->l1_efer & ~(EFER_LMA | EFER_LME);
+
+		if (vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_GUEST_LMA) {
+			e |= EFER_LMA;
+			if (vmcs12_read_field(c, VMCS_GUEST_CR0) & CR0_PG)
+				e |= EFER_LME;
+		}
+		vmwrite(VMCS_GUEST_IA32_EFER, e);
+	}
 	if (n->pdpte_mem) {			/* PAE senza EPT12: dalla memoria */
 		vmwrite(VMCS_GUEST_PDPTE0, n->pdpte[0]);
 		vmwrite(VMCS_GUEST_PDPTE1, n->pdpte[1]);
