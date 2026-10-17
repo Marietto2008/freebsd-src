@@ -81,7 +81,13 @@ vmx_vept_eptp(struct vmx_vcpu *vcpu)
 
 	KASSERT(n->vept_root != NULL, ("%s: radice shadow non preparata",
 	    __func__));
-	return (vtophys(n->vept_root) | EPT_PG_MEMORY_TYPE(6) | (3UL << 3));
+	/*
+	 * Formato EPTP (SDM 24.6.11): bit 2:0 tipo di memoria (6 = WB), bit 5:3
+	 * lunghezza del cammino - 1 (3). NON EPT_PG_MEMORY_TYPE, che e' per le
+	 * voci foglia (bit 5:3): dava 0x38 = UC con cammino 8, EPTP non valido
+	 * (INVEPT -> VM-instruction error 28, kvm-unit-tests EPT A/D disabled).
+	 */
+	return (vtophys(n->vept_root) | 6UL | (3UL << 3));
 }
 
 /* Svuota le sottotabelle della radice (non la radice) e la azzera. */

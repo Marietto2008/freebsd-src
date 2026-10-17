@@ -3398,11 +3398,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		uint64_t cur = vmcs_read(VMCS_EPTP);
 
 		/*
-		 * L'EPTP si ricava dallo stato (radice shadow), non dal VMCS02:
-		 * un EPTP non valido nel VMCS02 faceva panicare invept()
-		 * ('invept error 2', core.txt.8, kvm-unit-tests EPT A/D disabled).
-		 * Se il VMCS02 non contiene la radice shadow qualcuno l'ha
-		 * sovrascritto: lo si dice forte e lo si ripristina.
+		 * L'EPTP si ricava dalla radice shadow; se il VMCS02 contiene
+		 * altro qualcuno l'ha sovrascritto: lo si dice e lo si ripristina.
 		 */
 		ed.eptp = vmx_vept_eptp(vcpu);
 		ed._res = 0;
@@ -3414,27 +3411,7 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 				    (u_long)cur, (u_long)ed.eptp, vcpu->vcpuid);
 			vmcs_write(VMCS_EPTP, ed.eptp);
 		}
-		{
-			/* come invept() ma senza panic: se la CPU rifiuta, si
-			 * stampa l'errore VMX e si ripiega su all-context */
-			int ierr;
-
-			__asm __volatile("invept %[desc], %[type];"
-			    VMX_SET_ERROR_CODE
-			    : [error] "=r" (ierr)
-			    : [desc] "m" (ed), [type] "r" (INVEPT_TYPE_SINGLE_CONTEXT)
-			    : "memory");
-			if (ierr != 0) {
-				static int iwarned;
-				if (iwarned++ < 8)
-					printf("nested: INVEPT single(%#lx) err %d "
-					    "insn_error %lu (vcpu%d)\n",
-					    (u_long)ed.eptp, ierr,
-					    (u_long)vmcs_read(VMCS_INSTRUCTION_ERROR),
-					    vcpu->vcpuid);
-				invept(INVEPT_TYPE_ALL_CONTEXTS, ed);
-			}
-		}
+		invept(INVEPT_TYPE_SINGLE_CONTEXT, ed);
 	}
 	do {
 		/*
