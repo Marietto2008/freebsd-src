@@ -948,14 +948,17 @@ nested_check_vmentry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 				void *ck;
 				uint8_t vtpr;
 
+				/* pagina non RAM: la CPU legge cio' che c'e';
+				 * non e' un errore di formato -> niente VMfail */
 				pg = vm_gpa_hold(vcpu->vcpu, va, PAGE_SIZE,
 				    VM_PROT_READ, &ck);
-				if (pg == NULL)
-					return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-				vtpr = pg[0x80];
-				vm_gpa_release(ck);
-				if ((thr & 0xf) > (uint32_t)(vtpr >> 4))
-					return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+				if (pg != NULL) {
+					vtpr = pg[0x80];
+					vm_gpa_release(ck);
+					if ((thr & 0xf) > (uint32_t)(vtpr >> 4))
+						return (
+						    VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+				}
 			}
 		}
 	} else if (proc2 & (PROCBASED2_VIRTUALIZE_X2APIC_MODE |
@@ -1941,6 +1944,8 @@ nested_msr_list_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	uint64_t v;
 	uint32_t i, fail = 0;
 
+	if (c->ml_en_bad)
+		return (1);		/* lista non leggibile: prima voce */
 	vcpu->nested->msr_phase = 1;
 	for (i = 0; i < ml->n && fail == 0; i++) {
 		e = nested_msr_ent(ml, i);
@@ -1991,42 +1996,39 @@ nested_bitmaps_map(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	uint32_t p12;
 	uint64_t gpa;
 
+	/*
+	 * Il FORMATO degli indirizzi (allineamento, MAXPHYADDR) lo verifica
+	 * nested_check_vmentry; qui una mappatura fallita (indirizzo valido ma
+	 * non RAM) NON e' un VMfail: la CPU vera accetta l'indirizzo e legge
+	 * quello che c'e' (kvm-unit-tests vmx_controls_test, 'vmlaunch
+	 * succeeds'). Bitmap non mappata = percorso veloce conservativo
+	 * (riflette all'L1); liste d'uscita non mappate = ignorate; lista
+	 * d'ingresso non mappata = VM-entry fallito, motivo 34 (ml_en_bad).
+	 */
 	nested_bitmaps_unmap(c);
+	c->ml_en_bad = false;
 	p12 = (uint32_t)vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS);
 	if (p12 & PROCBASED_IO_BITMAPS) {
 		gpa = vmcs12_read_field(c, VMCS_IO_BITMAP_A);
-		if ((gpa & PAGE_MASK) != 0 || (c->bm_io_a = vm_gpa_hold(
-		    vcpu->vcpu, gpa, PAGE_SIZE, VM_PROT_READ, &c->ck_io_a)) ==
-		    NULL)
-			goto fail;
+		c->bm_io_a = vm_gpa_hold(vcpu->vcpu, trunc_page(gpa), PAGE_SIZE,
+		    VM_PROT_READ, &c->ck_io_a);
 		gpa = vmcs12_read_field(c, VMCS_IO_BITMAP_B);
-		if ((gpa & PAGE_MASK) != 0 || (c->bm_io_b = vm_gpa_hold(
-		    vcpu->vcpu, gpa, PAGE_SIZE, VM_PROT_READ, &c->ck_io_b)) ==
-		    NULL)
-			goto fail;
+		c->bm_io_b = vm_gpa_hold(vcpu->vcpu, trunc_page(gpa), PAGE_SIZE,
+		    VM_PROT_READ, &c->ck_io_b);
 	}
 	if (p12 & PROCBASED_MSR_BITMAPS) {
 		gpa = vmcs12_read_field(c, VMCS_MSR_BITMAP);
-		if ((gpa & PAGE_MASK) != 0 || (c->bm_msr = vm_gpa_hold(
-		    vcpu->vcpu, gpa, PAGE_SIZE, VM_PROT_READ, &c->ck_msr)) ==
-		    NULL)
-			goto fail;
+		c->bm_msr = vm_gpa_hold(vcpu->vcpu, trunc_page(gpa), PAGE_SIZE,
+		    VM_PROT_READ, &c->ck_msr);
 	}
-	/* liste MSR d'uscita: usate dalla riflessione, nel percorso veloce */
-	if (nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_STORE,
-	    VMCS_EXIT_MSR_STORE_COUNT, VM_PROT_READ | VM_PROT_WRITE,
-	    &c->ml_st) != 0 ||
-	    nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_LOAD,
-	    VMCS_EXIT_MSR_LOAD_COUNT, VM_PROT_READ,
-	    &c->ml_ld) != 0 ||
-	    nested_msr_list_map(vcpu, c, VMCS_ENTRY_MSR_LOAD,
-	    VMCS_ENTRY_MSR_LOAD_COUNT, VM_PROT_READ,
-	    &c->ml_en) != 0)
-		goto fail;
+	(void)nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_STORE,
+	    VMCS_EXIT_MSR_STORE_COUNT, VM_PROT_READ | VM_PROT_WRITE, &c->ml_st);
+	(void)nested_msr_list_map(vcpu, c, VMCS_EXIT_MSR_LOAD,
+	    VMCS_EXIT_MSR_LOAD_COUNT, VM_PROT_READ, &c->ml_ld);
+	if (nested_msr_list_map(vcpu, c, VMCS_ENTRY_MSR_LOAD,
+	    VMCS_ENTRY_MSR_LOAD_COUNT, VM_PROT_READ, &c->ml_en) != 0)
+		c->ml_en_bad = true;
 	return (0);
-fail:
-	nested_bitmaps_unmap(c);
-	return (-1);
 }
 
 /* Percorso veloce: bit di una bitmap gia' mappata. true se impostato o se la

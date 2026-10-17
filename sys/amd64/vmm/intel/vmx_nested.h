@@ -161,6 +161,7 @@ struct vmcs12_cache {
 	/* store/load all'uscita, load all'ingresso: mappate PRIMA del VMPTRLD
 	 * (che fa critical_enter) e lette anche dal percorso veloce */
 	struct nested_msr_list ml_st, ml_ld, ml_en;
+	bool		ml_en_bad;	/* lista d'ingresso non mappabile */
 };
 
 /*
