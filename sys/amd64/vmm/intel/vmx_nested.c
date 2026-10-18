@@ -1917,33 +1917,6 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 			return (false);
 	}
 
-	/*
-	 * RINVIO (come nested_run_pending di KVM): se il VMCS02 ha ancora
-	 * un'iniezione verso l'L2 da consegnare -- quella composta dal VMCS12
-	 * al VMRESUME, o una reiniezione di L0 (exitintinfo/eccezione) -- NON
-	 * si riflette l'interrupt dell'L1 adesso. Sulla CPU vera l'L1 non puo'
-	 * preemptare l'L2 tra la VM-entry e la consegna dell'evento iniettato:
-	 * l'evento entra, l'L2 gira, e l'interrupt dell'L1 si riflette alla
-	 * PROSSIMA uscita naturale (resta pendente nel vlapic). Prima si
-	 * rifletteva subito: Hyper-V iniettava il clock IPI 0xd2 nel VP1 della
-	 * root, l'uscita sintetica lo scavalcava, il vettore restava in
-	 * servizio senza EOI -> CLOCK_WATCHDOG_TIMEOUT sul proc. 1. L'iniezione
-	 * entry del VMCS02 e l'exitintinfo vengono consumati dall'ingresso /
-	 * da vmx_inject_interrupts: al giro dopo il rinvio non scatta piu' e
-	 * l'interrupt si riflette. (Il tentativo 3f8cc22 forzava invece
-	 * un'uscita col preemption timer a 0: entrava anche quando l'evento
-	 * non era consegnabile -> double fault 0x7F; rimosso, 1d8c4c7.)
-	 */
-	{
-		uint64_t i1 = 0, i2 = 0;
-
-		if ((vmcs_read(VMCS_ENTRY_INTR_INFO) & VMCS_INTR_VALID) != 0)
-			return (false);
-		vm_get_intinfo(vcpu->vcpu, &i1, &i2);
-		if (((i1 | i2) & VM_INTINFO_VALID) != 0)
-			return (false);
-	}
-
 	n->synth_intr_info = 0;
 	n->synth_qual = 0;
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) &
