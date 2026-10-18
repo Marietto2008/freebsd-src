@@ -247,6 +247,7 @@ void	nested_vmx_result(struct vmx_vcpu *vcpu, int errnum);
 void	nested_vmfail_invalid(struct vmx_vcpu *vcpu);
 /* Eventi dell'L1 da consegnare prima di rientrare in L2 (vmx_run). */
 void	nested_preempt_refresh(struct vmx_vcpu *vcpu);
+bool	nested_l1_intercepts_extint(struct vmx_vcpu *vcpu);
 bool	nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 	    uint64_t rip);
 /* Sonde d'arresto controllato (hw.vmm.vmx.nested_probe, vmx.c). */

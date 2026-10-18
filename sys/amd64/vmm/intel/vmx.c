@@ -1641,6 +1641,23 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 			vmx_set_nmi_window_exiting(vcpu);
 	}
 
+	/*
+	 * Nested: in L2, se l'L1 intercetta gli interrupt esterni (VMCS12), gli
+	 * interrupt del SUO vlapic sono suoi: li consegna nested_check_events con
+	 * un'uscita sintetica, mai iniettati qui nell'L2. Il controllo di
+	 * nested_check_events e questo sono due letture distinte e il callout
+	 * del timer dell'L1 gira su un'altra CPU dell'host (disable_intr non lo
+	 * ferma): un interrupt arrivato in mezzo veniva iniettato nell'L2 e
+	 * accettato nel vlapic dell'L1, che restava con il vettore in ISR senza
+	 * saperlo (PPR bloccato). Windows 11 + Hyper-V: 0xef (timer di Hyper-V)
+	 * in ISR, PPR 0xe0, entrambe le CPU in HLT per sempre. Qui lo si lascia
+	 * in attesa: l'IPI di notifica gia' arrivato fa uscire subito e al giro
+	 * dopo nested_check_events lo consegna all'L1.
+	 */
+	if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+	    nested_l1_intercepts_extint(vcpu))
+		return;
+
 	extint_pending = vm_extint_pending(vcpu->vcpu);
 
 	if (!extint_pending && virtual_interrupt_delivery) {
@@ -3505,8 +3522,10 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * Nested: un interrupt dell'L1 che l'L1 intercetta (EXTINT
 		 * exiting nel VMCS12) NON va iniettato in L2 ma consegnato
 		 * all'L1 con un'uscita sintetica. Il VMCS corrente cambia: si
-		 * esce come dopo una riflessione. Qui, a interrupt spenti, cosi'
-		 * nulla diventa pendente tra il controllo e l'iniezione.
+		 * esce come dopo una riflessione. NB: disable_intr non impedisce
+		 * ad altre CPU (callout del timer) di rendere pendente un
+		 * interrupt dopo il controllo: per questo vmx_inject_interrupts
+		 * non inietta mai nell'L2 gli interrupt che l'L1 intercetta.
 		 */
 		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
 		    nested_check_events(vcpu, vmexit, rip)) {

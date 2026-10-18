@@ -2435,6 +2435,16 @@ nested_invept(struct vmx_vcpu *vcpu)
  *    dell'L1, non quelli della shadow. Il VMCS02 conserva i campi d'uscita
  *    anche dopo VMCLEAR/VMPTRLD.
  */
+/* true se l'L1 intercetta gli interrupt esterni dell'L2 (pin del VMCS12) */
+bool
+nested_l1_intercepts_extint(struct vmx_vcpu *vcpu)
+{
+	struct vmcs12_cache *c = nested_current_cache(vcpu->nested);
+
+	return (c != NULL && (vmcs12_read_field(c, VMCS_PIN_BASED_CTLS) &
+	    PINBASED_EXTINT_EXITING) != 0);
+}
+
 /*
  * Sonda 9 (SOLO slow path, prime 8 volte): EPT violation di L2 che sta per
  * essere riflessa all'L1. Rifa' in software il percorso delle tabelle delle
