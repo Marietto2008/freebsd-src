@@ -1290,6 +1290,23 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		}
 	}
 
+	/* Pagina host della virtual-APIC dell'L1 (TPR shadow nel VMCS02, vedi
+	 * nested_compose_vmcs02): QUI, prima del VMPTRLD, perche' vm_gpa_hold
+	 * puo' dormire. 0 = non RAM o TPR shadow spento -> emulazione su CR8. */
+	n->vapic_hpa = 0;
+	if (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+	    PROCBASED_USE_TPR_SHADOW) {
+		uint64_t va12 = vmcs12_read_field(c, VMCS_VIRTUAL_APIC);
+		void *pg, *ck;
+
+		pg = vm_gpa_hold(vcpu->vcpu, va12 & ~(uint64_t)PAGE_MASK,
+		    PAGE_SIZE, VM_PROT_READ | VM_PROT_WRITE, &ck);
+		if (pg != NULL) {
+			n->vapic_hpa = DMAP_TO_PHYS((vm_offset_t)pg);
+			vm_gpa_release(ck);
+		}
+	}
+
 	/* Shadow EPT: radice preparata QUI, dove si puo' dormire. Da VMPTRLD
 	 * in poi si e' in sezione critica (niente malloc ne' vm_gpa_hold). */
 	if (vmcs12_proc2(c) &
@@ -2239,6 +2256,10 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		if (p12 & (type == 0 ? PROCBASED_CR8_LOAD_EXITING :
 		    PROCBASED_CR8_STORE_EXITING))
 			break;			/* L1 intercetta -> riflette */
+		/* con il TPR shadow dell'L1 CR8 e' del VTPR (hardware, vedi
+		 * nested_compose_vmcs02): mai sul TPR vero dell'L1 */
+		if (p12 & PROCBASED_USE_TPR_SHADOW)
+			break;
 		return (false);			/* L0 emula sul TPR */
 	}
 	case EXIT_REASON_RDMSR:
@@ -2675,6 +2696,38 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	    PROCBASED_CR8_STORE_EXITING;
 	proc = nested_adjust_ctl(proc, MSR_VMX_TRUE_PROCBASED_CTLS);
 	proc &= ~(PROCBASED_IO_BITMAPS | PROCBASED_USE_TPR_SHADOW);
+	/*
+	 * TPR shadow dell'L1 (come KVM): il VMCS02 usa la STESSA pagina
+	 * virtual-APIC dell'L1 (sua pagina host: la memoria del guest e'
+	 * wired) e la sua soglia; l'hardware virtualizza CR8 dell'L2 sul VTPR
+	 * e le uscite "TPR below threshold" (43) vanno all'L1. Le uscite su CR8
+	 * restano solo se l'L1 le chiede. Prima il TPR shadow si toglieva
+	 * sempre e CR8 dell'L2 si emulava sul TPR VERO dell'L1: Windows 11 +
+	 * Hyper-V, la partizione root alzava l'IRQL a 15 (mov cr8, rdx=0xf) e
+	 * il vlapic di Hyper-V restava a TPR 0xf0, sordo a ogni interrupt
+	 * (DTrace: zero vlapic_set_intr_ready; CPU 1 mai avviata).
+	 * Senza TPR shadow nel VMCS12 resta l'emulazione sul TPR dell'L1:
+	 * e' la semantica giusta (l'L2 tocca il TPR "fisico" dell'L1).
+	 */
+	{
+		uint32_t p12 = (uint32_t)vmcs12_read_field(c,
+		    VMCS_PRI_PROC_BASED_CTLS);
+		/* pagina host calcolata da nested_vmlaunch PRIMA del VMPTRLD:
+		 * qui si e' in sezione critica, niente vm_gpa_hold */
+		uint64_t hpa = (p12 & PROCBASED_USE_TPR_SHADOW) ?
+		    n->vapic_hpa : 0;
+
+		if (hpa != 0) {
+			proc |= PROCBASED_USE_TPR_SHADOW;
+			proc &= ~(PROCBASED_CR8_LOAD_EXITING |
+			    PROCBASED_CR8_STORE_EXITING);
+			proc |= p12 & (PROCBASED_CR8_LOAD_EXITING |
+			    PROCBASED_CR8_STORE_EXITING);
+			vmwrite(VMCS_VIRTUAL_APIC, hpa);
+			vmwrite(VMCS_TPR_THRESHOLD,
+			    vmcs12_read_field(c, VMCS_TPR_THRESHOLD) & 0xf);
+		}
+	}
 	/* T2.6: se l'L1 ha un evento pendente per se', accendi il window-exiting
 	 * cosi' l'L2 esce presto e la finestra viene riflessa all'L1 (§6.5). */
 	{

@@ -209,6 +209,8 @@ struct vmx_nested {
 					 * cambiato, L0 ha completato un'istruzione */
 	uint64_t	exit_tsc;	/* TSC host all'ultima uscita da L2 */
 	bool		preempt_on;	/* timer di preemption dell'L1 attivo */
+	uint64_t	vapic_hpa;	/* pagina host della virtual-APIC dell'L1
+					 * (TPR shadow nel VMCS02); 0 = nessuna */
 	uint64_t	preempt_deadline; /* sua scadenza, TSC host assoluto */
 	int		preempt_rate;	/* IA32_VMX_MISC[4:0] */
 	uint64_t	pdpte[4];	/* PDPTE dell'L2 letti dalla memoria di CR3 */

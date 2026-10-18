@@ -3530,7 +3530,9 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * If TPR Shadowing is enabled, the TPR Threshold
 		 * must be updated right before entering the guest.
 		 */
-		if (tpr_shadowing && !virtual_interrupt_delivery) {
+		/* in L2 la soglia del VMCS02 e' quella dell'L1 (nested) */
+		if (tpr_shadowing && !virtual_interrupt_delivery &&
+		    (vcpu->nested == NULL || !vcpu->nested->in_l2)) {
 			if ((vcpu->cap.proc_ctls & PROCBASED_USE_TPR_SHADOW) != 0) {
 				vmcs_write(VMCS_TPR_THRESHOLD, vlapic_get_cr8(vlapic));
 			}
