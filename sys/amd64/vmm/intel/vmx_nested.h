@@ -254,13 +254,6 @@ struct vmx_nested {
 		uint64_t	used;		/* ultimo uso (vept_tick), LRU */
 	}		vept_slot[VEPT_NROOTS];
 	uint64_t	vept_tick;
-	/*
-	 * Uscita immediata dopo l'ingresso (come req_immediate_exit di KVM):
-	 * con un'iniezione verso l'L2 ancora da consegnare non si prende
-	 * l'uscita sintetica verso l'L1, si entra col timer di preemption a 0.
-	 */
-	bool		imm_exit_want;	/* da armare al prossimo ingresso in L2 */
-	bool		imm_exit;	/* armato: la prossima uscita 52 e' di L0 */
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);
@@ -269,7 +262,6 @@ void	nested_vmx_result(struct vmx_vcpu *vcpu, int errnum);
 void	nested_vmfail_invalid(struct vmx_vcpu *vcpu);
 /* Eventi dell'L1 da consegnare prima di rientrare in L2 (vmx_run). */
 void	nested_preempt_refresh(struct vmx_vcpu *vcpu);
-void	nested_imm_exit_arm(struct vmx_vcpu *vcpu);
 bool	nested_l1_intercepts_extint(struct vmx_vcpu *vcpu);
 bool	nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 	    uint64_t rip);

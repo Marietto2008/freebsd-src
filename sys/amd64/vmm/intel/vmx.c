@@ -3533,11 +3533,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			break;
 		}
 		vmx_inject_interrupts(vcpu, vlapic, rip);
-		if (vcpu->nested != NULL && vcpu->nested->in_l2) {
+		if (vcpu->nested != NULL && vcpu->nested->in_l2)
 			nested_preempt_refresh(vcpu);
-			/* dopo: il valore 0 dell'uscita immediata deve vincere */
-			nested_imm_exit_arm(vcpu);
-		}
 
 		/*
 		 * Check for vcpu suspension after injecting events because

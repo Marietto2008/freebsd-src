@@ -1478,10 +1478,6 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	struct vmcs *vmcs02 = vcpu->vmcs;
 	uint64_t efer, hrip, hrsp, hcr0, hcr3, hcr4;
 	uint32_t i;
-
-	/* un'uscita immediata di L0 ancora armata non vale piu': si esce da L2
-	 * (il VMCS02 riprende il pin del VMCS12 al prossimo VMRESUME) */
-	n->imm_exit = n->imm_exit_want = false;
 	/* stato di L2 da ricopiare in VMCS12 cosi' l'L1 lo rilegge con VMREAD */
 	/*
 	 * SDM 28.3: all'uscita si salva TUTTO lo stato guest. Prima solo 11
@@ -1868,28 +1864,6 @@ nested_preempt_refresh(struct vmx_vcpu *vcpu)
 	vmwrite(VMCS_PREEMPTION_TIMER_VALUE, rem);
 }
 
-/*
- * Subito prima dell'ingresso in L2 (dopo vmx_inject_interrupts e
- * nested_preempt_refresh, VMCS02 corrente): se nested_check_events ha
- * rimandato un'uscita sintetica perche' un evento verso l'L2 era da
- * consegnare, timer di preemption a 0. SDM: con valore 0 l'uscita avviene
- * prima della prima istruzione dell'L2 ma DOPO la consegna dell'evento
- * iniettato. L'uscita 52 la consuma nested_l2_exit (n->imm_exit).
- */
-void
-nested_imm_exit_arm(struct vmx_vcpu *vcpu)
-{
-	struct vmx_nested *n = vcpu->nested;
-
-	if (!n->imm_exit_want)
-		return;
-	n->imm_exit_want = false;
-	n->imm_exit = true;
-	vmwrite(VMCS_PIN_BASED_CTLS,
-	    vmcs_read(VMCS_PIN_BASED_CTLS) | PINBASED_PREMPTION_TIMER);
-	vmwrite(VMCS_PREEMPTION_TIMER_VALUE, 0);
-}
-
 bool
 nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
     uint64_t rip)
@@ -1941,29 +1915,6 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 		SDT_PROBE4(vmm, vmx, nested, chkev, vcpu, pin12, pend, vec);
 		if ((pin12 & PINBASED_EXTINT_EXITING) == 0 || !pend)
 			return (false);
-	}
-	/*
-	 * Evento verso l'L2 ancora da consegnare: l'iniezione del VMCS12 appena
-	 * composta nel VMCS02, o una reiniezione di L0 (exitintinfo, eccezione).
-	 * Sulla CPU vera l'evento iniettato viene CONSEGNATO e solo dopo
-	 * l'interrupt dell'L1 fa uscire: l'L1 non vede mai un'uscita prima del
-	 * suo VMRESUME con l'evento in IDT-vectoring. Hyper-V infatti non lo
-	 * reinietta: il vettore resta "in servizio" nel suo APIC virtuale del
-	 * VP, la root non ne fa l'EOI e i clock successivi (0xd2) restano
-	 * bloccati -> CLOCK_WATCHDOG_TIMEOUT sul processore 1 (run-20261018-
-	 * 213834). Come nested_run_pending/req_immediate_exit di KVM: si entra,
-	 * col timer di preemption a 0 (nested_imm_exit_arm), e si riflette
-	 * all'uscita successiva.
-	 */
-	{
-		uint64_t i1 = 0, i2 = 0;
-
-		if ((vmcs_read(VMCS_ENTRY_INTR_INFO) & VMCS_INTR_VALID) != 0 ||
-		    (vm_get_intinfo(vcpu->vcpu, &i1, &i2) == 0 &&
-		    ((i1 | i2) & VM_INTINFO_VALID) != 0)) {
-			n->imm_exit_want = true;
-			return (false);
-		}
 	}
 
 	n->synth_intr_info = 0;
@@ -2310,22 +2261,6 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	case EXIT_REASON_EXT_INTR:
 		/* interrupt fisico per l'host: lo gestisce l'L0, si rientra in L2 */
 		return (false);
-	case EXIT_REASON_VMX_PREEMPT:
-		/*
-		 * Uscita immediata chiesta da L0 (nested_imm_exit_arm): l'evento
-		 * iniettato e' stato consegnato. Si toglie il timer se l'L1 non
-		 * lo usa e si resta in L2 (true + in_l2 = gestita): al rientro
-		 * nested_check_events riflette l'interrupt dell'L1.
-		 */
-		if (vcpu->nested->imm_exit) {
-			vcpu->nested->imm_exit = false;
-			if (!vcpu->nested->preempt_on)
-				vmwrite(VMCS_PIN_BASED_CTLS,
-				    vmcs_read(VMCS_PIN_BASED_CTLS) &
-				    ~PINBASED_PREMPTION_TIMER);
-			return (true);
-		}
-		break;			/* timer dell'L1 -> riflette */
 	case EXIT_REASON_EXCEPTION:
 		/* NMI (intr_type NMI) all'L0; le altre eccezioni si riflettono
 		 * se nella exception bitmap di VMCS12 (semplificato: riflette). */
