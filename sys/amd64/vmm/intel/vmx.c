@@ -2559,85 +2559,24 @@ emulate_rdmsr(struct vmx_vcpu *vcpu, u_int num, bool *retu)
 	return (error);
 }
 
-static int
-vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+/*
+ * Evento interrotto da un'uscita (IDT-vectoring info valido): lo si salva per
+ * reiniettarlo al prossimo ingresso (vmx_inject_interrupts). Usata dai rami
+ * dell'L1 e, nel nested, dalle uscite dell'L2 che L0 gestisce RESTANDO in L2:
+ * prima queste tornavano prima del salvataggio e l'evento si perdeva.
+ * Windows 11 + Hyper-V: l'interrupt 0xd1 (timer sintetico della root) che
+ * Hyper-V iniettava finiva in una EPT violation dello shadow durante la
+ * consegna e spariva; l'HAL della root non vedeva mai un tick -> bugcheck 0x5C.
+ * Le uscite riflesse all'L1 non passano di qui: l'evento va nel VMCS12
+ * (nested_reflect_to_l1) e lo reinietta l'L1.
+ */
+static void
+vmx_exit_save_idtvec(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
+    uint32_t reason)
 {
-	int error, errcode, errcode_valid, handled, in;
-	struct vmxctx *vmxctx;
-	struct vlapic *vlapic;
-	struct vm_inout_str *vis;
-	struct vm_task_switch *ts;
-	uint32_t eax, ecx, edx, idtvec_info, idtvec_err, intr_info, inst_info;
-	uint32_t intr_type, intr_vec, reason;
-	uint64_t exitintinfo, qual, gpa;
-#ifdef KDTRACE_HOOKS
-	int vcpuid;
-#endif
-	bool retu;
-
-	CTASSERT((PINBASED_CTLS_ONE_SETTING & PINBASED_VIRTUAL_NMI) != 0);
-	CTASSERT((PINBASED_CTLS_ONE_SETTING & PINBASED_NMI_EXITING) != 0);
-
-	handled = UNHANDLED;
-	vmxctx = &vcpu->ctx;
-#ifdef KDTRACE_HOOKS
-	vcpuid = vcpu->vcpuid;
-#endif
-
-	qual = vmexit->u.vmx.exit_qualification;
-	reason = vmexit->u.vmx.exit_reason;
-	vmexit->exitcode = VM_EXITCODE_BOGUS;
-
-	vmm_stat_incr(vcpu->vcpu, VMEXIT_COUNT, 1);
-	SDT_PROBE3(vmm, vmx, exit, entry, vmx, vcpuid, vmexit);
-
-	/* Uscite mentre il vCPU e' in L2: instradamento nested (§6.4) prima
-	 * dei rami dell'L1. Se riflessa all'L1, l'uscita e' gestita. */
-	if (vcpu->nested != NULL && vcpu->nested->in_l2) {
-		if (__predict_false(vmx_nested_probe == 2)) {
-			/* sonda 2: la prima uscita da L2 e' arrivata viva */
-			nested_probe_dump("L2-EXIT");
-			vm_suspend(vmx->vm, VM_SUSPEND_POWEROFF);
-			return (HANDLED);	/* il ciclo vede la sospensione */
-		}
-		if (nested_l2_exit(vcpu, vmexit)) {
-			if (vcpu->nested->ept_pending) {
-				/* violation EPT da risolvere nello slow path
-				 * (shadow EPT): si esce da vmx_run in L2. Il
-				 * paging dell'L2 si salva ORA (VMCS02 caricato)
-				 * per l'eventuale emulazione di MMIO dell'L1. */
-				vmexit_inst_emul(&vcpu->nested->ept_emul,
-				    vcpu->nested->ept_gpa, vmcs_gla());
-				vmexit->exitcode = VM_EXITCODE_NESTED;
-				vmexit->inst_length = 0;
-				return (UNHANDLED);
-			}
-			if (vcpu->nested->in_l2)
-				return (HANDLED); /* gestita in L0, resta in L2 */
-			/*
-			 * Riflessa all'L1: il VMCS corrente ora e' il VMCS01,
-			 * in stato clear. Restare nel ciclo di vmx_run vorrebbe
-			 * dire VMRESUME su un VMCS non launched (VMfail 5). Si
-			 * esce: vm_run riparte con un vmx_run nuovo (VMPTRLD,
-			 * campi host per-CPU, VMLAUNCH), come all'ingresso in L2.
-			 */
-			vcpu->nested->restart_only = true;
-			vmexit->exitcode = VM_EXITCODE_NESTED;
-			return (UNHANDLED);
-		}
-	}
-
-	/*
-	 * VM-entry failures during or after loading guest state.
-	 *
-	 * These VM-exits are uncommon but must be handled specially
-	 * as most VM-exit fields are not populated as usual.
-	 */
-	if (__predict_false(reason == EXIT_REASON_MCE_DURING_ENTRY)) {
-		VMX_CTR0(vcpu, "Handling MCE during VM-entry");
-		__asm __volatile("int $18");
-		return (1);
-	}
+	uint64_t exitintinfo;
+	uint32_t idtvec_info, idtvec_err, intr_type;
+	int error;
 
 	/*
 	 * VM exits that can be triggered during event delivery need to
@@ -2688,6 +2627,95 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 			vmcs_write(VMCS_ENTRY_INST_LENGTH, vmexit->inst_length);
 		}
 	}
+
+}
+
+static int
+vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+{
+	int error, errcode, errcode_valid, handled, in;
+	struct vmxctx *vmxctx;
+	struct vlapic *vlapic;
+	struct vm_inout_str *vis;
+	struct vm_task_switch *ts;
+	uint32_t eax, ecx, edx, idtvec_info, intr_info, inst_info;
+	uint32_t intr_type, intr_vec, reason;
+	uint64_t qual, gpa;
+#ifdef KDTRACE_HOOKS
+	int vcpuid;
+#endif
+	bool retu;
+
+	CTASSERT((PINBASED_CTLS_ONE_SETTING & PINBASED_VIRTUAL_NMI) != 0);
+	CTASSERT((PINBASED_CTLS_ONE_SETTING & PINBASED_NMI_EXITING) != 0);
+
+	handled = UNHANDLED;
+	vmxctx = &vcpu->ctx;
+#ifdef KDTRACE_HOOKS
+	vcpuid = vcpu->vcpuid;
+#endif
+
+	qual = vmexit->u.vmx.exit_qualification;
+	reason = vmexit->u.vmx.exit_reason;
+	vmexit->exitcode = VM_EXITCODE_BOGUS;
+
+	vmm_stat_incr(vcpu->vcpu, VMEXIT_COUNT, 1);
+	SDT_PROBE3(vmm, vmx, exit, entry, vmx, vcpuid, vmexit);
+
+	/* Uscite mentre il vCPU e' in L2: instradamento nested (§6.4) prima
+	 * dei rami dell'L1. Se riflessa all'L1, l'uscita e' gestita. */
+	if (vcpu->nested != NULL && vcpu->nested->in_l2) {
+		if (__predict_false(vmx_nested_probe == 2)) {
+			/* sonda 2: la prima uscita da L2 e' arrivata viva */
+			nested_probe_dump("L2-EXIT");
+			vm_suspend(vmx->vm, VM_SUSPEND_POWEROFF);
+			return (HANDLED);	/* il ciclo vede la sospensione */
+		}
+		if (nested_l2_exit(vcpu, vmexit)) {
+			if (vcpu->nested->ept_pending) {
+				/* violation EPT da risolvere nello slow path
+				 * (shadow EPT): si esce da vmx_run in L2. Il
+				 * paging dell'L2 si salva ORA (VMCS02 caricato)
+				 * per l'eventuale emulazione di MMIO dell'L1. */
+				vmexit_inst_emul(&vcpu->nested->ept_emul,
+				    vcpu->nested->ept_gpa, vmcs_gla());
+				vmx_exit_save_idtvec(vcpu, vmexit, reason);
+				vmexit->exitcode = VM_EXITCODE_NESTED;
+				vmexit->inst_length = 0;
+				return (UNHANDLED);
+			}
+			if (vcpu->nested->in_l2) {
+				/* gestita in L0, resta in L2 */
+				vmx_exit_save_idtvec(vcpu, vmexit, reason);
+				return (HANDLED);
+			}
+			/*
+			 * Riflessa all'L1: il VMCS corrente ora e' il VMCS01,
+			 * in stato clear. Restare nel ciclo di vmx_run vorrebbe
+			 * dire VMRESUME su un VMCS non launched (VMfail 5). Si
+			 * esce: vm_run riparte con un vmx_run nuovo (VMPTRLD,
+			 * campi host per-CPU, VMLAUNCH), come all'ingresso in L2.
+			 */
+			vcpu->nested->restart_only = true;
+			vmexit->exitcode = VM_EXITCODE_NESTED;
+			return (UNHANDLED);
+		}
+	}
+
+	/*
+	 * VM-entry failures during or after loading guest state.
+	 *
+	 * These VM-exits are uncommon but must be handled specially
+	 * as most VM-exit fields are not populated as usual.
+	 */
+	if (__predict_false(reason == EXIT_REASON_MCE_DURING_ENTRY)) {
+		VMX_CTR0(vcpu, "Handling MCE during VM-entry");
+		__asm __volatile("int $18");
+		return (1);
+	}
+
+	vmx_exit_save_idtvec(vcpu, vmexit, reason);
+	idtvec_info = vmcs_idt_vectoring_info();	/* per il task switch */
 
 	switch (reason) {
 	case EXIT_REASON_TRIPLE_FAULT:
