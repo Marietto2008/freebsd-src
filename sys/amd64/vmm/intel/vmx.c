@@ -1551,22 +1551,6 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 	}
 
 	/*
-	 * In L2 con un evento GIA' nel VM-entry interruption-info del VMCS02
-	 * (composto da nested_compose_vmcs02 dal VMCS12 dell'L1, o da una
-	 * riflessione): non si inietta altro. L'iniezione la decide l'L1, non
-	 * L0; il VMRESUME consegna quell'evento. Senza questo, la reiniezione
-	 * di exitintinfo (vm_entry_intinfo, sotto) scriveva ENTRY_INTR_INFO
-	 * sopra quello gia' valido -> KASSERT "cannot inject pending exception"
-	 * (INVARIANTS) o VMCS02 corrotto -> triple fault della CPU fisica =
-	 * reset secco dell'host (Windows+Hyper-V, mezzo giro di rotella).
-	 * exitintinfo resta pendente e si reinietta a un ingresso successivo,
-	 * quando l'ENTRY_INTR_INFO del VMCS02 e' libero.
-	 */
-	if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
-	    (vmcs_read(VMCS_ENTRY_INTR_INFO) & VMCS_INTR_VALID) != 0)
-		return;
-
-	/*
 	 * MASK_HWINTR is OFF. Log when IRR has vector 50 (PIT/IOAPIC)
 	 * to track exactly when it gets injected.
 	 */
