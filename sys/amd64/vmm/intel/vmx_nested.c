@@ -82,6 +82,10 @@ SDT_PROBE_DEFINE4(vmm, vmx, nested, chkev, "struct vmx_vcpu *", "uint64_t",
  * (RFLAGS << 32 | interrompibilita') dell'L2 */
 SDT_PROBE_DEFINE5(vmm, vmx, nested, compose, "struct vmx_vcpu *", "uint64_t",
     "uint64_t", "uint64_t", "uint64_t");
+/* EPT violation nel percorso veloce (VMCS02 caricato): eptp hardware, eptp
+ * shadow da vept_root, gpa in fault, qualificazione. Per il ciclo infinito. */
+SDT_PROBE_DEFINE5(vmm, vmx, nested, eptviol, "struct vmx_vcpu *", "uint64_t",
+    "uint64_t", "uint64_t", "uint64_t");
 
 /* Contatori per vCPU (bhyvectl --get-stats). */
 VMM_STAT_INTEL(VMX_NESTED_L2_ENTRIES, "ingressi in L2");
@@ -2333,6 +2337,9 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 			vcpu->nested->ept_gpa =
 			    vmcs_read(VMCS_GUEST_PHYSICAL_ADDRESS);
 			vcpu->nested->ept_qual = vmcs_read(VMCS_EXIT_QUALIFICATION);
+			SDT_PROBE5(vmm, vmx, nested, eptviol, vcpu,
+			    vmcs_read(VMCS_EPTP), vmx_vept_eptp(vcpu),
+			    vcpu->nested->ept_gpa, vcpu->nested->ept_qual);
 			vcpu->nested->ept_pending = true;
 			vmexit->inst_length = 0;
 			return (true);
