@@ -105,6 +105,7 @@ bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
 #define	VEPT_MMIO	3	/* MMIO dell'L1: emulazione in L0 */
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	    uint64_t *l1gpa, uint64_t *perm);			/* slow path */
+uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
 	    uint64_t *out);
 void	vmx_vept_flush(struct vmx_nested *n);

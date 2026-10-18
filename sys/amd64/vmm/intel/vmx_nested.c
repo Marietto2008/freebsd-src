@@ -21,6 +21,7 @@
 #include <sys/sdt.h>
 
 #include <machine/vmm.h>
+#include <machine/vmm_instruction_emul.h>
 #include <machine/cpufunc.h>
 #include <machine/psl.h>
 #include <machine/specialreg.h>
@@ -2248,7 +2249,18 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		if (cc == NULL) break;
 		p12 = (uint32_t)vmcs12_read_field(cc, VMCS_PRI_PROC_BASED_CTLS);
 		if ((p12 & PROCBASED_MSR_BITMAPS) == 0) break; /* tutte -> riflette */
-		msr = (uint32_t)vmx_get_guest_reg(vcpu, VM_REG_GUEST_RCX);
+		/*
+		 * RCX dell'L2. NON vmx_get_guest_reg(vcpu, VM_REG_GUEST_RCX):
+		 * quella vuole il numero hardware del registro (codifica delle
+		 * istruzioni VMX: 0 RAX, 1 RCX, 2 RDX) e VM_REG_GUEST_RCX vale 2,
+		 * cioe' RDX. Si decideva sull'MSR "RDX": Windows 11 + Hyper-V,
+		 * RDMSR/WRMSR di HV_X64_MSR_HYPERCALL (0x40000001) con RDX=0 presi
+		 * per l'MSR 0, non intercettato -> gestiti da L0 invece che
+		 * riflessi: il loader leggeva 0, attivava la pagina hypercall al
+		 * GPA 0, il kernel la chiamava, Hyper-V vedeva la root eseguire al
+		 * GPA 0 -> triple fault -> reset (OUT 0xCF9).
+		 */
+		msr = (uint32_t)vcpu->ctx.guest_rcx;
 		if (msr < 0x2000) { base = wr ? 2048 : 0; bit = msr; }
 		else if (msr >= 0xc0000000 && msr < 0xc0002000)
 			{ base = wr ? 3072 : 1024; bit = msr - 0xc0000000; }
@@ -2389,6 +2401,66 @@ nested_invept(struct vmx_vcpu *vcpu)
  *    dell'L1, non quelli della shadow. Il VMCS02 conserva i campi d'uscita
  *    anche dopo VMCLEAR/VMPTRLD.
  */
+/*
+ * Sonda 9 (SOLO slow path, prime 8 volte): EPT violation di L2 che sta per
+ * essere riflessa all'L1. Rifa' in software il percorso delle tabelle delle
+ * pagine dell'L2 per il GLA del fault, leggendole attraverso l'EPT12 (il
+ * riferimento), e per ogni pagina di tabella confronta la pagina host attesa
+ * con quella a cui punta lo shadow EPT (quella che legge l'hardware).
+ * Windows 11 + Hyper-V: fault in fetch con GPA 0 su un RIP del kernel.
+ */
+static void
+nested_probe_walk(struct vmx_vcpu *vcpu, int r, uint64_t l1gpa, uint64_t perm)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vm_guest_paging *pg = &n->ept_emul.u.inst_emul.paging;
+	uint64_t gla = n->ept_emul.u.inst_emul.gla, tgpa, l1, pte, swgpa = 0;
+	uint64_t exp, sh, *p;
+	void *ck;
+	int lvl, fault = 0, err;
+	static int count;
+
+	if (count >= 8)
+		return;
+	count++;
+	err = vm_gla2gpa_nofault(vcpu->vcpu, pg, gla, VM_PROT_EXECUTE, &swgpa,
+	    &fault);
+	printf("nested_probe EPT-RIFL#%d r=%d l2gpa=%#lx qual=%#lx gla=%#lx "
+	    "cr3=%#lx mode=%d/%d l1gpa=%#lx perm=%#lx | sw gpa=%#lx err=%d "
+	    "fault=%d\n", count, r, (u_long)n->ept_gpa, (u_long)n->ept_qual,
+	    (u_long)gla, (u_long)pg->cr3, pg->cpu_mode, pg->paging_mode,
+	    (u_long)l1gpa, (u_long)perm, (u_long)swgpa, err, fault);
+	if (pg->paging_mode != PAGING_MODE_64)
+		return;
+	tgpa = pg->cr3 & 0x000ffffffffff000ULL;
+	for (lvl = 3; lvl >= 0; lvl--) {
+		if (vmx_vept_l1gpa(vcpu, tgpa, VM_PROT_READ, &l1) != 0) {
+			printf("nested_probe   L%d tabella l2gpa=%#lx: l'EPT12 "
+			    "non la mappa\n", lvl + 1, (u_long)tgpa);
+			return;
+		}
+		p = vm_gpa_hold(vcpu->vcpu, l1 & ~(uint64_t)PAGE_MASK,
+		    PAGE_SIZE, VM_PROT_READ, &ck);
+		if (p == NULL) {
+			printf("nested_probe   L%d tabella l1gpa=%#lx non RAM\n",
+			    lvl + 1, (u_long)l1);
+			return;
+		}
+		exp = DMAP_TO_PHYS((vm_offset_t)p);
+		pte = p[(gla >> (12 + 9 * lvl)) & 0x1ff];
+		vm_gpa_release(ck);
+		sh = vmx_vept_shadow_entry(vcpu, tgpa);
+		printf("nested_probe   L%d tabella l2gpa=%#lx l1gpa=%#lx host "
+		    "atteso=%#lx shadow=%#lx%s pte=%#lx\n", lvl + 1,
+		    (u_long)tgpa, (u_long)l1, (u_long)exp, (u_long)sh,
+		    (sh != 0 && (sh & 0x000ffffffffff000ULL) != exp) ?
+		    " <-- DIVERSO" : "", (u_long)pte);
+		if ((pte & 1) == 0 || (lvl > 0 && (pte & 0x80) != 0))
+			return;
+		tgpa = pte & 0x000ffffffffff000ULL;
+	}
+}
+
 static int
 nested_ept_slow(struct vmx_vcpu *vcpu)
 {
@@ -2411,6 +2483,8 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 		vmexit->inst_length = 0;
 		return (0);
 	}
+	if (__predict_false(vmx_nested_probe == 9))
+		nested_probe_walk(vcpu, r, l1gpa, perm);
 	VMPTRLD(vcpu->vmcs);			/* il VMCS02 */
 	vmexit->u.vmx.exit_reason = (r == VEPT_MISCONF) ?
 	    EXIT_REASON_EPT_MISCONFIG : EXIT_REASON_EPT_FAULT;

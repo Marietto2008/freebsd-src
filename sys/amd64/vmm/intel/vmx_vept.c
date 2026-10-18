@@ -301,3 +301,24 @@ vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot, uint64_t *out)
 		return (EFAULT);
 	return (0);
 }
+
+/*
+ * Sonda 9: voce foglia dello shadow EPT per l2gpa (0 se assente), per
+ * confrontare la pagina host che vede l'hardware con quella attesa.
+ */
+uint64_t
+vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa)
+{
+	uint64_t *tbl = vcpu->nested->vept_root, e;
+	int level;
+
+	if (tbl == NULL)
+		return (0);
+	for (level = 3; level > 0; level--) {
+		e = tbl[EPT_IDX(l2gpa, level)];
+		if ((e & EPT_RWX) == 0)
+			return (0);
+		tbl = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(e));
+	}
+	return (tbl[EPT_IDX(l2gpa, 0)]);
+}
