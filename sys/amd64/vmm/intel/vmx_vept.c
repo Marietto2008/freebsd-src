@@ -47,30 +47,60 @@ MALLOC_DEFINE(M_VMX_VEPT, "vmx_vept", "Intel VMX nested shadow EPT");
 #define	EPT_IDX(gpa, lvl)	(((gpa) >> (12 + 9 * (lvl))) & 0x1ff)
 
 /*
- * Prepara la radice shadow per l'EPTP12 corrente: la alloca VUOTA se manca, la
- * svuota (tenendola) se l'L1 ha cambiato EPT. PUO' DORMIRE (malloc/free):
+ * Prepara la radice shadow per l'EPTP12 corrente: riprende quella gia' fatta
+ * per lo stesso EPTP12, altrimenti ne alloca una VUOTA (o svuota la meno usata
+ * di recente, oltre VEPT_NROOTS). PUO' DORMIRE (malloc/free):
  * va chiamata nello slow path PRIMA del VMPTRLD del VMCS02, perche' VMPTRLD
  * fa critical_enter (panic "malloc: called with spinlock or critical section
  * held", kvm-unit-tests 'EPT A/D disabled'). Con radice valida l'L2 entra e la
  * shadow si riempie a domanda in vmx_vept_fault; tornare un EPTP invalido
  * farebbe fallire ogni ingresso (uovo-e-gallina).
  */
+static void vept_wipe(uint64_t *root);
+
 void
 vmx_vept_prepare(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c = nested_current_cache(n);
 	uint64_t eptp12 = (c != NULL) ? vmcs12_read_field(c, VMCS_EPTP) : 0;
+	struct vept_slot *s, *pick = NULL;
+	int i;
 
-	if (n->vept_root == NULL) {
-		n->vept_root = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
-		    M_VMX_VEPT, M_WAITOK | M_ZERO);
-		n->vept_eptp12 = eptp12;
-	} else if (n->vept_eptp12 != eptp12) {
-		/* l'L1 ha cambiato EPT: la shadow rispecchia quello vecchio */
-		vmx_vept_invept(n);
-		n->vept_eptp12 = eptp12;
+	/*
+	 * Radice gia' costruita per questo EPTP12 (cambio VTL di Hyper-V):
+	 * la si riprende COSI' COM'E'. Le sue voci valgono finche' l'L1 non
+	 * fa INVEPT, che le svuota tutte (vmx_vept_invept); il TLB della
+	 * radice lo invalida vmx_run a ogni ingresso in L2.
+	 */
+	for (i = 0; i < VEPT_NROOTS; i++) {
+		s = &n->vept_slot[i];
+		if (s->root != NULL && s->eptp12 == eptp12) {
+			pick = s;
+			break;
+		}
 	}
+	if (pick == NULL) {
+		/* slot libero, altrimenti il meno usato di recente (svuotato) */
+		for (i = 0; i < VEPT_NROOTS; i++) {
+			s = &n->vept_slot[i];
+			if (s->root == NULL) {
+				pick = s;
+				break;
+			}
+			if (pick == NULL || s->used < pick->used)
+				pick = s;
+		}
+		if (pick->root == NULL)
+			pick->root = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
+			    M_VMX_VEPT, M_WAITOK | M_ZERO);
+		else
+			vept_wipe(pick->root);
+		pick->eptp12 = eptp12;
+	}
+	pick->used = ++n->vept_tick;
+	n->vept_root = pick->root;
+	n->vept_eptp12 = eptp12;
 }
 
 /* Shadow EPTP (radice) da scrivere nel VMCS02: WB, 4 livelli. Non dorme:
@@ -94,25 +124,36 @@ vmx_vept_eptp(struct vmx_vcpu *vcpu)
 /* Svuota le sottotabelle della radice (non la radice) e la azzera. */
 static void vept_free_level(uint64_t *tbl, int level);
 
-/*
- * INVEPT dell'L1, o EPT12 cambiato: svuota la shadow TENENDO la radice, cosi'
- * l'EPTP gia' scritto nel VMCS02 resta valido. Il TLB per l'EPTP shadow lo
- * invalida vmx_run a ogni rientro in L2 (INVEPT single-context).
- */
-void
-vmx_vept_invept(struct vmx_nested *n)
+/* Svuota una radice TENENDOLA, cosi' un EPTP gia' scritto nel VMCS02 resta
+ * valido. */
+static void
+vept_wipe(uint64_t *root)
 {
-	uint64_t *root = n->vept_root;
 	int i;
 
-	if (root == NULL)
-		return;
 	for (i = 0; i < 512; i++) {
 		if ((root[i] & EPT_RWX) != 0 && (root[i] & EPT_PG_PS) == 0)
 			vept_free_level((uint64_t *)PHYS_TO_DMAP(
 			    EPT_ADDR(root[i])), 2);
 		root[i] = 0;
 	}
+}
+
+/*
+ * INVEPT dell'L1: svuota TUTTE le radici (single-context compreso: non si
+ * legge il descrittore, e svuotarne di piu' e' sempre lecito). Il TLB per
+ * l'EPTP shadow lo invalida vmx_run a ogni rientro in L2 (INVEPT
+ * single-context sulla radice corrente; le altre lo ricevono quando
+ * tornano correnti).
+ */
+void
+vmx_vept_invept(struct vmx_nested *n)
+{
+	int i;
+
+	for (i = 0; i < VEPT_NROOTS; i++)
+		if (n->vept_slot[i].root != NULL)
+			vept_wipe(n->vept_slot[i].root);
 }
 
 /* Libera le tabelle shadow (ricorsiva sui livelli interni). */
@@ -136,11 +177,18 @@ vept_free_level(uint64_t *tbl, int level)
 void
 vmx_vept_flush(struct vmx_nested *n)
 {
-	if (n->vept_root != NULL) {
-		vept_free_level(n->vept_root, 3);
-		n->vept_root = NULL;
-		n->vept_eptp12 = 0;
+	int i;
+
+	for (i = 0; i < VEPT_NROOTS; i++) {
+		if (n->vept_slot[i].root != NULL) {
+			vept_free_level(n->vept_slot[i].root, 3);
+			n->vept_slot[i].root = NULL;
+		}
+		n->vept_slot[i].eptp12 = 0;
+		n->vept_slot[i].used = 0;
 	}
+	n->vept_root = NULL;
+	n->vept_eptp12 = 0;
 }
 
 /*

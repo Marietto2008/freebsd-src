@@ -109,7 +109,7 @@ uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
 	    uint64_t *out);
 void	vmx_vept_flush(struct vmx_nested *n);
-void	vmx_vept_invept(struct vmx_nested *n);	/* svuota, tiene la radice */
+void	vmx_vept_invept(struct vmx_nested *n);	/* svuota tutte, tiene le radici */
 void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
 struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
@@ -239,6 +239,21 @@ struct vmx_nested {
 	uint64_t	exit_insn_info;	/* VMCS_EXIT_INSTRUCTION_INFO */
 	uint64_t	exit_insn_length; /* VMCS_EXIT_INSTRUCTION_LENGTH */
 	struct vm_guest_paging exit_paging; /* cr3/cpl/cpu_mode/paging_mode */
+	/*
+	 * Radici shadow per EPTP12 (in coda: gli offset sopra servono a
+	 * DTrace). vept_root/vept_eptp12 sono la radice CORRENTE, una di
+	 * queste. Hyper-V con la VBS alterna due EPT (VTL0/VTL1) ~1300 volte
+	 * al secondo: con una radice sola ogni cambio la svuotava per intero
+	 * (logs/win11-flush-191817.txt). Come il TLB, una radice resta valida
+	 * finche' l'L1 non fa INVEPT.
+	 */
+#define	VEPT_NROOTS	4
+	struct vept_slot {
+		uint64_t	*root;		/* NULL: slot libero */
+		uint64_t	eptp12;
+		uint64_t	used;		/* ultimo uso (vept_tick), LRU */
+	}		vept_slot[VEPT_NROOTS];
+	uint64_t	vept_tick;
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);
