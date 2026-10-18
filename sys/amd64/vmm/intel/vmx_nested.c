@@ -1592,10 +1592,68 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	 */
 	vmcs12_write_field(c, VMCS_ENTRY_INTR_INFO,
 	    vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO) & ~VMCS_INTR_VALID);
-	vmcs12_write_field(c, VMCS_IDT_VECTORING_INFO, vcpu->nested->synth ?
-	    0 : vmcs_read(VMCS_IDT_VECTORING_INFO));
-	vmcs12_write_field(c, VMCS_IDT_VECTORING_ERROR, vcpu->nested->synth ?
-	    0 : vmcs_read(VMCS_IDT_VECTORING_ERROR));
+	/*
+	 * Evento per l'L2 NON ancora consegnato (come vmcs12_save_pending_event
+	 * di KVM): va all'L1 nell'IDT-vectoring, che lo reinietta al prossimo
+	 * VMRESUME. Due posti dove puo' stare:
+	 *  - vcpu->exitintinfo / eccezione pendente: un'uscita dell'L2 gestita
+	 *    in L0 durante la consegna (vmx_exit_save_idtvec, b4a46ea; es.
+	 *    fault dello shadow EPT sullo stack della root mentre riceve il
+	 *    clock) o un'eccezione decisa da L0 per l'L2;
+	 *  - il VM-entry interruption-info del VMCS02, composto dal VMCS12 al
+	 *    VMRESUME e non ancora entrato (uscita sintetica prima
+	 *    dell'ingresso).
+	 * Prima l'uscita sintetica scriveva IDT-vectoring 0: la root perdeva
+	 * l'evento (il clock -> SYNTHETIC/CLOCK_WATCHDOG_TIMEOUT) e quello in
+	 * exitintinfo veniva poi iniettato in HYPER-V da vmx_inject_interrupts,
+	 * cioe' nel contesto sbagliato. Lo stesso per l'EPT violation riflessa
+	 * dallo slow path: l'IDT-vectoring hardware arrivava all'L1, ma la
+	 * copia in exitintinfo restava e finiva anche nell'L1.
+	 */
+	{
+		uint64_t pend = 0, idt, idterr, ilen;
+		uint32_t ent = vmcs_read(VMCS_ENTRY_INTR_INFO);
+		bool have = vm_entry_intinfo(vcpu->vcpu, &pend) != 0;
+
+		ilen = 0;
+		if (!vcpu->nested->synth) {
+			idt = vmcs_read(VMCS_IDT_VECTORING_INFO);
+			idterr = vmcs_read(VMCS_IDT_VECTORING_ERROR);
+			if ((idt & VMCS_IDT_VEC_VALID) == 0 && have) {
+				idt = (uint32_t)pend;
+				idterr = pend >> 32;
+			}
+		} else if (have) {
+			idt = (uint32_t)pend;
+			idterr = pend >> 32;
+			ilen = vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH);
+		} else if (ent & VMCS_INTR_VALID) {
+			idt = ent;
+			idterr = vmcs_read(VMCS_ENTRY_EXCEPTION_ERROR);
+			ilen = vmcs_read(VMCS_ENTRY_INST_LENGTH);
+		} else
+			idt = idterr = 0;
+		idt &= ~(1UL << 12);		/* bit indefinito */
+		if ((idt & VMCS_IDT_VEC_ERRCODE_VALID) == 0)
+			idterr = 0;
+		/* evento software (int n, #BP/#OF, ICEBP): serve la lunghezza */
+		if (vcpu->nested->synth && (idt & VMCS_IDT_VEC_VALID) != 0) {
+			uint32_t t = idt & VMCS_INTR_T_MASK;
+
+			if (t == VMCS_INTR_T_SWINTR || t == VMCS_INTR_T_PRIV_SWEXCEPTION ||
+			    t == VMCS_INTR_T_SWEXCEPTION)
+				vmcs12_write_field(c, VMCS_EXIT_INSTRUCTION_LENGTH,
+				    ilen);
+		}
+		if (__predict_false((idt & VMCS_IDT_VEC_VALID) != 0 &&
+		    vcpu->nested->synth))
+			SDT_PROBE2(vmm, vmx, nested, synth_exit, vcpu, (int)idt);
+		vmcs12_write_field(c, VMCS_IDT_VECTORING_INFO, idt);
+		vmcs12_write_field(c, VMCS_IDT_VECTORING_ERROR, idterr);
+		/* il VMCS02 non deve reiniettarlo da se' a un ingresso futuro */
+		if (ent & VMCS_INTR_VALID)
+			vmcs_write(VMCS_ENTRY_INTR_INFO, 0);
+	}
 	for (i = 0; i < nitems(l2state); i++)
 		vmcs12_write_field(c, l2state[i], vmcs_read(l2state[i]));
 	/*
