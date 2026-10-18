@@ -74,6 +74,14 @@ SDT_PROBE_DEFINE1(vmm, vmx, nested, slowpath, "struct vmx_vcpu *");
 SDT_PROBE_DEFINE2(vmm, vmx, nested, shadow_fill, "struct vmx_vcpu *", "uint64_t");
 SDT_PROBE_DEFINE2(vmm, vmx, nested, vmfail, "struct vmx_vcpu *", "int");
 SDT_PROBE_DEFINE1(vmm, vmx, nested, init_latched, "struct vmx_vcpu *");
+/* decisione di nested_check_events: pin del VMCS12, interrupt dell'L1 in
+ * attesa (0/1) e suo vettore */
+SDT_PROBE_DEFINE4(vmm, vmx, nested, chkev, "struct vmx_vcpu *", "uint64_t",
+    "int", "int");
+/* fine composizione del VMCS02: entry intr info, pin, proc del VMCS12, e
+ * (RFLAGS << 32 | interrompibilita') dell'L2 */
+SDT_PROBE_DEFINE5(vmm, vmx, nested, compose, "struct vmx_vcpu *", "uint64_t",
+    "uint64_t", "uint64_t", "uint64_t");
 
 /* Contatori per vCPU (bhyvectl --get-stats). */
 VMM_STAT_INTEL(VMX_NESTED_L2_ENTRIES, "ingressi in L2");
@@ -1836,11 +1844,16 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 		vmexit->exitcode = VM_EXITCODE_NESTED;
 		return (true);
 	}
-	if ((vmcs12_read_field(c, VMCS_PIN_BASED_CTLS) &
-	    PINBASED_EXTINT_EXITING) == 0)
-		return (false);
-	if (!vlapic_pending_intr(vl, &vec))
-		return (false);
+	{
+		uint64_t pin12 = vmcs12_read_field(c, VMCS_PIN_BASED_CTLS);
+		int pend;
+
+		vec = -1;
+		pend = vlapic_pending_intr(vl, &vec) ? 1 : 0;
+		SDT_PROBE4(vmm, vmx, nested, chkev, vcpu, pin12, pend, vec);
+		if ((pin12 & PINBASED_EXTINT_EXITING) == 0 || !pend)
+			return (false);
+	}
 
 	n->synth_intr_info = 0;
 	n->synth_qual = 0;
@@ -2908,6 +2921,12 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	    vmcs12_read_field(c, VMCS_ENTRY_INST_LENGTH));
 
 	c->control_dirty = false;
+	SDT_PROBE5(vmm, vmx, nested, compose, vcpu,
+	    vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO),
+	    vmcs12_read_field(c, VMCS_PIN_BASED_CTLS),
+	    vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS),
+	    (vmcs12_read_field(c, VMCS_GUEST_RFLAGS) << 32) |
+	    (vmcs12_read_field(c, VMCS_GUEST_INTERRUPTIBILITY) & 0xffffffff));
 	SDT_PROBE1(vmm, vmx, nested, enter_l2, vcpu);
 	return (0);
 }
