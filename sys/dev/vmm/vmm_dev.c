@@ -323,8 +323,16 @@ alloc_memseg(struct vmmdev_softc *sc, struct vm_memseg *mseg, size_t len,
 		error = devmem_create_cdev(sc, mseg->segid, name);
 		if (error)
 			vm_free_memseg(sc->vm, mseg->segid);
-		else
-			name = NULL;	/* freed when 'cdev' is destroyed */
+		/*
+		 * Passato a devmem_create_cdev, 'name' appartiene a devmem: su
+		 * successo lo libera il teardown della lista devmem; su errore
+		 * l'ha gia' liberato devmem_create_cdev (SLIST_REMOVE + free).
+		 * Azzerarlo in ENTRAMBI i casi evita il doppio free al 'done:'
+		 * -- bug upstream latente (free di dsc->name sul fallimento di
+		 * make_dev_s + questo free) che panica l'host appena make_dev_s
+		 * fallisce.  Prima si azzerava solo nel ramo di successo.
+		 */
+		name = NULL;
 	}
 done:
 	free(name, M_VMMDEV);
@@ -1445,6 +1453,9 @@ devmem_create_cdev(struct vmmdev_softc *sc, int segid, char *devname)
 	error = make_dev_s(&mda, &dsc->cdev, "vmm.io/%s.%s", vm_name(sc->vm),
 	    devname);
 	if (error != 0) {
+		printf("vmm: make_dev_s(vmm.io/%s.%s) FALLITO: errore %d "
+		    "(uid=%u gid=%d)\n", vm_name(sc->vm), devname, error,
+		    sc->ucred->cr_uid, GID_VMM);
 		SLIST_REMOVE(&sc->devmem, dsc, devmem_softc, link);
 		free(dsc->name, M_VMMDEV);
 		free(dsc, M_VMMDEV);
