@@ -112,6 +112,14 @@ SDT_PROBE_DEFINE3(vmm, vmx, nested, diag_simp, "int", "uint64_t", "uint64_t");
  * il VMCS12 lo chiedeva: INVARIANTE VIOLATO, nested_l2_exit doveva riflettere.
  */
 SDT_PROBE_DEFINE3(vmm, vmx, nested, winexit, "int", "int", "uint64_t");
+/*
+ * Rinvio dell'interrupt dell'L1 in nested_check_events: kind 1 = evento
+ * dell'L2 ancora in VMCS02.ENTRY_INTR_INFO (composto dal VMCS12); kind 2 =
+ * evento dell'L2 in exitintinfo (consegna interrotta da una EPT violation
+ * sullo shadow, da reiniettare). info = l'evento che si protegge; vec =
+ * l'interrupt dell'L1 rinviato, che NON viene accettato.
+ */
+SDT_PROBE_DEFINE4(vmm, vmx, nested, defer, "int", "int", "uint64_t", "int");
 
 SYSCTL_DECL(_hw_vmm_vmx);		/* il nodo e' definito in vmx.c */
 
@@ -1975,8 +1983,43 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 	 * rimandare lasciandolo pendente creava la doppia iniezione -> reset
 	 * secco dell'host (beeabe4, revert fec9211).
 	 */
-	if ((vmcs_read(VMCS_ENTRY_INTR_INFO) & VMCS_INTR_VALID) != 0)
+	if ((vmcs_read(VMCS_ENTRY_INTR_INFO) & VMCS_INTR_VALID) != 0) {
+		SDT_PROBE4(vmm, vmx, nested, defer, vcpu->vcpuid, 1,
+		    vmcs_read(VMCS_ENTRY_INTR_INFO), vec);
 		return (false);
+	}
+	/*
+	 * Stesso rinvio quando l'evento dell'L2 sta in exitintinfo: la sua
+	 * consegna e' stata interrotta da una EPT violation sullo shadow EPT
+	 * (un terzo dei tick di Hyper-V segue questo percorso), l'uscita VM ha
+	 * azzerato il valid di ENTRY_INTR_INFO e L0 lo deve reiniettare. Senza
+	 * questo, l'uscita sintetica lo restituiva all'L1 nell'IDT-vectoring
+	 * e Hyper-V non lo reiniettava piu': 2 corse su 6 dopo e8efe28, con
+	 * synth_exit idt=0x800000d1 e nessun rinvio (parere #16 di Astra).
+	 *
+	 * Solo info1 (exitintinfo), non l'eccezione pendente: con in_l2 e' per
+	 * forza un evento dell'L2, perche' lo salva vmx_exit_save_idtvec nei
+	 * rami nested e ogni riflessione all'L1 lo consuma (vm_entry_intinfo in
+	 * nested_reflect_to_l1) prima che l'L1 possa rifare VMRESUME. E solo con
+	 * ENTRY_INTR_INFO NON valido (il caso sopra ha gia' restituito false):
+	 * i due eventi non coesistono mai, e vmx_inject_interrupts ne inietta
+	 * uno solo. beeabe4, che guardava anche questo, resettava l'host senza
+	 * dump; non aveva la guardia in vmx_inject_interrupts (e8efe28) ne' la
+	 * finestra INT_WINDOW corretta (6496bc2).
+	 *
+	 * Come sopra, si ritorna PRIMA di vlapic_intr_accepted: l'interrupt
+	 * dell'L1 resta in IRR, non viene consumato.
+	 */
+	{
+		uint64_t info1, info2;
+
+		vm_get_intinfo(vcpu->vcpu, &info1, &info2);
+		if ((info1 & VM_INTINFO_VALID) != 0) {
+			SDT_PROBE4(vmm, vmx, nested, defer, vcpu->vcpuid, 2,
+			    info1, vec);
+			return (false);
+		}
+	}
 
 	n->synth_intr_info = 0;
 	n->synth_qual = 0;
