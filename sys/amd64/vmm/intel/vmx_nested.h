@@ -307,6 +307,8 @@ void	vmx_nested_free(struct vmx_vcpu *vcpu);
 /* Cattura diagnostica (hw.vmm.vmx.diag_vec); sola lettura, vedi nested_diag. */
 void	nested_diag_pre_entry(struct vmx_vcpu *vcpu);
 void	nested_diag_post_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
+/* true se il bit INT_WINDOW del VMCS02 e' soltanto di L0 (vedi vmx_nested.c) */
+bool	nested_l0_owns_int_window(struct vmx_vcpu *vcpu);
 #endif /* _KERNEL */
 
 #endif /* _VMX_NESTED_H_ */

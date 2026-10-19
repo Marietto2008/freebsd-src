@@ -105,6 +105,12 @@ SDT_PROBE_DEFINE6(vmm, vmx, nested, diag_exit, "int", "uint64_t", "uint64_t",
 SDT_PROBE_DEFINE6(vmm, vmx, nested, diag_more, "int", "uint64_t", "uint64_t",
     "uint64_t", "uint64_t", "uint64_t");
 SDT_PROBE_DEFINE3(vmm, vmx, nested, diag_simp, "int", "uint64_t", "uint64_t");
+/*
+ * Uscita INTR_WINDOW da L2 gestita da L0: chi possedeva il bit nel VMCS02.
+ * owner 0 = solo L0 (nested_compose_vmcs02, T2.6): atteso. owner 1 = anche
+ * il VMCS12 lo chiedeva: INVARIANTE VIOLATO, nested_l2_exit doveva riflettere.
+ */
+SDT_PROBE_DEFINE3(vmm, vmx, nested, winexit, "int", "int", "uint64_t");
 
 SYSCTL_DECL(_hw_vmm_vmx);		/* il nodo e' definito in vmx.c */
 
@@ -2421,6 +2427,27 @@ nested_diag_post_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	    vmexit->rip, d->vmcs, d->eptp12);
 	SDT_PROBE6(vmm, vmx, nested, diag_more, vcpu->vcpuid, d->deliv,
 	    d->activity, d->eptp, d->rsp, d->eptp12);
+}
+
+/*
+ * Proprieta' del bit INT_WINDOW_EXITING nel VMCS02 (parere #15 di Astra). Il
+ * bit vi arriva da due sorgenti: il VMCS12 (la finestra e' dell'L1, e la sua
+ * uscita va riflessa) oppure L0 (nested_compose_vmcs02, blocco T2.6, per un
+ * interrupt pendente dell'L1: la consuma L0). Restituisce true se l'L1 NON la
+ * chiede, cioe' se il bit e' soltanto di L0. Una uscita 7 che arriva a L0 con
+ * l'L1 che la chiedeva viola l'invariante: si conta con la sonda winexit.
+ */
+bool
+nested_l0_owns_int_window(struct vmx_vcpu *vcpu)
+{
+	struct vmcs12_cache *c = nested_current_cache(vcpu->nested);
+	uint64_t p12;
+	bool l0;
+
+	p12 = (c != NULL) ? vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) : 0;
+	l0 = (p12 & PROCBASED_INT_WINDOW_EXITING) == 0;
+	SDT_PROBE3(vmm, vmx, nested, winexit, vcpu->vcpuid, l0 ? 0 : 1, p12);
+	return (l0);
 }
 
 bool

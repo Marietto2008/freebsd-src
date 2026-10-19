@@ -2914,6 +2914,10 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		 * ingresso, ora che l'evento iniettato in L2 e' stato consegnato.
 		 */
 		if (vcpu->nested != NULL && vcpu->nested->in_l2) {
+			/* proprieta' esplicita: se il bit era anche dell'L1 la
+			 * sonda winexit lo segnala (nested_l2_exit doveva
+			 * rifletterla); si spegne comunque solo nel VMCS02 */
+			(void)nested_l0_owns_int_window(vcpu);
 			vmcs_write(VMCS_PRI_PROC_BASED_CTLS,
 			    vmcs_read(VMCS_PRI_PROC_BASED_CTLS) &
 			    ~PROCBASED_INT_WINDOW_EXITING);
