@@ -2657,7 +2657,23 @@ vmx_exit_save_idtvec(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 		if (intr_type == VMCS_INTR_T_SWINTR ||
 		    intr_type == VMCS_INTR_T_PRIV_SWEXCEPTION ||
 		    intr_type == VMCS_INTR_T_SWEXCEPTION) {
-			vmcs_write(VMCS_ENTRY_INST_LENGTH, vmexit->inst_length);
+			/*
+			 * La lunghezza dal VMCS, NON da vmexit->inst_length: quello
+			 * e' "di quanto avanzare il RIP" e i gestori lo riusano.
+			 * nested_l2_exit lo azzera per l'EPT violation sullo shadow
+			 * (si riesegue l'istruzione) PRIMA che vmx_exit_process
+			 * chiami questa funzione: si reiniettava int 0x2d con
+			 * lunghezza 0, l'indirizzo di ritorno restava sull'int, il
+			 * gestore del kernel saltava un byte e la CPU leggeva
+			 * '2D CC C3 CC CC' come sub eax,imm32 fino all'int3 di
+			 * padding -> bugcheck 0x1000007E/0x80000003 della root
+			 * (dump nel pagefile, 20/10). Per un'uscita durante la
+			 * consegna di un evento software il campo d'uscita contiene
+			 * la lunghezza dell'istruzione (SDM 27.2.4), e qui il VMCS
+			 * dell'uscita e' ancora quello caricato.
+			 */
+			vmcs_write(VMCS_ENTRY_INST_LENGTH,
+			    vmexit_instruction_length());
 		}
 	}
 
