@@ -2900,6 +2900,25 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	case EXIT_REASON_INTR_WINDOW:
 		vmm_stat_incr(vcpu->vcpu, VMEXIT_INTR_WINDOW, 1);
 		SDT_PROBE3(vmm, vmx, exit, intrwindow, vmx, vcpuid, vmexit);
+		/*
+		 * Nested: arrivata qui da L2, questa finestra NON l'ha chiesta il
+		 * VMCS12 (altrimenti nested_l2_exit l'avrebbe riflessa all'L1): l'ha
+		 * aperta nested_compose_vmcs02 (T2.6) scrivendo il bit direttamente
+		 * nel VMCS02, per un interrupt pendente dell'L1. vcpu->cap.proc_ctls
+		 * sono invece i controlli dell'L1 (VMCS01), dove il bit non c'e':
+		 * vmx_clear_int_window_exiting li asserisce -> panic
+		 * "intr_window_exiting not set" (vmcore del 19/10 00:04, era il
+		 * "reset" di 01f9704) -- e senza INVARIANTS scriverebbe i controlli
+		 * dell'L1 DENTRO il VMCS02. Si spegne il bit nel VMCS02 corrente;
+		 * l'interrupt dell'L1 lo consegna nested_check_events al prossimo
+		 * ingresso, ora che l'evento iniettato in L2 e' stato consegnato.
+		 */
+		if (vcpu->nested != NULL && vcpu->nested->in_l2) {
+			vmcs_write(VMCS_PRI_PROC_BASED_CTLS,
+			    vmcs_read(VMCS_PRI_PROC_BASED_CTLS) &
+			    ~PROCBASED_INT_WINDOW_EXITING);
+			return (1);
+		}
 		vmx_clear_int_window_exiting(vcpu);
 		return (1);
 	case EXIT_REASON_EXT_INTR:
