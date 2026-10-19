@@ -1952,6 +1952,25 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 			return (false);
 	}
 
+	/*
+	 * RINVIO (come nested_run_pending di KVM): se il VMCS02 ha ancora un
+	 * evento da consegnare all'L2 (ENTRY_INTR_INFO valido: l'iniezione
+	 * composta dal VMCS12 al VMRESUME, non ancora entrata) NON si riflette
+	 * l'interrupt dell'L1 adesso. Sulla CPU vera l'L1 non preempta l'L2 tra
+	 * la VM-entry e la consegna dell'evento iniettato: si ritorna false, il
+	 * VMRESUME consegna l'evento (vmx_inject_interrupts non inietta altro,
+	 * stessa condizione in vmx.c), e l'interrupt dell'L1 -- che resta
+	 * pendente nel vlapic -- si riflette alla prossima uscita naturale.
+	 * Prima la riflessione immediata scavalcava il clock IPI (0xd2) che
+	 * Hyper-V iniettava nel VP1 della root: senza EOI -> CLOCK_WATCHDOG sul
+	 * processore 1. NB: si guarda SOLO ENTRY_INTR_INFO, non vm_get_intinfo:
+	 * quest'ultimo (exitintinfo) lo consuma vmx_inject_interrupts, e
+	 * rimandare lasciandolo pendente creava la doppia iniezione -> reset
+	 * secco dell'host (beeabe4, revert fec9211).
+	 */
+	if ((vmcs_read(VMCS_ENTRY_INTR_INFO) & VMCS_INTR_VALID) != 0)
+		return (false);
+
 	n->synth_intr_info = 0;
 	n->synth_qual = 0;
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) &
