@@ -188,6 +188,7 @@ struct nested_diag {
 	uint32_t	activity;	/* GUEST_ACTIVITY */
 	uint32_t	msgtype;	/* SIM slot: MessageType */
 	uint32_t	msghdr;		/* PayloadSize | Flags<<8 (pending = bit 8) */
+	uint32_t	ilen;		/* VMCS_ENTRY_INST_LENGTH all'ingresso hardware */
 	uint64_t	rip;
 	uint64_t	rsp;
 	uint64_t	rflags;

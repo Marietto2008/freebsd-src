@@ -95,7 +95,8 @@ SDT_PROBE_DEFINE5(vmm, vmx, nested, eptviol, "struct vmx_vcpu *", "uint64_t",
  *              ExpirationTime, rflags)
  *   diag_exit (vcpu, exit_reason | idt_vectoring<<32, exit_intr_info,
  *              rip d'uscita, vmptrst, eptp12)
- *   diag_more (vcpu, DeliveryTime, activity, eptp del VMCS02, rsp, eptp12)
+ *   diag_more (vcpu, DeliveryTime, activity | ENTRY_INST_LENGTH<<32,
+ *              eptp del VMCS02, rsp, eptp12)
  * e diag_simp(vcpu, gpa della SIM page, valore scritto nella SIMP).
  */
 SDT_PROBE_DEFINE6(vmm, vmx, nested, diag_entry, "int", "uint64_t", "uint64_t",
@@ -2373,6 +2374,9 @@ nested_diag_pre_entry(struct vmx_vcpu *vcpu)
 	d->entry_info = ei;
 	d->intblk = vmcs_read(VMCS_GUEST_INTERRUPTIBILITY);
 	d->activity = vmcs_read(VMCS_GUEST_ACTIVITY);
+	/* lunghezza con cui l'hardware consegna un evento SOFTWARE iniettato:
+	 * l'indirizzo di ritorno spinto e' RIP + ilen */
+	d->ilen = vmcs_read(VMCS_ENTRY_INST_LENGTH);
 	d->rip = vmcs_read(VMCS_GUEST_RIP);
 	d->rsp = vmcs_read(VMCS_GUEST_RSP);
 	d->rflags = vmcs_read(VMCS_GUEST_RFLAGS);
@@ -2426,7 +2430,8 @@ nested_diag_post_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	    (uint64_t)(uint32_t)vmcs_read(VMCS_EXIT_INTR_INFO),
 	    vmexit->rip, d->vmcs, d->eptp12);
 	SDT_PROBE6(vmm, vmx, nested, diag_more, vcpu->vcpuid, d->deliv,
-	    d->activity, d->eptp, d->rsp, d->eptp12);
+	    (uint64_t)d->activity | ((uint64_t)d->ilen << 32), d->eptp, d->rsp,
+	    d->eptp12);
 }
 
 /*
