@@ -2679,6 +2679,11 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmm_stat_incr(vcpu->vcpu, VMEXIT_COUNT, 1);
 	SDT_PROBE3(vmm, vmx, exit, entry, vmx, vcpuid, vmexit);
 
+	/* diagnostica: esito dell'ingresso fotografato da nested_diag_pre_entry,
+	 * col VMCS02 ancora caricato e prima di qualunque riflessione */
+	if (vcpu->nested != NULL)
+		nested_diag_post_exit(vcpu, vmexit);
+
 	/* Uscite mentre il vCPU e' in L2: instradamento nested (§6.4) prima
 	 * dei rami dell'L1. Se riflessa all'L1, l'uscita e' gestita. */
 	if (vcpu->nested != NULL && vcpu->nested->in_l2) {
@@ -3704,6 +3709,9 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 				    entry_ctl, interruptibility, activity);
 			}
 		}
+		/* diagnostica: fotografia dell'ingresso in L2 che inietta
+		 * hw.vmm.vmx.diag_vec, qui e non alla composizione (Astra #13) */
+		nested_diag_pre_entry(vcpu);
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
 		/* nested: TSC al momento dell'uscita, per IA32_TSC nella lista
 		 * "store all'uscita" (SDM: valore all'uscita, non alla

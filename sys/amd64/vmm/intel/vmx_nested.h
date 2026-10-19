@@ -173,6 +173,31 @@ struct vmcs12_cache {
  * capability passa 0->1 (vmx_nested_init), liberato a 1->0 e al cleanup del
  * vCPU (vmx_nested_free). Mai condiviso fra vCPU.
  */
+/*
+ * Cattura diagnostica di SOLA LETTURA (hw.vmm.vmx.diag_vec, spenta per
+ * difetto). Quando l'ingresso hardware in L2 porta il vettore richiesto, i
+ * campi qui sotto fotografano in UN SOLO istante -- immediatamente prima del
+ * VMLAUNCH/VMRESUME, non alla composizione -- lo stato del VMCS caricato e lo
+ * slot di messaggio SynIC che la root dovrebbe consumare. L'esito si legge al
+ * VM-exit successivo (IDT_VECTORING_INFO). Nessun cambiamento funzionale.
+ */
+struct nested_diag {
+	int		armed;		/* cattura fatta, attende l'uscita */
+	uint32_t	entry_info;	/* VMCS_ENTRY_INTR_INFO */
+	uint32_t	intblk;		/* GUEST_INTERRUPTIBILITY */
+	uint32_t	activity;	/* GUEST_ACTIVITY */
+	uint32_t	msgtype;	/* SIM slot: MessageType */
+	uint32_t	msghdr;		/* PayloadSize | Flags<<8 (pending = bit 8) */
+	uint64_t	rip;
+	uint64_t	rsp;
+	uint64_t	rflags;
+	uint64_t	eptp;		/* VMCS_EPTP del VMCS02 */
+	uint64_t	vmcs;		/* vmptrst: il VMCS DAVVERO caricato */
+	uint64_t	eptp12;		/* EPTP12 corrente = etichetta del VTL */
+	uint64_t	exp;		/* SIM slot: ExpirationTime */
+	uint64_t	deliv;		/* SIM slot: DeliveryTime */
+};
+
 struct vmx_nested {
 	bool		vmxon;		/* L1 in VMX operation (dopo VMXON) */
 	bool		in_l2;		/* il vCPU sta eseguendo in L2 */
@@ -254,6 +279,15 @@ struct vmx_nested {
 		uint64_t	used;		/* ultimo uso (vept_tick), LRU */
 	}		vept_slot[VEPT_NROOTS];
 	uint64_t	vept_tick;
+	/*
+	 * Diagnostica, in coda per non spostare gli offset che DTrace usa.
+	 * La SIM page si aggancia una volta, al WRMSR della SIMP, e si tiene
+	 * (vm_gpa_hold_global): il percorso d'ingresso deve solo dereferenziare.
+	 */
+	void		*diag_simp_ck;	/* cookie della pagina tenuta */
+	volatile uint8_t *diag_simp;	/* sua KVA, NULL se non agganciata */
+	uint64_t	diag_simp_gpa;	/* suo GPA */
+	struct nested_diag diag;
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);
@@ -270,6 +304,9 @@ extern int vmx_nested_probe;
 void	nested_probe_dump(const char *tag);
 int	vmx_nested_vmcs02_setup(struct vmcs12_cache *c);
 void	vmx_nested_free(struct vmx_vcpu *vcpu);
+/* Cattura diagnostica (hw.vmm.vmx.diag_vec); sola lettura, vedi nested_diag. */
+void	nested_diag_pre_entry(struct vmx_vcpu *vcpu);
+void	nested_diag_post_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
 #endif /* _KERNEL */
 
 #endif /* _VMX_NESTED_H_ */

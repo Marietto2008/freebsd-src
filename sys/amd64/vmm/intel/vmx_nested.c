@@ -19,6 +19,7 @@
 #include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/sdt.h>
+#include <sys/sysctl.h>
 
 #include <machine/vmm.h>
 #include <machine/vmm_instruction_emul.h>
@@ -86,6 +87,38 @@ SDT_PROBE_DEFINE5(vmm, vmx, nested, compose, "struct vmx_vcpu *", "uint64_t",
  * shadow da vept_root, gpa in fault, qualificazione. Per il ciclo infinito. */
 SDT_PROBE_DEFINE5(vmm, vmx, nested, eptviol, "struct vmx_vcpu *", "uint64_t",
     "uint64_t", "uint64_t", "uint64_t");
+/*
+ * Cattura diagnostica dell'ingresso che inietta hw.vmm.vmx.diag_vec. Le tre
+ * sonde descrivono lo STESSO istante (lo stato e' fotografato prima
+ * dell'ingresso hardware e sparato al VM-exit, dove le sonde sono lecite):
+ *   diag_entry(vcpu, entry_info | intblk<<32, rip, msgtype | msghdr<<32,
+ *              ExpirationTime, rflags)
+ *   diag_exit (vcpu, exit_reason | idt_vectoring<<32, exit_intr_info,
+ *              rip d'uscita, vmptrst, eptp12)
+ *   diag_more (vcpu, DeliveryTime, activity, eptp del VMCS02, rsp, eptp12)
+ * e diag_simp(vcpu, gpa della SIM page, valore scritto nella SIMP).
+ */
+SDT_PROBE_DEFINE6(vmm, vmx, nested, diag_entry, "int", "uint64_t", "uint64_t",
+    "uint64_t", "uint64_t", "uint64_t");
+SDT_PROBE_DEFINE6(vmm, vmx, nested, diag_exit, "int", "uint64_t", "uint64_t",
+    "uint64_t", "uint64_t", "uint64_t");
+SDT_PROBE_DEFINE6(vmm, vmx, nested, diag_more, "int", "uint64_t", "uint64_t",
+    "uint64_t", "uint64_t", "uint64_t");
+SDT_PROBE_DEFINE3(vmm, vmx, nested, diag_simp, "int", "uint64_t", "uint64_t");
+
+SYSCTL_DECL(_hw_vmm_vmx);		/* il nodo e' definito in vmx.c */
+
+/*
+ * Vettore da catturare all'ingresso in L2; 0 = diagnostica spenta (difetto).
+ * Per il tick della root di Hyper-V: 0xd1 (SINT3 di STIMER0).
+ */
+static int nested_diag_vec = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, diag_vec, CTLFLAG_RWTUN, &nested_diag_vec, 0,
+    "nested: vettore la cui iniezione in L2 va fotografata (0 = spenta)");
+/* Offset dello slot di messaggio nella SIM page: SINTx sta a x * 256. */
+static int nested_diag_slot = 0x300;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, diag_slot, CTLFLAG_RWTUN, &nested_diag_slot,
+    0, "nested: offset dello slot SINT nella SIM page (SINT3 = 0x300)");
 
 /* Contatori per vCPU (bhyvectl --get-stats). */
 VMM_STAT_INTEL(VMX_NESTED_L2_ENTRIES, "ingressi in L2");
@@ -238,6 +271,8 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 		vpid_free(n->vpid2);
 	if (n->msr_bitmap != NULL)
 		free(n->msr_bitmap, M_VMX_NESTED);
+	if (n->diag_simp_ck != NULL)
+		vm_gpa_release(n->diag_simp_ck);
 	free(n, M_VMX_NESTED);
 	vcpu->nested = NULL;
 }
@@ -2247,6 +2282,128 @@ n_exit_rip_record(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vcpu->nested->l2_exit_rip = vmexit->rip;
 }
 
+/*
+ * HV_X64_MSR_SIMP: bit 0 = abilitata, bit 12.. = GPA della pagina dei messaggi
+ * SynIC. E' stato PRIVATO di ciascun VTL, quindi il GPA cambia col VTL: qui si
+ * tiene l'ultimo visto, che e' quello del VTL in cui gira il tick.
+ */
+#define	HV_X64_MSR_SIMP		0x40000083
+
+/*
+ * Aggancia la SIM page quando l'L2 ne scrive il GPA, cosi' che il percorso
+ * d'ingresso (interrupt disabilitati, nessuna sospensione possibile) debba solo
+ * dereferenziare un indirizzo. vm_gpa_hold_global e non vm_gpa_hold: la
+ * seconda pretende il vCPU FROZEN (KASSERT sotto INVARIANTS) e qui il vCPU e'
+ * RUNNING. La pagina resta tenuta fino al prossimo cambio o alla distruzione.
+ */
+static void
+nested_diag_snoop_simp(struct vmx_vcpu *vcpu, uint32_t msr, bool wr)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t val, gpa;
+	void *kva, *ck;
+
+	if (nested_diag_vec == 0 || !wr || msr != HV_X64_MSR_SIMP)
+		return;
+	val = ((vcpu->ctx.guest_rdx & 0xffffffff) << 32) |
+	    (vcpu->ctx.guest_rax & 0xffffffff);
+	if ((val & 1) == 0)
+		return;			/* SIMP disabilitata: niente da leggere */
+	gpa = val & ~(uint64_t)PAGE_MASK;
+	if (gpa == n->diag_simp_gpa && n->diag_simp != NULL)
+		return;			/* gia' agganciata */
+	kva = vm_gpa_hold_global(vcpu->vmx->vm, gpa, PAGE_SIZE, VM_PROT_READ,
+	    &ck);
+	if (kva == NULL)
+		return;
+	if (n->diag_simp_ck != NULL)
+		vm_gpa_release(n->diag_simp_ck);
+	n->diag_simp_ck = ck;
+	n->diag_simp = kva;
+	n->diag_simp_gpa = gpa;
+	SDT_PROBE3(vmm, vmx, nested, diag_simp, vcpu->vcpuid, gpa, val);
+}
+
+/*
+ * Fotografia atomica immediatamente prima del VMLAUNCH/VMRESUME. Chiamata da
+ * vmx_run con gli interrupt disabilitati: solo vmcs_read e letture di memoria,
+ * nessuna sonda e nessuna printf. L'esito lo spara nested_diag_post_exit.
+ */
+void
+nested_diag_pre_entry(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct nested_diag *d;
+	volatile uint8_t *p;
+	uint32_t ei;
+
+	if (nested_diag_vec == 0 || n == NULL || !n->in_l2)
+		return;
+	ei = vmcs_read(VMCS_ENTRY_INTR_INFO);
+	if ((ei & VMCS_INTR_VALID) == 0 ||
+	    (ei & 0xff) != (uint32_t)nested_diag_vec)
+		return;
+
+	d = &n->diag;
+	d->entry_info = ei;
+	d->intblk = vmcs_read(VMCS_GUEST_INTERRUPTIBILITY);
+	d->activity = vmcs_read(VMCS_GUEST_ACTIVITY);
+	d->rip = vmcs_read(VMCS_GUEST_RIP);
+	d->rsp = vmcs_read(VMCS_GUEST_RSP);
+	d->rflags = vmcs_read(VMCS_GUEST_RFLAGS);
+	d->eptp = vmcs_read(VMCS_EPTP);
+	vmptrst(&d->vmcs);
+	d->eptp12 = n->vept_eptp12;
+	d->msgtype = d->msghdr = 0;
+	d->exp = d->deliv = 0;
+	p = n->diag_simp;
+	if (p != NULL) {
+		/*
+		 * Intestazione del messaggio SynIC: MessageType a +0,
+		 * PayloadSize a +4, MessageFlags a +5 (bit 0 = MessagePending).
+		 * Payload del timer: TimerIndex +0x10, Expiration +0x18,
+		 * Delivery +0x20.
+		 */
+		p += nested_diag_slot & (PAGE_SIZE - 1);
+		d->msgtype = *(volatile uint32_t *)p;
+		d->msghdr = p[4] | ((uint32_t)p[5] << 8);
+		d->exp = *(volatile uint64_t *)(p + 0x18);
+		d->deliv = *(volatile uint64_t *)(p + 0x20);
+	}
+	d->armed = 1;
+}
+
+/*
+ * Al primo VM-exit dopo quell'ingresso, col VMCS02 ancora caricato: sparo la
+ * fotografia e l'esito. IDT_VECTORING_INFO dice se l'evento e' stato
+ * consegnato e poi interrotto dall'uscita; se l'iniezione non e' avvenuta
+ * affatto, entry_info qui sotto lo dimostra.
+ */
+void
+nested_diag_post_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct nested_diag *d;
+
+	if (n == NULL || n->diag.armed == 0)
+		return;
+	d = &n->diag;
+	d->armed = 0;
+
+	SDT_PROBE6(vmm, vmx, nested, diag_entry, vcpu->vcpuid,
+	    (uint64_t)d->entry_info | ((uint64_t)d->intblk << 32),
+	    d->rip,
+	    (uint64_t)d->msgtype | ((uint64_t)d->msghdr << 32),
+	    d->exp, d->rflags);
+	SDT_PROBE6(vmm, vmx, nested, diag_exit, vcpu->vcpuid,
+	    (uint64_t)(vmexit->u.vmx.exit_reason & 0xffff) |
+	    ((uint64_t)(uint32_t)vmcs_read(VMCS_IDT_VECTORING_INFO) << 32),
+	    (uint64_t)(uint32_t)vmcs_read(VMCS_EXIT_INTR_INFO),
+	    vmexit->rip, d->vmcs, d->eptp12);
+	SDT_PROBE6(vmm, vmx, nested, diag_more, vcpu->vcpuid, d->deliv,
+	    d->activity, d->eptp, d->rsp, d->eptp12);
+}
+
 bool
 nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 {
@@ -2357,6 +2514,7 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		 * GPA 0 -> triple fault -> reset (OUT 0xCF9).
 		 */
 		msr = (uint32_t)vcpu->ctx.guest_rcx;
+		nested_diag_snoop_simp(vcpu, msr, wr);
 		if (msr < 0x2000) { base = wr ? 2048 : 0; bit = msr; }
 		else if (msr >= 0xc0000000 && msr < 0xc0002000)
 			{ base = wr ? 3072 : 1024; bit = msr - 0xc0000000; }
