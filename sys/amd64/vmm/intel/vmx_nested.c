@@ -107,6 +107,14 @@ SDT_PROBE_DEFINE6(vmm, vmx, nested, diag_more, "int", "uint64_t", "uint64_t",
     "uint64_t", "uint64_t", "uint64_t");
 SDT_PROBE_DEFINE3(vmm, vmx, nested, diag_simp, "int", "uint64_t", "uint64_t");
 /*
+ * EFER del VMCS02 a ogni ingresso in L2 (parere #19 di Astra). Per capire
+ * dove si perde SCE: all'ingresso iniziale vs ricomposizioni successive, e se
+ * la VM-entry MSR-load list del VMCS12 carica IA32_EFER.
+ * efer(vcpuid, VMCS12.GUEST_IA32_EFER, VMCS02.GUEST_IA32_EFER dopo compose+lista,
+ *      l1_efer, entry_ctls12, (lista_efer_presente<<32 | lista_efer_valore_basso))
+ */
+SDT_PROBE_DEFINE6(vmm, vmx, nested, efer, "int", "uint64_t", "uint64_t", "uint64_t", "uint64_t", "uint64_t");
+/*
  * Uscita INTR_WINDOW da L2 gestita da L0: chi possedeva il bit nel VMCS02.
  * owner 0 = solo L0 (nested_compose_vmcs02, T2.6): atteso. owner 1 = anche
  * il VMCS12 lo chiedeva: INVARIANTE VIOLATO, nested_l2_exit doveva riflettere.
@@ -151,6 +159,9 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, diag_slot, CTLFLAG_RWTUN, &nested_diag_slot,
 static int nested_diag_ud = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, diag_ud, CTLFLAG_RWTUN, &nested_diag_ud, 0,
     "nested: cattura lo stato al #UD in L2 (0 = spenta)");
+static int nested_diag_efer = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, diag_efer, CTLFLAG_RWTUN, &nested_diag_efer, 0,
+    "nested: traccia l'EFER del VMCS02 a ogni ingresso in L2 (0 = spenta)");
 
 /* Contatori per vCPU (bhyvectl --get-stats). */
 VMM_STAT_INTEL(VMX_NESTED_L2_ENTRIES, "ingressi in L2");
@@ -1456,6 +1467,9 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		nested_advance_rip(vcpu);
 		return (0);
 	}
+	/* EFER del VMCS02 dopo compose + MSR-load list, VMCS02 ancora caricato
+	 * (parere #19): per vedere dove si perde SCE */
+	nested_diag_efer_trace(vcpu, c);
 	VMCLEAR(vmcs02);			/* vmx_run lo ricarichera' */
 
 	/*
@@ -2552,6 +2566,35 @@ nested_diag_ud_capture(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	    vmcs_read(VMCS_EXCEPTION_BITMAP), eb12,
 	    (uint64_t)(uint32_t)vmcs_read(VMCS_ENTRY_INTR_INFO),
 	    pend, n->vept_eptp12);
+}
+
+void
+nested_diag_efer_trace(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	struct nested_msr_list *ml;
+	struct msr_entry *e;
+	uint64_t list_efer = 0;	/* bit63 presente, bit0..62 valore basso */
+	uint32_t i;
+
+	if (nested_diag_efer == 0 || c == NULL)
+		return;
+	/* la VM-entry MSR-load list del VMCS12 carica IA32_EFER? */
+	ml = &c->ml_en;
+	if (!c->ml_en_bad) {
+		for (i = 0; i < ml->n; i++) {
+			e = nested_msr_ent(ml, i);
+			if (e->index == MSR_EFER) {
+				list_efer = (1ULL << 63) | (e->val & 0x7fffffffffffffffULL);
+				break;
+			}
+		}
+	}
+	SDT_PROBE6(vmm, vmx, nested, efer, vcpu->vcpuid,
+	    vmcs12_read_field(c, VMCS_GUEST_IA32_EFER),
+	    vmcs_read(VMCS_GUEST_IA32_EFER),		/* VMCS02 corrente */
+	    vcpu->nested->l1_efer,
+	    vmcs12_read_field(c, VMCS_ENTRY_CTLS),
+	    list_efer);
 }
 
 bool

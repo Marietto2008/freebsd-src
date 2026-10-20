@@ -312,6 +312,7 @@ void	nested_diag_post_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
 bool	nested_l0_owns_int_window(struct vmx_vcpu *vcpu);
 /* cattura lo stato al #UD in L2 (hw.vmm.vmx.diag_ud); sola lettura */
 void	nested_diag_ud_capture(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
+void	nested_diag_efer_trace(struct vmx_vcpu *vcpu, struct vmcs12_cache *c);
 #endif /* _KERNEL */
 
 #endif /* _VMX_NESTED_H_ */
