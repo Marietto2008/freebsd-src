@@ -2713,8 +2713,12 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 
 	/* diagnostica: esito dell'ingresso fotografato da nested_diag_pre_entry,
 	 * col VMCS02 ancora caricato e prima di qualunque riflessione */
-	if (vcpu->nested != NULL)
+	if (vcpu->nested != NULL) {
 		nested_diag_post_exit(vcpu, vmexit);
+		/* #UD di smss (parere #18): stato col VMCS02 ancora caricato,
+		 * prima di nested_l2_exit/riflessioni/save_idtvec */
+		nested_diag_ud_capture(vcpu, vmexit);
+	}
 
 	/* Uscite mentre il vCPU e' in L2: instradamento nested (§6.4) prima
 	 * dei rami dell'L1. Se riflessa all'L1, l'uscita e' gestita. */

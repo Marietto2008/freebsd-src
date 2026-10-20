@@ -120,6 +120,20 @@ SDT_PROBE_DEFINE3(vmm, vmx, nested, winexit, "int", "int", "uint64_t");
  * l'interrupt dell'L1 rinviato, che NON viene accettato.
  */
 SDT_PROBE_DEFINE4(vmm, vmx, nested, defer, "int", "int", "uint64_t", "int");
+/*
+ * Cattura diagnostica del #UD che uccide smss (parere #18 di Astra). Sola
+ * lettura, gated da hw.vmm.vmx.diag_ud. Scatta all'uscita hardware da L2 col
+ * VMCS02 ancora caricato, PRIMA di nested_l2_exit/riflessioni/save_idtvec,
+ * quando l'uscita e' causata da #UD (exception exit, bitmap[6]=1) o avviene
+ * durante la sua consegna (IDT_VECTORING = vettore 6). I campi bastano a
+ * tradurre il RIP (CR3, con attenzione a PCID/LA57 lato script) e a decidere
+ * istruzione-illegale vs consegna (VM_EXIT_INTR_INFO vs IDT_VECTORING, e le
+ * exception bitmap di VMCS02 e VMCS12).
+ */
+SDT_PROBE_DEFINE6(vmm, vmx, nested, ud_a, "int", "uint64_t", "uint64_t", "uint64_t", "uint64_t", "uint64_t");
+SDT_PROBE_DEFINE6(vmm, vmx, nested, ud_b, "int", "uint64_t", "uint64_t", "uint64_t", "uint64_t", "uint64_t");
+SDT_PROBE_DEFINE6(vmm, vmx, nested, ud_c, "int", "uint64_t", "uint64_t", "uint64_t", "uint64_t", "uint64_t");
+
 
 SYSCTL_DECL(_hw_vmm_vmx);		/* il nodo e' definito in vmx.c */
 
@@ -134,6 +148,9 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, diag_vec, CTLFLAG_RWTUN, &nested_diag_vec, 0,
 static int nested_diag_slot = 0x300;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, diag_slot, CTLFLAG_RWTUN, &nested_diag_slot,
     0, "nested: offset dello slot SINT nella SIM page (SINT3 = 0x300)");
+static int nested_diag_ud = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, diag_ud, CTLFLAG_RWTUN, &nested_diag_ud, 0,
+    "nested: cattura lo stato al #UD in L2 (0 = spenta)");
 
 /* Contatori per vCPU (bhyvectl --get-stats). */
 VMM_STAT_INTEL(VMX_NESTED_L2_ENTRIES, "ingressi in L2");
@@ -2496,6 +2513,45 @@ nested_l0_owns_int_window(struct vmx_vcpu *vcpu)
 	l0 = (p12 & PROCBASED_INT_WINDOW_EXITING) == 0;
 	SDT_PROBE3(vmm, vmx, nested, winexit, vcpu->vcpuid, l0 ? 0 : 1, p12);
 	return (l0);
+}
+
+void
+nested_diag_ud_capture(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	uint32_t reason, intr, idtvec;
+	uint64_t pend = 0, exc = 0, eb12;
+
+	if (nested_diag_ud == 0 || n == NULL || !n->in_l2)
+		return;
+	reason = vmexit->u.vmx.exit_reason & 0xffff;
+	intr = vmcs_read(VMCS_EXIT_INTR_INFO);
+	idtvec = vmcs_read(VMCS_IDT_VECTORING_INFO);
+	/* #UD che causa l'uscita (bitmap[6]=1), o gia' in consegna */
+	if (!((reason == EXIT_REASON_EXCEPTION &&
+	    (intr & 0x800007ff) == 0x80000306) ||
+	    (idtvec & 0x800007ff) == 0x80000306))
+		return;
+
+	c = nested_current_cache(n);
+	eb12 = (c != NULL) ? vmcs12_read_field(c, VMCS_EXCEPTION_BITMAP) : 0;
+	vm_get_intinfo(vcpu->vcpu, &pend, &exc);
+	SDT_PROBE6(vmm, vmx, nested, ud_a, vcpu->vcpuid,
+	    vmcs_read(VMCS_GUEST_CR3), vmcs_read(VMCS_GUEST_RIP),
+	    vmcs_read(VMCS_GUEST_RSP), vmcs_read(VMCS_GUEST_CR4),
+	    vmcs_read(VMCS_GUEST_IA32_EFER));
+	SDT_PROBE6(vmm, vmx, nested, ud_b, vcpu->vcpuid,
+	    (uint64_t)reason | ((uint64_t)(vmcs_read(VMCS_GUEST_CS_SELECTOR) & 0xffff) << 16) |
+	    ((uint64_t)(uint32_t)idtvec << 32),
+	    (uint64_t)(uint32_t)intr,
+	    vmcs_read(VMCS_EXIT_QUALIFICATION),
+	    vmcs_read(VMCS_GUEST_LINEAR_ADDRESS),
+	    vmcs_read(VMCS_GUEST_PHYSICAL_ADDRESS));
+	SDT_PROBE6(vmm, vmx, nested, ud_c, vcpu->vcpuid,
+	    vmcs_read(VMCS_EXCEPTION_BITMAP), eb12,
+	    (uint64_t)(uint32_t)vmcs_read(VMCS_ENTRY_INTR_INFO),
+	    pend, n->vept_eptp12);
 }
 
 bool
