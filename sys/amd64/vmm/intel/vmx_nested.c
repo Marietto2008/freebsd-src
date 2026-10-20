@@ -1834,12 +1834,12 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	 * campi: l'L1 rileggeva segmenti, GDTR/IDTR, SYSENTER, LDTR, PDPTE
 	 * dell'L2 come li aveva scritti lui (kvm-unit-tests vmx_ldtr_test,
 	 * vmx_mtf_pdpte_test); Hyper-V li usa per emulare la partizione root.
-	 * PAT, DR7 e DEBUGCTL solo coi rispettivi save controls (piu' sotto).
+	 * PAT, EFER, DR7 e DEBUGCTL solo coi rispettivi save controls (piu'
+	 * sotto).
 	 */
 	static const uint32_t l2state[] = {
 		VMCS_GUEST_RIP, VMCS_GUEST_RSP, VMCS_GUEST_RFLAGS,
 		VMCS_GUEST_CR0, VMCS_GUEST_CR3, VMCS_GUEST_CR4,
-		VMCS_GUEST_IA32_EFER,
 		VMCS_GUEST_ES_SELECTOR, VMCS_GUEST_CS_SELECTOR,
 		VMCS_GUEST_SS_SELECTOR, VMCS_GUEST_DS_SELECTOR,
 		VMCS_GUEST_FS_SELECTOR, VMCS_GUEST_GS_SELECTOR,
@@ -2014,6 +2014,17 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_PAT)
 		vmcs12_write_field(c, VMCS_GUEST_IA32_PAT,
 		    vcpu->guest_msrs[IDX_MSR_PAT]);
+	/*
+	 * Save EFER (SDM 28.3, parere #21 di Astra): il campo del VMCS12 si
+	 * aggiorna SOLO se l'L1 lo chiede, come fa KVM. Prima si copiava
+	 * sempre e un L1 senza save EFER si ritrovava sovrascritto il valore
+	 * che aveva scritto lui (kvm-unit-tests EFER save matrix, SAVE=0). Il
+	 * VMCS02 ha sempre VM_EXIT_SAVE_EFER (controlli dell'L0): il valore
+	 * dell'L2 qui e' corretto in ogni caso.
+	 */
+	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_EFER)
+		vmcs12_write_field(c, VMCS_GUEST_IA32_EFER,
+		    vmcs_read(VMCS_GUEST_IA32_EFER));
 	/* Save preemption timer: il residuo (salvato dal VMCS02) all'L1. */
 	if (vmcs12_read_field(c, VMCS_EXIT_CTLS) & VM_EXIT_SAVE_PREEMPTION_TIMER)
 		vmcs12_write_field(c, VMCS_PREEMPTION_TIMER_VALUE,

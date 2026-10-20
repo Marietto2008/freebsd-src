@@ -1,0 +1,5 @@
+# VM_EXIT_SAVE_EFER condizionale: matrice LOAD x SAVE + test EFER esistente.
+# sudo kut-run.sh --nested kut-efersave.list
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+control_field_EFER | vmx.flat | control_field_EFER | -cpu max | 1 | 1024 | 60
+EFER_save_matrix   | vmx.flat | EFER_save_matrix   | -cpu max | 1 | 1024 | 60
