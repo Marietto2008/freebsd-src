@@ -209,6 +209,8 @@ struct vmx_nested {
 	uint64_t	vmx_msr[VMX_NESTED_NMSR];  /* MSR VMX 0x480..0x491 (T1.4) */
 	uint64_t	feature_control;	/* IA32_FEATURE_CONTROL (T1.4) */
 	char		*msr_bitmap;	/* pagina MSR bitmap fusa L0|L1 (T6.3) */
+	struct timeval	msrbm_warn_t;	/* ratelimit: bitmap L1 non mappabile */
+	int		msrbm_warn_n;
 	uint64_t	*vept_root;	/* radice shadow EPT (T2.7), NULL se assente */
 	uint64_t	vept_eptp12;	/* EPTP12 che la shadow rispecchia */
 	uint16_t	vpid2;		/* VPID distinto per L2 (T2.8) */

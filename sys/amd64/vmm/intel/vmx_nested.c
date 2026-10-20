@@ -116,6 +116,17 @@ SDT_PROBE_DEFINE3(vmm, vmx, nested, diag_simp, "int", "uint64_t", "uint64_t");
 SDT_PROBE_DEFINE6(vmm, vmx, nested, efer, "int", "uint64_t", "uint64_t", "uint64_t", "uint64_t", "uint64_t");
 SDT_PROBE_DEFINE4(vmm, vmx, nested, efer2, "int", "uint64_t", "uint64_t", "uint64_t");  /* vcpuid, eptp12, efer02, current_vmcs12 */
 /*
+ * Bitmap MSR del VMCS02 fusa (T6.3, parere #21 di Astra), a ogni compose.
+ * msrbm(vcpuid, VMCS02.MSR_BITMAP riletto, efer, syse, flags):
+ *   efer = byte c0000080..87 (EFER bit0, STAR 1, LSTAR 2, CSTAR 3, SFMASK 4)
+ *          R01 | W01<<8 | R12<<16 | W12<<24 | R02<<32 | W02<<40
+ *   syse = idem per il byte di 0x170..0x177 (SYSENTER_CS/ESP/EIP bit 4..6)
+ *   flags = bit0 VMCS12 usa le bitmap MSR, bit1 bitmap dell'L1 mappata,
+ *           bit2 VMCS02 ha PROCBASED_MSR_BITMAPS
+ */
+SDT_PROBE_DEFINE5(vmm, vmx, nested, msrbm, "int", "uint64_t", "uint64_t",
+    "uint64_t", "uint64_t");
+/*
  * Uscita INTR_WINDOW da L2 gestita da L0: chi possedeva il bit nel VMCS02.
  * owner 0 = solo L0 (nested_compose_vmcs02, T2.6): atteso. owner 1 = anche
  * il VMCS12 lo chiedeva: INVARIANTE VIOLATO, nested_l2_exit doveva riflettere.
@@ -170,6 +181,8 @@ VMM_STAT_INTEL(VMX_NESTED_REFLECTIONS, "exit riflesse all'L1");
 VMM_STAT_INTEL(VMX_NESTED_SYNTH_EXITS, "exit sintetiche verso l'L1");
 VMM_STAT_INTEL(VMX_NESTED_SLOWPATH, "exit nested gestite nello slow path");
 VMM_STAT_INTEL(VMX_NESTED_VMFAIL, "VMfail restituiti all'L1");
+VMM_STAT_INTEL(VMX_NESTED_MSRBM_UNMAPPED,
+    "bitmap MSR dell'L1 attiva ma non mappabile");
 
 /*
  * Alloca lo stato nested del vCPU. Idempotente: se gia' presente, no-op.
@@ -284,9 +297,16 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	vmx_nested_init_msrs(n);
 	n->vpid2 = vpid_alloc(vcpu->vcpuid);	/* VPID distinto L2 (T2.8) */
 	/*
-	 * msr_bitmap e le pagine VMCS02 restano NULL: le allocano pigramente
-	 * T6.3 (bitmap fusa) e T1.8 (VMCS02 al VMPTRLD del VMCS12).
+	 * Bitmap MSR del VMCS02 (T6.3): una pagina per vCPU, allineata e
+	 * quindi fisicamente contigua, allocata QUI dove si puo' dormire (non
+	 * nel compose); la riempie nested_compose_msr_bitmap a ogni ingresso.
+	 * Le pagine VMCS02 restano pigre (T1.8, al VMPTRLD del VMCS12).
 	 */
+	n->msr_bitmap = malloc_aligned(PAGE_SIZE, PAGE_SIZE, M_VMX_NESTED,
+	    M_WAITOK | M_ZERO);
+	KASSERT((vtophys(n->msr_bitmap) & PAGE_MASK) == 0,
+	    ("vmx_nested_init: bitmap MSR non allineata"));
+	memset(n->msr_bitmap, 0xff, PAGE_SIZE);
 	vcpu->nested = n;
 	return (0);
 }
@@ -2569,6 +2589,74 @@ nested_diag_ud_capture(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	    pend, n->vept_eptp12);
 }
 
+/*
+ * T6.3 (parere #21 di Astra): bitmap MSR del VMCS02 = OR della bitmap dell'L0
+ * (VMCS01) e di quella dell'L1 (VMCS12), byte per byte su tutta la pagina: un
+ * accesso passa senza uscita solo se lo lasciano passare ENTRAMBI. Prima il
+ * VMCS02 usava la sola bitmap dell'L0, che lascia passare EFER, STAR, LSTAR,
+ * CSTAR, SF_MASK, SYSENTER_* (e TSC/TSC_AUX in lettura): Hyper-V li intercetta
+ * ma non riceveva le uscite, non vedeva la WRMSR EFER|SCE di Windows e
+ * ricaricava il suo 0xd00 con LOAD_EFER -> SYSCALL con SCE=0 -> #UD in smss.
+ *
+ * Si ricalcola a ogni compose: la bitmap dell'L1 e' memoria ordinaria che
+ * l'L1 puo' cambiare senza VMWRITE (l'hardware la legge a ogni RDMSR/WRMSR).
+ * Limite noto: una modifica fatta da un altro LP dell'L1 mentre questo L2 gira
+ * si vede solo al prossimo ingresso.
+ *
+ * L1 senza bitmap MSR: ogni RDMSR/WRMSR esce (SDM) -> tutto a 1. L1 con bitmap
+ * attiva ma non mappabile (indirizzo valido, non RAM; non e' un VMfail, vedi
+ * nested_bitmaps_map): tutto a 1 anche qui, coerente con l'instradamento in
+ * nested_l2_exit che in quel caso riflette all'L1, ma CONTATO a parte
+ * (VMX_NESTED_MSRBM_UNMAPPED) e segnalato, per non nasconderlo.
+ * L'instradamento delle uscite (L1 intercetta -> riflette, altrimenti L0) non
+ * cambia.
+ */
+static void
+nested_compose_msr_bitmap(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	struct vmx_nested *n = vcpu->nested;
+	const uint64_t *b01 = (const uint64_t *)vcpu->vmx->msr_bitmap;
+	const uint64_t *b12;
+	uint64_t *b02 = (uint64_t *)n->msr_bitmap;
+	uint32_t p12;
+	int i, flags = 0;
+
+	p12 = (uint32_t)vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS);
+	if (p12 & PROCBASED_MSR_BITMAPS) {
+		flags |= 1;
+		if (c->bm_msr == NULL) {
+			vmm_stat_incr(vcpu->vcpu, VMX_NESTED_MSRBM_UNMAPPED, 1);
+			if (ppsratecheck(&n->msrbm_warn_t, &n->msrbm_warn_n, 1))
+				printf("vmx_nested: vcpu %d: bitmap MSR "
+				    "dell'L1 (gpa %#lx) non mappabile, si "
+				    "intercetta tutto\n", vcpu->vcpuid,
+				    vmcs12_read_field(c, VMCS_MSR_BITMAP));
+		} else
+			flags |= 2;
+	}
+	if (flags == 3) {
+		b12 = (const uint64_t *)c->bm_msr;
+		for (i = 0; i < PAGE_SIZE / sizeof(uint64_t); i++)
+			b02[i] = b01[i] | b12[i];
+	} else
+		memset(b02, 0xff, PAGE_SIZE);
+	vmwrite(VMCS_MSR_BITMAP, vtophys(n->msr_bitmap));
+
+#define	MSRBM_PACK(o)							\
+	((uint64_t)((const uint8_t *)b01)[1024 + (o)] |			\
+	 (uint64_t)((const uint8_t *)b01)[3072 + (o)] << 8 |		\
+	 (uint64_t)(flags == 3 ? c->bm_msr[1024 + (o)] : 0) << 16 |	\
+	 (uint64_t)(flags == 3 ? c->bm_msr[3072 + (o)] : 0) << 24 |	\
+	 (uint64_t)((const uint8_t *)b02)[1024 + (o)] << 32 |		\
+	 (uint64_t)((const uint8_t *)b02)[3072 + (o)] << 40)
+	/* SYSENTER 0x174..0x176: bassi, quindi offset -1024 dalla meta' alta */
+	SDT_PROBE5(vmm, vmx, nested, msrbm, vcpu->vcpuid,
+	    vmcs_read(VMCS_MSR_BITMAP), MSRBM_PACK(16), MSRBM_PACK(46 - 1024),
+	    flags | ((vmcs_read(VMCS_PRI_PROC_BASED_CTLS) &
+	    PROCBASED_MSR_BITMAPS) ? 4 : 0));
+#undef	MSRBM_PACK
+}
+
 void
 nested_diag_efer_trace(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 {
@@ -3314,9 +3402,8 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	 * vmcs_init_host non lo tocca, quindi nel VMCS02 valeva 0 -> alla
 	 * prima uscita da L2 l'host ripartiva con RSP=0 -> triple fault. */
 	vmwrite(VMCS_HOST_RSP, (u_long)&x->ctx);
-	/* MSR bitmap: quello dell'L0 (intercetta cio' che serve a L0); la
-	 * fusione con quello dell'L1 e' T6.3. */
-	vmwrite(VMCS_MSR_BITMAP, vtophys(x->vmx->msr_bitmap));
+	/* MSR bitmap: fusione L0 | L1 (T6.3) */
+	nested_compose_msr_bitmap(x, c);
 	/*
 	 * TSC offset = quello dell'L0 per l'L1 + quello dell'L1 per l'L2 (se
 	 * l'L1 lo usa). Prima solo il secondo: l'L2 vedeva il TSC dell'host,
