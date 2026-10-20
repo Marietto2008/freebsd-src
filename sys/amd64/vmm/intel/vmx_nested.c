@@ -127,6 +127,16 @@ SDT_PROBE_DEFINE4(vmm, vmx, nested, efer2, "int", "uint64_t", "uint64_t", "uint6
 SDT_PROBE_DEFINE5(vmm, vmx, nested, msrbm, "int", "uint64_t", "uint64_t",
     "uint64_t", "uint64_t");
 /*
+ * Persistenza del VMCS12 (parere #22). vmcs12mem(vcpuid, gpa, op, nfields,
+ * launched, digest): op 1 salvato da VMCLEAR, 2 salvato da sfratto, 3 salvato
+ * da VMXOFF, 4 VMCLEAR di un VMCS12 non in cache (solo launch state), 5
+ * VMCLEAR che inizializza il formato (pagina mai vista), 6 caricato da
+ * VMPTRLD, 7 VMPTRLD senza formato (slot vuoto), 8 formato corrotto
+ * (VMPTRLD rifiutato; su VMCLEAR si reinizializza), 9 regione non mappabile.
+ */
+SDT_PROBE_DEFINE6(vmm, vmx, nested, vmcs12mem, "int", "uint64_t", "int",
+    "int", "int", "uint32_t");
+/*
  * Uscita INTR_WINDOW da L2 gestita da L0: chi possedeva il bit nel VMCS02.
  * owner 0 = solo L0 (nested_compose_vmcs02, T2.6): atteso. owner 1 = anche
  * il VMCS12 lo chiedeva: INVARIANTE VIOLATO, nested_l2_exit doveva riflettere.
@@ -183,6 +193,10 @@ VMM_STAT_INTEL(VMX_NESTED_SLOWPATH, "exit nested gestite nello slow path");
 VMM_STAT_INTEL(VMX_NESTED_VMFAIL, "VMfail restituiti all'L1");
 VMM_STAT_INTEL(VMX_NESTED_MSRBM_UNMAPPED,
     "bitmap MSR dell'L1 attiva ma non mappabile");
+VMM_STAT_INTEL(VMX_NESTED_VMCS12_SAVED, "VMCS12 salvati in memoria");
+VMM_STAT_INTEL(VMX_NESTED_VMCS12_LOADED, "VMCS12 caricati dalla memoria");
+VMM_STAT_INTEL(VMX_NESTED_VMCS12_MEMERR,
+    "VMCS12: regione corrotta o non mappabile");
 
 /*
  * Alloca lo stato nested del vCPU. Idempotente: se gia' presente, no-op.
@@ -673,6 +687,189 @@ done:
 	return (0);
 }
 
+/* --- Persistenza del VMCS12 nella sua regione (parere #22) --- */
+#define	VMCS12_OP_SAVE_VMCLEAR	1
+#define	VMCS12_OP_SAVE_EVICT	2
+#define	VMCS12_OP_SAVE_VMXOFF	3
+#define	VMCS12_OP_CLEAR		4
+#define	VMCS12_OP_INIT		5
+#define	VMCS12_OP_LOAD		6
+#define	VMCS12_OP_NOFORMAT	7
+#define	VMCS12_OP_CORRUPT	8
+#define	VMCS12_OP_UNMAPPED	9
+
+static uint32_t
+vmcs12_mem_digest(const struct vmcs12_mem_field *f, uint32_t n)
+{
+	const uint8_t *p = (const uint8_t *)f;
+	uint32_t h = 2166136261U;
+	size_t i;
+
+	for (i = 0; i < n * sizeof(*f); i++)
+		h = (h ^ p[i]) * 16777619U;
+	return (h);
+}
+
+/* Il formato in memoria e' integro? (non controlla la revisione) */
+static bool
+vmcs12_mem_valid(const struct vmcs12_mem *m)
+{
+	uint32_t i, j, enc;
+
+	if (m->magic != VMCS12_MEM_MAGIC || m->version != VMCS12_MEM_VERSION ||
+	    m->launched > 1 || m->nfields > VMCS12_NFIELDS)
+		return (false);
+	for (i = 0; i < m->nfields; i++) {
+		enc = m->fields[i].enc;
+		if ((enc & 0xffff8000) != 0)
+			return (false);
+		for (j = 0; j < i; j++)
+			if (m->fields[j].enc == enc)
+				return (false);
+	}
+	return (vmcs12_mem_digest(m->fields, m->nfields) == m->digest);
+}
+
+/*
+ * Scrive la cache c nella regione c->vmcs12_gpa con il launch state dato
+ * (0 per VMCLEAR, quello corrente per sfratto e VMXOFF: lo sfratto di L0 NON
+ * e' un VMCLEAR dell'L1). 0 se scritto; EFAULT se la regione non e'
+ * mappabile, e allora il chiamante NON deve scartare lo slot (unica copia).
+ * La cache e' gia' completa: VMWRITE dell'L1 e aggiornamenti impliciti
+ * (uscite riflesse, VM_INSTRUCTION_ERROR, launch state) la scrivono tutti.
+ */
+static int
+vmcs12_mem_save(struct vmx_vcpu *vcpu, struct vmcs12_cache *c, int launched,
+    int op)
+{
+	struct vmcs12_mem *m;
+	void *cookie;
+	int i;
+
+	m = vm_gpa_hold(vcpu->vcpu, c->vmcs12_gpa, PAGE_SIZE,
+	    VM_PROT_READ | VM_PROT_WRITE, &cookie);
+	if (m == NULL) {
+		vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMCS12_MEMERR, 1);
+		SDT_PROBE6(vmm, vmx, nested, vmcs12mem, vcpu->vcpuid,
+		    c->vmcs12_gpa, VMCS12_OP_UNMAPPED, c->nfields, launched, 0);
+		return (EFAULT);
+	}
+	for (i = 0; i < c->nfields; i++) {
+		m->fields[i].enc = c->fields[i].enc;
+		m->fields[i].val_lo = (uint32_t)c->fields[i].val;
+		m->fields[i].val_hi = (uint32_t)(c->fields[i].val >> 32);
+	}
+	m->nfields = c->nfields;
+	m->digest = vmcs12_mem_digest(m->fields, m->nfields);
+	m->launched = launched ? 1 : 0;
+	m->version = VMCS12_MEM_VERSION;
+	m->magic = VMCS12_MEM_MAGIC;
+	SDT_PROBE6(vmm, vmx, nested, vmcs12mem, vcpu->vcpuid, c->vmcs12_gpa,
+	    op, c->nfields, m->launched, m->digest);
+	vm_gpa_release(cookie);
+	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMCS12_SAVED, 1);
+	return (0);
+}
+
+/*
+ * VMCLEAR di un VMCS12 che non e' nella cache di questo vCPU. Formato valido:
+ * conserva i campi, launch state = clear. Formato assente (VMCS appena
+ * allocato: il primo VMCLEAR e' la sequenza raccomandata dall'SDM) o
+ * corrotto: lo inizializza vuoto e clear.
+ */
+static int
+vmcs12_mem_clear(struct vmx_vcpu *vcpu, uint64_t gpa)
+{
+	struct vmcs12_mem *m;
+	void *cookie;
+	int op;
+
+	m = vm_gpa_hold(vcpu->vcpu, gpa, PAGE_SIZE,
+	    VM_PROT_READ | VM_PROT_WRITE, &cookie);
+	if (m == NULL) {
+		vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMCS12_MEMERR, 1);
+		SDT_PROBE6(vmm, vmx, nested, vmcs12mem, vcpu->vcpuid, gpa,
+		    VMCS12_OP_UNMAPPED, 0, 0, 0);
+		return (EFAULT);
+	}
+	if (vmcs12_mem_valid(m))
+		op = VMCS12_OP_CLEAR;
+	else {
+		op = (m->magic == VMCS12_MEM_MAGIC) ? VMCS12_OP_CORRUPT :
+		    VMCS12_OP_INIT;
+		if (op == VMCS12_OP_CORRUPT)
+			vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMCS12_MEMERR, 1);
+		m->nfields = 0;
+		m->digest = vmcs12_mem_digest(m->fields, 0);
+		m->version = VMCS12_MEM_VERSION;
+		m->magic = VMCS12_MEM_MAGIC;
+	}
+	m->launched = 0;
+	SDT_PROBE6(vmm, vmx, nested, vmcs12mem, vcpu->vcpuid, gpa, op,
+	    m->nfields, 0, m->digest);
+	vm_gpa_release(cookie);
+	return (0);
+}
+
+/* Slot della cache per un VMCS12 appena caricato: niente dello occupante
+ * precedente (campi, mappe, launch state) deve sopravvivere. */
+static void
+vmcs12_slot_reset(struct vmcs12_cache *c, uint64_t gpa)
+{
+	nested_bitmaps_unmap(c);
+	c->vmcs12_gpa = gpa;
+	c->nfields = 0;
+	c->launched = 0;
+	c->ml_en_bad = false;
+	c->host_dirty = true;
+	c->control_dirty = true;
+}
+
+/*
+ * VMPTRLD di un VMCS12 non in cache: carica la regione nello slot (gia'
+ * azzerato da vmcs12_slot_reset). 0 caricato o formato assente (VMCS mai
+ * passato da VMCLEAR: slot vuoto e clear, nessuno stato inventato); EINVAL
+ * formato presente ma corrotto; EFAULT regione non mappabile.
+ */
+static int
+vmcs12_mem_load(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	struct vmcs12_mem *m;
+	void *cookie;
+	uint32_t i;
+	int op, error = 0;
+
+	m = vm_gpa_hold(vcpu->vcpu, c->vmcs12_gpa, PAGE_SIZE, VM_PROT_READ,
+	    &cookie);
+	if (m == NULL) {
+		vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMCS12_MEMERR, 1);
+		SDT_PROBE6(vmm, vmx, nested, vmcs12mem, vcpu->vcpuid,
+		    c->vmcs12_gpa, VMCS12_OP_UNMAPPED, 0, 0, 0);
+		return (EFAULT);
+	}
+	if (m->magic != VMCS12_MEM_MAGIC)
+		op = VMCS12_OP_NOFORMAT;
+	else if (!vmcs12_mem_valid(m)) {
+		op = VMCS12_OP_CORRUPT;
+		error = EINVAL;
+		vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMCS12_MEMERR, 1);
+	} else {
+		op = VMCS12_OP_LOAD;
+		for (i = 0; i < m->nfields; i++) {
+			c->fields[i].enc = m->fields[i].enc;
+			c->fields[i].val = (uint64_t)m->fields[i].val_lo |
+			    (uint64_t)m->fields[i].val_hi << 32;
+		}
+		c->nfields = m->nfields;
+		c->launched = m->launched;
+		vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMCS12_LOADED, 1);
+	}
+	SDT_PROBE6(vmm, vmx, nested, vmcs12mem, vcpu->vcpuid, c->vmcs12_gpa,
+	    op, m->nfields, m->launched, m->digest);
+	vm_gpa_release(cookie);
+	return (error);
+}
+
 static int
 nested_vmxoff(struct vmx_vcpu *vcpu)
 {
@@ -681,9 +878,18 @@ nested_vmxoff(struct vmx_vcpu *vcpu)
 
 	n->vmxon = false;
 	n->current_vmcs12 = VMCS12_GPA_NONE;
+	/* i VMCS12 ancora nella cache vanno nella loro regione, col loro
+	 * launch state (VMXOFF non e' un VMCLEAR); se una regione non e'
+	 * scrivibile lo slot resta, unica copia */
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
+		if (n->cache[i].vmcs12_gpa == VMCS12_GPA_NONE)
+			continue;
+		if (vmcs12_mem_save(vcpu, &n->cache[i], n->cache[i].launched,
+		    VMCS12_OP_SAVE_VMXOFF) != 0)
+			continue;
 		nested_bitmaps_unmap(&n->cache[i]);
 		n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
+		n->cache[i].nfields = 0;
 		n->cache[i].launched = 0;
 	}
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
@@ -711,16 +917,26 @@ nested_vmclear(struct vmx_vcpu *vcpu)
 	}
 	if (vmcs12 == n->current_vmcs12)
 		n->current_vmcs12 = VMCS12_GPA_NONE;
-	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
-		if (n->cache[i].vmcs12_gpa == vmcs12) {
+	/*
+	 * SDM 24.11.3: VMCLEAR scrive i dati del VMCS nella sua regione e ne
+	 * porta il launch state a clear, SENZA cancellarne i campi; un VMPTRLD
+	 * successivo, anche su un altro LP, li ritrova. Prima la cache si
+	 * liberava e il contenuto andava perso (WSL2: VMfail 7).
+	 */
+	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
+		if (n->cache[i].vmcs12_gpa == vmcs12)
+			break;
+	if (i < VMX_NESTED_MAX_VMCS12) {
+		n->cache[i].launched = 0;
+		if (vmcs12_mem_save(vcpu, &n->cache[i], 0,
+		    VMCS12_OP_SAVE_VMCLEAR) == 0) {
 			nested_bitmaps_unmap(&n->cache[i]);
 			n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
-			n->cache[i].launched = 0;
-			break;
+			n->cache[i].nfields = 0;
 		}
-	}
-	/* SDM: VMCLEAR azzera il launch-state anche nel VMCS12 in memoria.
-	 * Scrittura in guest memory: T1.8/T2. */
+		/* regione non scrivibile: lo slot (clear) resta, unica copia */
+	} else
+		(void)vmcs12_mem_clear(vcpu, vmcs12);
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
 	nested_advance_rip(vcpu);
@@ -775,14 +991,46 @@ nested_vmptrld(struct vmx_vcpu *vcpu)
 		if (slot < 0 && n->cache[i].vmcs12_gpa == VMCS12_GPA_NONE)
 			slot = i;
 	}
-	if (i == VMX_NESTED_MAX_VMCS12) {	/* non in cache: creane una voce */
-		if (slot < 0)
-			slot = 0;		/* evizione semplice (v1) */
-		nested_bitmaps_unmap(&n->cache[slot]);	/* evizione */
-		n->cache[slot].vmcs12_gpa = vmcs12;
-		n->cache[slot].launched = 0;
-		n->cache[slot].host_dirty = true;
-		n->cache[slot].control_dirty = true;
+	if (i == VMX_NESTED_MAX_VMCS12) {	/* non in cache: caricalo */
+		int j, k, error;
+
+		if (slot < 0) {
+			/*
+			 * Sfratto a giro: la vittima va nella sua regione COL
+			 * SUO launch state (lo sfratto di L0 non e' un VMCLEAR
+			 * dell'L1). Se non si puo' scrivere non la si scarta:
+			 * si prova la successiva.
+			 */
+			for (j = 0; j < VMX_NESTED_MAX_VMCS12; j++) {
+				k = (n->evict_next + j) % VMX_NESTED_MAX_VMCS12;
+				if (vmcs12_mem_save(vcpu, &n->cache[k],
+				    n->cache[k].launched,
+				    VMCS12_OP_SAVE_EVICT) == 0) {
+					slot = k;
+					break;
+				}
+			}
+			if (slot < 0) {
+				nested_vmx_result(vcpu,
+				    VMXERR_VMPTRLD_INVALID_ADDRESS);
+				goto done;
+			}
+			n->evict_next = (slot + 1) % VMX_NESTED_MAX_VMCS12;
+		}
+		vmcs12_slot_reset(&n->cache[slot], vmcs12);
+		error = vmcs12_mem_load(vcpu, &n->cache[slot]);
+		if (error != 0) {
+			/*
+			 * Formato bhyve presente ma corrotto: non lo si tratta
+			 * come un VMCS nuovo. Regione non mappabile: gia'
+			 * esclusa dal controllo di revisione qui sopra.
+			 */
+			vmcs12_slot_reset(&n->cache[slot], VMCS12_GPA_NONE);
+			nested_vmx_result(vcpu, error == EINVAL ?
+			    VMXERR_VMPTRLD_INCORRECT_REVISION :
+			    VMXERR_VMPTRLD_INVALID_ADDRESS);
+			goto done;
+		}
 	}
 	n->current_vmcs12 = vmcs12;
 	nested_vmx_result(vcpu, VMXR_SUCCEED);

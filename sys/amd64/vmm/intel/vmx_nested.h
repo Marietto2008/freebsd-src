@@ -133,6 +133,44 @@ struct vmcs12_field {
 };
 
 /*
+ * Rappresentazione PERSISTENTE del VMCS12 nella sua regione di memoria
+ * dell'L1 (parere #22 di Astra). La cache per-vCPU qui sotto e' solo
+ * un'accelerazione: la copia di riferimento e' la regione indicata
+ * dall'operando di VMPTRLD/VMCLEAR (GPA dell'L1, mai tradotto con l'EPT12).
+ * VMCLEAR, lo sfratto dalla cache e VMXOFF vi scrivono i campi; VMPTRLD li
+ * rilegge. Serve perche' Hyper-V migra i VMCS fra LP (VMCLEAR su uno,
+ * VMPTRLD sull'altro, SDM 24.11.1): prima il contenuto si perdeva e il
+ * VMLAUNCH della partizione di WSL2 dava VMfail 7 (7 campi su ~104).
+ *
+ * Il formato e' definito dall'implementazione (SDM 24.2): i primi 8 byte
+ * (revision ID, abort indicator) sono architetturali e NON si toccano; poi
+ * un'intestazione bhyve e le coppie (encoding, valore) serializzate a 12
+ * byte, senza padding del compilatore. Un L1 che legga la pagina
+ * direttamente non e' supportato, come sul ferro vero.
+ */
+#define	VMCS12_MEM_MAGIC	0x32316862U	/* "bh12" */
+#define	VMCS12_MEM_VERSION	1
+struct vmcs12_mem_field {
+	uint32_t	enc;
+	uint32_t	val_lo;
+	uint32_t	val_hi;
+} __packed;
+struct vmcs12_mem {
+	uint32_t	revision;	/* architetturale: lo scrive l'L1 */
+	uint32_t	abort;		/* architetturale */
+	uint32_t	magic;		/* VMCS12_MEM_MAGIC */
+	uint16_t	version;	/* VMCS12_MEM_VERSION */
+	uint16_t	launched;	/* launch state: 0 clear, 1 launched */
+	uint32_t	nfields;	/* <= VMCS12_NFIELDS */
+	uint32_t	digest;		/* FNV-1a 32 di fields[0..nfields) */
+	struct vmcs12_mem_field fields[VMCS12_NFIELDS];
+} __packed;
+_Static_assert(sizeof(struct vmcs12_mem_field) == 12,
+    "vmcs12_mem_field deve occupare 12 byte");
+_Static_assert(sizeof(struct vmcs12_mem) <= PAGE_SIZE,
+    "la rappresentazione del VMCS12 non sta in una pagina");
+
+/*
  * Lista MSR del VMCS12 (SDM 24.7.2): fino a 512 voci da 16 byte = 8 KB,
  * allineata a 16, quindi su al massimo 3 pagine; una voce non scavalca mai
  * il confine di pagina.
@@ -209,6 +247,7 @@ struct vmx_nested {
 	uint64_t	vmx_msr[VMX_NESTED_NMSR];  /* MSR VMX 0x480..0x491 (T1.4) */
 	uint64_t	feature_control;	/* IA32_FEATURE_CONTROL (T1.4) */
 	char		*msr_bitmap;	/* pagina MSR bitmap fusa L0|L1 (T6.3) */
+	int		evict_next;	/* prossimo slot da sfrattare (giro) */
 	struct timeval	msrbm_warn_t;	/* ratelimit: bitmap L1 non mappabile */
 	int		msrbm_warn_n;
 	uint64_t	*vept_root;	/* radice shadow EPT (T2.7), NULL se assente */

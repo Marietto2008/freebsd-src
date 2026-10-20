@@ -1,0 +1,4 @@
+# Persistenza VMCS12 (parere #22): test_vmcs_persist + lifecycle, nessun L2.
+# kut-run.sh --nested kut-persist.list
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+persist | vmx.flat | test_vmx_feature_control test_vmxon test_vmcs_lifecycle test_vmcs_persist | -cpu max | 1 | 1024 | 120
