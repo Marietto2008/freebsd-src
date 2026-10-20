@@ -114,6 +114,7 @@ SDT_PROBE_DEFINE3(vmm, vmx, nested, diag_simp, "int", "uint64_t", "uint64_t");
  *      l1_efer, entry_ctls12, (lista_efer_presente<<32 | lista_efer_valore_basso))
  */
 SDT_PROBE_DEFINE6(vmm, vmx, nested, efer, "int", "uint64_t", "uint64_t", "uint64_t", "uint64_t", "uint64_t");
+SDT_PROBE_DEFINE3(vmm, vmx, nested, efer2, "int", "uint64_t", "uint64_t");  /* vcpuid, eptp12, efer02 */
 /*
  * Uscita INTR_WINDOW da L2 gestita da L0: chi possedeva il bit nel VMCS02.
  * owner 0 = solo L0 (nested_compose_vmcs02, T2.6): atteso. owner 1 = anche
@@ -2595,6 +2596,8 @@ nested_diag_efer_trace(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	    vcpu->nested->l1_efer,
 	    vmcs12_read_field(c, VMCS_ENTRY_CTLS),
 	    list_efer);
+	SDT_PROBE3(vmm, vmx, nested, efer2, vcpu->vcpuid,
+	    vcpu->nested->vept_eptp12, vmcs_read(VMCS_GUEST_IA32_EFER));
 }
 
 bool
