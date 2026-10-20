@@ -190,7 +190,8 @@ VMM_STAT_INTEL(VMX_NESTED_L2_ENTRIES, "ingressi in L2");
 VMM_STAT_INTEL(VMX_NESTED_REFLECTIONS, "exit riflesse all'L1");
 VMM_STAT_INTEL(VMX_NESTED_SYNTH_EXITS, "exit sintetiche verso l'L1");
 VMM_STAT_INTEL(VMX_NESTED_SLOWPATH, "exit nested gestite nello slow path");
-VMM_STAT_INTEL(VMX_NESTED_VMFAIL, "VMfail restituiti all'L1");
+VMM_STAT_INTEL(VMX_NESTED_VMFAIL, "VMfailValid restituiti all'L1");
+VMM_STAT_INTEL(VMX_NESTED_VMFAIL_INVALID, "VMfailInvalid restituiti all'L1");
 VMM_STAT_INTEL(VMX_NESTED_MSRBM_UNMAPPED,
     "bitmap MSR dell'L1 attiva ma non mappabile");
 VMM_STAT_INTEL(VMX_NESTED_VMCS12_SAVED, "VMCS12 salvati in memoria");
@@ -401,11 +402,18 @@ nested_vmx_result(struct vmx_vcpu *vcpu, int errnum)
 		/* SDM VMfail: VMfailValid(errnum) se c'e' un VMCS corrente,
 		 * altrimenti VMfailInvalid (non c'e' dove scrivere l'errore). */
 		struct vmcs12_cache *c = nested_current_cache(vcpu->nested);
+		/*
+		 * Contatori: prima VMX_NESTED_VMFAIL era definito ma nessuno lo
+		 * incrementava, e lo 0 di --get-stats non diceva nulla.
+		 */
 		if (c != NULL) {		/* L1 lo legge via VMREAD 0x4400 */
 			rflags |= PSL_Z;
 			vmcs12_write_field(c, VMCS_INSTRUCTION_ERROR, errnum);
-		} else
+			vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMFAIL, 1);
+		} else {
 			rflags |= PSL_C;
+			vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMFAIL_INVALID, 1);
+		}
 	}
 	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, rflags);
 }
@@ -479,6 +487,7 @@ nested_vmfail_invalid(struct vmx_vcpu *vcpu)
 	rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_Z | PSL_N | PSL_V);
 	rflags |= PSL_C;			/* VMfailInvalid */
 	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RFLAGS, rflags);
+	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VMFAIL_INVALID, 1);
 }
 
 static void
