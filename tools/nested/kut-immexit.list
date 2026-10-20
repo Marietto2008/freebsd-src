@@ -1,0 +1,5 @@
+# Immediate exit (parere #24): interrupt dell'L1 pendente + iniezione verso l'L2.
+# sudo kut-run.sh --nested kut-immexit.list
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+l1intr_l2inj     | vmx.flat | vmx_l1_intr_vs_l2_injection_test     | -cpu max | 1 | 1024 | 120
+l1intr_l2inj_ept | vmx.flat | vmx_l1_intr_vs_l2_injection_ept_test | -cpu max | 1 | 1024 | 120

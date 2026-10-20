@@ -248,6 +248,14 @@ struct vmx_nested {
 	uint64_t	feature_control;	/* IA32_FEATURE_CONTROL (T1.4) */
 	char		*msr_bitmap;	/* pagina MSR bitmap fusa L0|L1 (T6.3) */
 	int		evict_next;	/* prossimo slot da sfrattare (giro) */
+	/*
+	 * Immediate exit (parere #24 di Astra): VMX preemption timer a 0 nel
+	 * VMCS02, armato da L0 quando rinvia un interrupt dell'L1 perche' l'L2
+	 * ha un evento da consegnare. imm_ok: la CPU ha il timer nei controlli
+	 * pin. imm_armed: il bit nel VMCS02 corrente e' di L0, non dell'L1.
+	 */
+	bool		imm_ok;
+	bool		imm_armed;
 	struct timeval	msrbm_warn_t;	/* ratelimit: bitmap L1 non mappabile */
 	int		msrbm_warn_n;
 	uint64_t	*vept_root;	/* radice shadow EPT (T2.7), NULL se assente */

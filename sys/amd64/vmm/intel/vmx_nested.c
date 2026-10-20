@@ -137,6 +137,13 @@ SDT_PROBE_DEFINE5(vmm, vmx, nested, msrbm, "int", "uint64_t", "uint64_t",
 SDT_PROBE_DEFINE6(vmm, vmx, nested, vmcs12mem, "int", "uint64_t", "int",
     "int", "int", "uint32_t");
 /*
+ * Immediate exit (parere #24). immexit(vcpuid, op, kind): op 1 armato (kind =
+ * tipo del rinvio, 1 evento in ENTRY_INTR_INFO, 2 in exitintinfo), 2 uscita
+ * del timer di L0 arrivata, 3 rinvio senza immediate exit perche' l'L1 usa il
+ * suo timer, 4 CPU senza preemption timer.
+ */
+SDT_PROBE_DEFINE3(vmm, vmx, nested, immexit, "int", "int", "int");
+/*
  * Uscita INTR_WINDOW da L2 gestita da L0: chi possedeva il bit nel VMCS02.
  * owner 0 = solo L0 (nested_compose_vmcs02, T2.6): atteso. owner 1 = anche
  * il VMCS12 lo chiedeva: INVARIANTE VIOLATO, nested_l2_exit doveva riflettere.
@@ -198,6 +205,10 @@ VMM_STAT_INTEL(VMX_NESTED_VMCS12_SAVED, "VMCS12 salvati in memoria");
 VMM_STAT_INTEL(VMX_NESTED_VMCS12_LOADED, "VMCS12 caricati dalla memoria");
 VMM_STAT_INTEL(VMX_NESTED_VMCS12_MEMERR,
     "VMCS12: regione corrotta o non mappabile");
+VMM_STAT_INTEL(VMX_NESTED_IMMEXIT_ARMED, "immediate exit armate da L0");
+VMM_STAT_INTEL(VMX_NESTED_IMMEXIT_FIRED, "immediate exit arrivate");
+VMM_STAT_INTEL(VMX_NESTED_IMMEXIT_L1TIMER,
+    "rinvii senza immediate exit (timer dell'L1 in uso)");
 
 /*
  * Alloca lo stato nested del vCPU. Idempotente: se gia' presente, no-op.
@@ -322,6 +333,9 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	KASSERT((vtophys(n->msr_bitmap) & PAGE_MASK) == 0,
 	    ("vmx_nested_init: bitmap MSR non allineata"));
 	memset(n->msr_bitmap, 0xff, PAGE_SIZE);
+	/* immediate exit: il VMCS02 puo' accendere il preemption timer? */
+	n->imm_ok = ((rdmsr(MSR_VMX_TRUE_PINBASED_CTLS) >> 32) &
+	    PINBASED_PREMPTION_TIMER) != 0;
 	vcpu->nested = n;
 	return (0);
 }
@@ -2234,6 +2248,55 @@ nested_preempt_refresh(struct vmx_vcpu *vcpu)
 	vmwrite(VMCS_PREEMPTION_TIMER_VALUE, rem);
 }
 
+/*
+ * Immediate exit (parere #24 di Astra; come request_immediate_exit di KVM).
+ * Quando nested_check_events RINVIA un interrupt dell'L1 perche' l'L2 ha un
+ * evento da consegnare, senza altro l'interrupt aspettava la successiva uscita
+ * naturale dell'L2: sotto carico di calcolo fino a secondi (fase A: 3,98 M
+ * rinvii, coda fino a 4 s). Ora L0 accende nel VMCS02 il VMX preemption timer
+ * a 0: SDM 22.6.4, l'uscita avviene dopo la consegna dell'evento iniettato e
+ * prima della prima istruzione dell'L2. Se la consegna e' interrotta (EPT
+ * violation sullo shadow) l'uscita ha quel motivo e l'evento finisce in
+ * exitintinfo: il rinvio di tipo 2 lo protegge come prima (22dc5d5).
+ *
+ * Il timer e' una risorsa di L0: si arma solo se l'L1 NON usa il suo
+ * (preempt_on); altrimenti serve un multiplexing delle due scadenze, non
+ * fatto: si conta il caso (con Windows 11 + Hyper-V: mai, misurato). Il bit
+ * si toglie alla chiamata successiva (prima dell'ingresso dopo), e l'uscita
+ * 52 col bit di L0 non si riflette mai all'L1 (nested_l2_exit).
+ */
+static void
+nested_immexit_arm(struct vmx_vcpu *vcpu, int kind)
+{
+	struct vmx_nested *n = vcpu->nested;
+
+	if (!n->imm_ok) {
+		SDT_PROBE3(vmm, vmx, nested, immexit, vcpu->vcpuid, 4, kind);
+		return;
+	}
+	if (n->preempt_on) {
+		vmm_stat_incr(vcpu->vcpu, VMX_NESTED_IMMEXIT_L1TIMER, 1);
+		SDT_PROBE3(vmm, vmx, nested, immexit, vcpu->vcpuid, 3, kind);
+		return;
+	}
+	vmwrite(VMCS_PIN_BASED_CTLS, vmcs_read(VMCS_PIN_BASED_CTLS) |
+	    PINBASED_PREMPTION_TIMER);
+	vmwrite(VMCS_PREEMPTION_TIMER_VALUE, 0);
+	n->imm_armed = true;
+	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_IMMEXIT_ARMED, 1);
+	SDT_PROBE3(vmm, vmx, nested, immexit, vcpu->vcpuid, 1, kind);
+}
+
+/* Toglie il timer di L0 dal VMCS02 corrente (l'L1 non lo usa: armato solo
+ * con preempt_on falso). */
+static void
+nested_immexit_disarm(struct vmx_vcpu *vcpu)
+{
+	vmwrite(VMCS_PIN_BASED_CTLS, vmcs_read(VMCS_PIN_BASED_CTLS) &
+	    ~PINBASED_PREMPTION_TIMER);
+	vcpu->nested->imm_armed = false;
+}
+
 bool
 nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
     uint64_t rip)
@@ -2245,6 +2308,9 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 
 	if (c == NULL || !n->in_l2)
 		return (false);
+	/* il timer di L0 vale per UN ingresso: lo si riarma se serve ancora */
+	if (n->imm_armed)
+		nested_immexit_disarm(vcpu);
 	/*
 	 * MTF pendente (SDM 26.5.2 / come nested_vmx_mtf_pending di KVM): se
 	 * L0 ha completato un'istruzione dell'L2 per conto suo (I/O, MSR, CPUID
@@ -2306,6 +2372,7 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 	if ((vmcs_read(VMCS_ENTRY_INTR_INFO) & VMCS_INTR_VALID) != 0) {
 		SDT_PROBE4(vmm, vmx, nested, defer, vcpu->vcpuid, 1,
 		    vmcs_read(VMCS_ENTRY_INTR_INFO), vec);
+		nested_immexit_arm(vcpu, 1);
 		return (false);
 	}
 	/*
@@ -2337,6 +2404,7 @@ nested_check_events(struct vmx_vcpu *vcpu, struct vm_exit *vmexit,
 		if ((info1 & VM_INTINFO_VALID) != 0) {
 			SDT_PROBE4(vmm, vmx, nested, defer, vcpu->vcpuid, 2,
 			    info1, vec);
+			nested_immexit_arm(vcpu, 2);
 			return (false);
 		}
 	}
@@ -2971,6 +3039,21 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	case EXIT_REASON_EXT_INTR:
 		/* interrupt fisico per l'host: lo gestisce l'L0, si rientra in L2 */
 		return (false);
+	case EXIT_REASON_VMX_PREEMPT:
+		/*
+		 * Immediate exit di L0 (nested_immexit_arm): NON e' una scadenza
+		 * del timer dell'L1 e non gli si riflette. L'evento dell'L2 e'
+		 * consegnato; si resta in L2 e, prima del prossimo ingresso,
+		 * nested_check_events consegna l'interrupt rinviato all'L1.
+		 */
+		if (vcpu->nested->imm_armed) {
+			vmm_stat_incr(vcpu->vcpu, VMX_NESTED_IMMEXIT_FIRED, 1);
+			SDT_PROBE3(vmm, vmx, nested, immexit, vcpu->vcpuid, 2,
+			    0);
+			vmexit->inst_length = 0;
+			return (true);
+		}
+		break;			/* timer dell'L1 -> riflette */
 	case EXIT_REASON_EXCEPTION:
 		/* NMI (intr_type NMI) all'L0; le altre eccezioni si riflettono
 		 * se nella exception bitmap di VMCS12 (semplificato: riflette). */
@@ -3485,6 +3568,7 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 		vmwrite(VMCS_PREEMPTION_TIMER_VALUE, val);
 	}
 	vmwrite(VMCS_PIN_BASED_CTLS, pin);
+	n->imm_armed = false;		/* pin appena riscritto dal VMCS12 */
 
 	/* --- Primary proc: VMCS12 U requisiti L0; I/O bitmaps=0, TPR shadow=0;
 	 *     HLT = SOLO VMCS12 (non si eredita da VMCS01) --- */
