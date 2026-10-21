@@ -143,6 +143,9 @@ SDT_PROBE_DEFINE6(vmm, vmx, nested, vmcs12mem, "int", "uint64_t", "int",
  * suo timer, 4 CPU senza preemption timer.
  */
 SDT_PROBE_DEFINE3(vmm, vmx, nested, immexit, "int", "int", "int");
+/* INVEPT dell'L1 (parere #24): invept(vcpuid, tipo, eptp del descrittore,
+ * radici shadow svuotate). */
+SDT_PROBE_DEFINE4(vmm, vmx, nested, invept, "int", "int", "uint64_t", "int");
 /*
  * Uscita INTR_WINDOW da L2 gestita da L0: chi possedeva il bit nel VMCS02.
  * owner 0 = solo L0 (nested_compose_vmcs02, T2.6): atteso. owner 1 = anche
@@ -209,6 +212,9 @@ VMM_STAT_INTEL(VMX_NESTED_IMMEXIT_ARMED, "immediate exit armate da L0");
 VMM_STAT_INTEL(VMX_NESTED_IMMEXIT_FIRED, "immediate exit arrivate");
 VMM_STAT_INTEL(VMX_NESTED_IMMEXIT_L1TIMER,
     "rinvii senza immediate exit (timer dell'L1 in uso)");
+VMM_STAT_INTEL(VMX_NESTED_INVEPT_SINGLE, "INVEPT single-context dell'L1");
+VMM_STAT_INTEL(VMX_NESTED_INVEPT_ALL, "INVEPT all-context dell'L1");
+VMM_STAT_INTEL(VMX_NESTED_VEPT_WIPED, "radici shadow EPT svuotate da INVEPT");
 
 /*
  * Alloca lo stato nested del vCPU. Idempotente: se gia' presente, no-op.
@@ -3257,18 +3263,20 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 }
 
 /*
- * INVEPT dell'L1 (prima non instradata: finiva in userland). Si svuota la
- * shadow EPT per intero, qualunque sia il tipo (single-context o all-context
- * sono entrambi soddisfatti da un flush completo); il TLB dell'EPTP shadow lo
- * invalida vmx_run al prossimo ingresso in L2. Tipo non annunciato nell'EPT
- * cap esposto all'L1 (bit 25 single, 26 all) -> VMfail 28.
+ * INVEPT dell'L1 (prima non instradata: finiva in userland). All-context
+ * svuota tutta la shadow EPT; single-context solo le radici con la stessa
+ * base EPT12 dell'EPTP del descrittore (vmx_vept_invept, parere #24). Il TLB
+ * dell'EPTP shadow lo invalida vmx_run al prossimo ingresso in L2. Tipo non
+ * annunciato nell'EPT cap esposto all'L1 (bit 25 single, 26 all) -> VMfail 28.
+ * Il descrittore (m128) ha l'EPTP nei primi 8 byte.
  */
 static int
 nested_invept(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	uint32_t info = (uint32_t)n->exit_insn_info;
-	uint64_t type, cap = n->vmx_msr[0x48c - 0x480];
+	uint64_t type, eptp = 0, cap = n->vmx_msr[0x48c - 0x480];
+	int wiped;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
 	type = vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
@@ -3278,7 +3286,14 @@ nested_invept(struct vmx_vcpu *vcpu)
 		nested_advance_rip(vcpu);
 		return (0);
 	}
-	vmx_vept_invept(n);
+	if (type == 1 && nested_read_operand_u64(vcpu, &eptp) != 0)
+		return (0);			/* eccezione o VMfail gia' dati */
+	wiped = vmx_vept_invept(n, type, eptp);
+	vmm_stat_incr(vcpu->vcpu, type == 1 ? VMX_NESTED_INVEPT_SINGLE :
+	    VMX_NESTED_INVEPT_ALL, 1);
+	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VEPT_WIPED, wiped);
+	SDT_PROBE4(vmm, vmx, nested, invept, vcpu->vcpuid, (int)type, eptp,
+	    wiped);
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 	nested_advance_rip(vcpu);
 	return (0);

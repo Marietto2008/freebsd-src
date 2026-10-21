@@ -1,0 +1,4 @@
+# INVEPT single-context selettivo (parere #24): due EPT12, stessa base con attributi diversi, all-context.
+# sudo kut-run.sh --nested kut-invept.list
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+invept_sel | vmx.flat | vmx_invept_selective_test | -cpu max | 1 | 1024 | 120

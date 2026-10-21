@@ -140,20 +140,39 @@ vept_wipe(uint64_t *root)
 }
 
 /*
- * INVEPT dell'L1: svuota TUTTE le radici (single-context compreso: non si
- * legge il descrittore, e svuotarne di piu' e' sempre lecito). Il TLB per
- * l'EPTP shadow lo invalida vmx_run a ogni rientro in L2 (INVEPT
- * single-context sulla radice corrente; le altre lo ricevono quando
- * tornano correnti).
+ * INVEPT dell'L1. All-context (tipo 2): svuota tutte le radici. Single-
+ * context (tipo 1, parere #24 di Astra, come handle_invept di KVM): solo le
+ * radici costruite per un EPTP12 con la stessa BASE FISICA (bit 51:12) di
+ * quello del descrittore -- tutte, se piu' d'una -- perche' l'SDM associa le
+ * traduzioni ai bit 51:12 e non agli attributi dell'EPTP. Le altre (l'altro
+ * VTL, l'altra partizione) restano: prima si svuotavano tutte a ogni INVEPT
+ * single-context di Hyper-V (~50/s), con ~150 000 EPT violation/s per
+ * ricostruirle (fase A). Svuotare la radice intera basta: single-context non
+ * e' single-address.
+ * Il TLB per l'EPTP shadow lo invalida vmx_run a ogni rientro in L2 (INVEPT
+ * single-context sulla radice corrente; le altre lo ricevono quando tornano
+ * correnti), come prima. Le radici sono per vCPU (vmx_nested): nessuna
+ * condivisione fra vCPU. Ritorna il numero di radici svuotate.
  */
-void
-vmx_vept_invept(struct vmx_nested *n)
-{
-	int i;
+#define	VEPT_EPTP_BASE	0x000ffffffffff000ULL	/* bit 51:12 */
 
-	for (i = 0; i < VEPT_NROOTS; i++)
-		if (n->vept_slot[i].root != NULL)
-			vept_wipe(n->vept_slot[i].root);
+int
+vmx_vept_invept(struct vmx_nested *n, uint64_t type, uint64_t eptp)
+{
+	struct vept_slot *s;
+	int i, wiped = 0;
+
+	for (i = 0; i < VEPT_NROOTS; i++) {
+		s = &n->vept_slot[i];
+		if (s->root == NULL)
+			continue;
+		if (type == 1 && (s->eptp12 & VEPT_EPTP_BASE) !=
+		    (eptp & VEPT_EPTP_BASE))
+			continue;
+		vept_wipe(s->root);
+		wiped++;
+	}
+	return (wiped);
 }
 
 /* Libera le tabelle shadow (ricorsiva sui livelli interni). */
