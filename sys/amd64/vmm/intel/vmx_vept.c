@@ -102,8 +102,78 @@ vept_count_leaves(const uint64_t *tbl, int level)
 	return (n);
 }
 
-#define	VEPT_OBS_MAX	512		/* tabelle tracciate per radice */
-#define	VEPT_OBS_HASH	1024		/* bucket (potenza di 2, > MAX) */
+#define	VEPT_OBS_MAX	2048		/* tabelle tracciate per radice (C2.1) */
+#define	VEPT_OBS_HASH	4096		/* bucket (potenza di 2, > MAX) */
+
+/*
+ * C2.1 (parere #27 di Astra): memoria della diagnostica con conto e tetto
+ * globali. Le fotografie si allocano una per tabella, quando serve, con
+ * M_NOWAIT: se il tetto e' raggiunto o l'allocazione fallisce, la misura
+ * della radice diventa incompleta (overflow), l'INVEPT non cambia.
+ */
+static int vept_diag_maxmb = 128;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_diag_maxmb, CTLFLAG_RWTUN,
+    &vept_diag_maxmb, 0, "nested: tetto della memoria della diagnostica EPT12 (MB)");
+static u_long vept_diag_mem, vept_diag_mem_high;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_diag_mem, CTLFLAG_RD,
+    &vept_diag_mem, 0, "nested: memoria della diagnostica EPT12 (byte)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_diag_mem_high, CTLFLAG_RD,
+    &vept_diag_mem_high, 0, "nested: massimo della memoria della diagnostica EPT12");
+static u_long vept_diag_dist_ovf;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_diag_dist_ovf, CTLFLAG_RD,
+    &vept_diag_dist_ovf, 0, "nested: tabelle distinte non registrate (insieme pieno)");
+
+static void *
+vept_diag_alloc(size_t sz)
+{
+	void *p;
+	u_long m;
+
+	if (atomic_fetchadd_long(&vept_diag_mem, sz) + sz >
+	    (u_long)vept_diag_maxmb << 20) {
+		atomic_subtract_long(&vept_diag_mem, sz);
+		return (NULL);
+	}
+	p = malloc(sz, M_VMX_VEPT, M_NOWAIT | M_ZERO);
+	if (p == NULL) {
+		atomic_subtract_long(&vept_diag_mem, sz);
+		return (NULL);
+	}
+	m = vept_diag_mem;
+	if (m > vept_diag_mem_high)
+		vept_diag_mem_high = m;		/* indicativo: senza CAS */
+	return (p);
+}
+
+static void
+vept_diag_free(void *p, size_t sz)
+{
+	if (p == NULL)
+		return;
+	free(p, M_VMX_VEPT);
+	atomic_subtract_long(&vept_diag_mem, sz);
+}
+
+/*
+ * C2.1: insieme CUMULATIVO delle tabelle EPT12 distinte di una radice (cioe'
+ * di un EPTP12), che NON si azzera all'INVEPT: con B1 le radici vivranno a
+ * lungo e le fotografie si accumuleranno. Chiave (GPA, livello, base L2-GPA),
+ * ora dell'ultimo uso, epoca (= numero di svuotamenti della radice) in cui e'
+ * stata vista l'ultima volta: una tabella che ricompare dopo uno svuotamento
+ * e' un "riuso". Si azzera solo quando lo slot passa a un altro EPTP12.
+ */
+#define	VEPT_DIST_HASH	16384
+struct vept_dent {
+	uint64_t	gpa;		/* 0 = vuota */
+	uint64_t	base;
+	sbintime_t	last;
+	uint32_t	epoch;
+	int		level;
+};
+SDT_PROBE_DEFINE6(vmm, vmx, nested, veptdiag5, "int", "uint64_t", "uint64_t",
+    "uint64_t", "uint64_t", "uint64_t");
+/* veptdiag5(vcpu, eptp12, distinte in 1 s | 10 s << 21 | 60 s << 42,
+ * distinte totali, riusi dopo uno svuotamento, tabelle tracciate ora) */
 
 struct vept_obs_ent {
 	uint64_t	gpa;		/* tabella EPT12 (GPA dell'L1); 0 = vuota */
@@ -125,6 +195,10 @@ struct vept_obs {
 	uint64_t	walk_mismatch;	/* voce usata != fotografia */
 	bool		overflow;	/* tetto superato: misura incompleta */
 	struct vept_rng	*rng;		/* C2: buffer degli intervalli */
+	struct vept_dent *dist;		/* C2.1: insieme cumulativo */
+	uint32_t	epoch;		/* C2.1: svuotamenti della radice */
+	uint64_t	dtotal, reuse;	/* C2.1 */
+	sbintime_t	dreport;	/* C2.1: ultimo riepilogo */
 };
 
 static struct vept_obs *
@@ -135,8 +209,8 @@ vept_obs_get(struct vmx_nested *n, uint64_t *root)
 	for (i = 0; i < VEPT_NROOTS; i++)
 		if (n->vept_slot[i].root == root) {
 			if (n->vept_obs[i] == NULL)
-				n->vept_obs[i] = malloc(sizeof(struct vept_obs),
-				    M_VMX_VEPT, M_WAITOK | M_ZERO);
+				n->vept_obs[i] = vept_diag_alloc(
+				    sizeof(struct vept_obs));
 			return (n->vept_obs[i]);
 		}
 	return (NULL);
@@ -154,9 +228,20 @@ vept_obs_reset(struct vept_obs *o)
 		o->ent[i].gpa = 0;
 		o->ent[i].ambiguous = false;
 	}
+	o->epoch++;		/* C2.1: l'insieme cumulativo resta */
 	o->n = 0;
 	o->walk_mismatch = 0;
 	o->overflow = false;
+}
+
+/* C2.1: lo slot passa a un altro EPTP12: l'insieme cumulativo riparte. */
+static void
+vept_dist_clear(struct vept_obs *o)
+{
+	if (o == NULL || o->dist == NULL)
+		return;
+	memset(o->dist, 0, VEPT_DIST_HASH * sizeof(struct vept_dent));
+	o->dtotal = o->reuse = 0;
 }
 
 static void
@@ -167,11 +252,76 @@ vept_obs_free(struct vept_obs *o)
 	if (o == NULL)
 		return;
 	for (i = 0; i < VEPT_OBS_HASH; i++)
-		if (o->ent[i].snap != NULL)
-			free(o->ent[i].snap, M_VMX_VEPT);
-	if (o->rng != NULL)
-		free(o->rng, M_VMX_VEPT);
-	free(o, M_VMX_VEPT);
+		vept_diag_free(o->ent[i].snap, PAGE_SIZE);
+	vept_diag_free(o->rng, VEPT_RNG_MAX * sizeof(struct vept_rng));
+	vept_diag_free(o->dist, VEPT_DIST_HASH * sizeof(struct vept_dent));
+	vept_diag_free(o, sizeof(struct vept_obs));
+}
+
+/* C2.1: aggiorna l'insieme cumulativo delle tabelle distinte. */
+static void
+vept_dist_note(struct vept_obs *o, uint64_t gpa, int level, uint64_t base)
+{
+	struct vept_dent *d;
+	uint32_t h;
+	int i;
+
+	if (o->dist == NULL && (o->dist = vept_diag_alloc(VEPT_DIST_HASH *
+	    sizeof(struct vept_dent))) == NULL) {
+		vept_diag_dist_ovf++;
+		return;
+	}
+	h = (uint32_t)(((gpa >> 12) ^ (base >> 21) ^ (uint64_t)level) *
+	    2654435761U);
+	for (i = 0; i < 64; i++) {	/* sondaggio limitato */
+		d = &o->dist[(h + i) & (VEPT_DIST_HASH - 1)];
+		if (d->gpa == gpa && d->level == level && d->base == base) {
+			if (d->epoch != o->epoch) {
+				o->reuse++;	/* ricompare dopo uno svuotamento */
+				d->epoch = o->epoch;
+			}
+			d->last = sbinuptime();
+			return;
+		}
+		if (d->gpa == 0) {
+			d->gpa = gpa;
+			d->level = level;
+			d->base = base;
+			d->epoch = o->epoch;
+			d->last = sbinuptime();
+			o->dtotal++;
+			return;
+		}
+	}
+	vept_diag_dist_ovf++;
+}
+
+/* C2.1: al massimo una volta al secondo, tabelle distinte usate negli ultimi
+ * 1, 10 e 60 secondi. */
+static void
+vept_dist_report(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12)
+{
+	sbintime_t now = sbinuptime(), age;
+	uint64_t d1 = 0, d10 = 0, d60 = 0;
+	int i;
+
+	if (o->dist == NULL || now - o->dreport < SBT_1S)
+		return;
+	o->dreport = now;
+	for (i = 0; i < VEPT_DIST_HASH; i++) {
+		if (o->dist[i].gpa == 0)
+			continue;
+		age = now - o->dist[i].last;
+		if (age < SBT_1S)
+			d1++;
+		if (age < 10 * SBT_1S)
+			d10++;
+		if (age < 60 * SBT_1S)
+			d60++;
+	}
+	SDT_PROBE6(vmm, vmx, nested, veptdiag5, vcpu->vcpuid, eptp12,
+	    MIN(d1, 0x1fffff) | MIN(d10, 0x1fffff) << 21 |
+	    MIN(d60, 0x1fffff) << 42, o->dtotal, o->reuse, o->n);
 }
 
 /*
@@ -189,6 +339,7 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 
 	if (o == NULL || gpa == 0)
 		return;
+	vept_dist_note(o, gpa, level, base);
 	h = (uint32_t)((gpa >> 12) * 2654435761U);
 	for (i = 0; i < VEPT_OBS_HASH; i++) {
 		e = &o->ent[(h + i) & (VEPT_OBS_HASH - 1)];
@@ -206,8 +357,10 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 		o->overflow = true;
 		return;
 	}
-	if (e->snap == NULL)
-		e->snap = malloc(PAGE_SIZE, M_VMX_VEPT, M_WAITOK);
+	if (e->snap == NULL && (e->snap = vept_diag_alloc(PAGE_SIZE)) == NULL) {
+		o->overflow = true;		/* tetto di memoria: incompleta */
+		return;
+	}
 	memcpy(e->snap, page, PAGE_SIZE);
 	e->gpa = gpa;
 	e->level = level;
@@ -287,9 +440,10 @@ vept_obs_scan(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
 
 	if (o == NULL)
 		return;
-	if (o->rng == NULL)
-		o->rng = malloc(VEPT_RNG_MAX * sizeof(struct vept_rng),
-		    M_VMX_VEPT, M_WAITOK);
+	if (o->rng == NULL &&
+	    (o->rng = vept_diag_alloc(VEPT_RNG_MAX * sizeof(struct vept_rng))) ==
+	    NULL)
+		return;			/* tetto di memoria: niente misura */
 	if (o->overflow)
 		fb |= VEPT_FB_OVERFL;
 	if (o->walk_mismatch != 0)
@@ -372,6 +526,7 @@ vept_obs_scan(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
 		    o->rng[i].end);
 	SDT_PROBE6(vmm, vmx, nested, veptdiag4, vcpu->vcpuid, live, hit, nr,
 	    fb, (uint64_t)sbttons(sbinuptime() - t1));
+	vept_dist_report(vcpu, o, eptp12);
 }
 
 
@@ -426,6 +581,7 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 		else {
 			vept_wipe(pick->root);
 			vept_obs_reset(n->vept_obs[pick - n->vept_slot]);
+			vept_dist_clear(n->vept_obs[pick - n->vept_slot]);
 		}
 		pick->eptp12 = eptp12;
 	}
