@@ -37,6 +37,7 @@
 #include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/malloc.h>
+#include <sys/sysctl.h>
 #include <sys/types.h>
 
 #include <vm/vm.h>
@@ -107,6 +108,12 @@ struct vm_run_13 {
 	_IOWR('v', IOCNUM_RUN, struct vm_run_13)
 
 #endif /* COMPAT_FREEBSD13 */
+
+SYSCTL_DECL(_hw_vmm);
+static int nested_memgen_inject = 0;
+SYSCTL_INT(_hw_vmm, OID_AUTO, nested_memgen_inject, CTLFLAG_RWTUN,
+    &nested_memgen_inject, 0,
+    "nested: permette VM_NESTED_MEMGEN_BUMP (solo prove)");
 
 const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 	VMMDEV_IOCTL(VM_RUN, VMMDEV_IOCTL_LOCK_ONE_VCPU),
@@ -193,6 +200,9 @@ const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 
 	VMMDEV_IOCTL(VM_GET_FLAGS, 0),
 	VMMDEV_IOCTL(VM_SET_FLAGS, 0),
+	/* gli stessi lock di VM_MMAP_MEMSEG: nessun vCPU in esecuzione */
+	VMMDEV_IOCTL(VM_NESTED_MEMGEN_BUMP,
+	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
 };
 const size_t vmmdev_machdep_ioctl_count = nitems(vmmdev_machdep_ioctls);
 
@@ -666,6 +676,22 @@ vmmdev_machdep_ioctl(struct vm *vm, struct vcpu *vcpu, u_long cmd, caddr_t data,
 		vm_get_flags(vm, vflags);
         break;
 	}
+	case VM_NESTED_MEMGEN_BUMP:
+		/*
+		 * Prova del nested (parere #28 di Astra, §4): fa avanzare la
+		 * generazione dei mapping SENZA cambiarli, con i vCPU fermi
+		 * dal dispatcher (LOCK_ALL_VCPUS) e i memseg in esclusiva. Lo
+		 * shadow EPT deve accorgersene prima del prossimo ingresso in
+		 * L2. Solo con hw.vmm.nested_memgen_inject=1.
+		 */
+		if (!nested_memgen_inject) {
+			error = EPERM;
+			break;
+		}
+		vm_memmap_generation_bump(vm);
+		*(uint64_t *)data = vm_memmap_generation(vm);
+		error = 0;
+		break;
 	default:
 		error = ENOTTY;
 		break;

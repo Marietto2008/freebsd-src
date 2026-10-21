@@ -342,6 +342,8 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	/* immediate exit: il VMCS02 puo' accendere il preemption timer? */
 	n->imm_ok = ((rdmsr(MSR_VMX_TRUE_PINBASED_CTLS) >> 32) &
 	    PINBASED_PREMPTION_TIMER) != 0;
+	/* B1: la modalita' della shadow EPT resta quella della creazione */
+	n->vept_keep = vmx_vept_keep_enabled();
 	vcpu->nested = n;
 	return (0);
 }
@@ -3433,6 +3435,20 @@ vmx_nested_exit(void *vcpui)
 
 	SDT_PROBE1(vmm, vmx, nested, slowpath, vcpu);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
+
+	/*
+	 * B1: generazione dei mapping di L0 cambiata -> tutte le radici shadow
+	 * si svuotano qui, dove si puo' dormire, prima di qualunque altra cosa.
+	 * vmx_run esce apposta (vept_memgen_pending) se se ne accorge prima di
+	 * un ingresso in L2: allora non c'e' altro da fare, si riparte.
+	 */
+	if (vcpu->nested != NULL && vcpu->nested->vept_keep) {
+		vmx_vept_memgen_sync(vcpu);
+		if (vcpu->nested->vept_memgen_pending) {
+			vcpu->nested->vept_memgen_pending = false;
+			return (0);
+		}
+	}
 
 	/* Uscita di L2 gia' riflessa all'L1 in vmx_exit_process: qui va solo
 	 * fatto ripartire vmx_run. Il motivo d'uscita e' di L2 (es. VMCALL):

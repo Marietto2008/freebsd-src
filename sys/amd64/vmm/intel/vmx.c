@@ -3541,6 +3541,7 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			vmcs_write(VMCS_EPTP, ed.eptp);
 		}
 		invept(INVEPT_TYPE_SINGLE_CONTEXT, ed);
+		vmx_vept_hw_flushed(vcpu);	/* B1: conta i flush dovuti */
 	}
 	do {
 		/*
@@ -3563,6 +3564,21 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		    "%#lx/%#lx", __func__, vmcs_guest_rip(), rip));
 
 		handled = UNHANDLED;
+		/*
+		 * B1: una radice shadow di una generazione dei mapping vecchia
+		 * non deve servire a nessun ingresso. La generazione cambia solo
+		 * a vCPU IDLE, quindi la si vede al primo giro di un vmx_run:
+		 * si esce verso lo slow path, che svuota le radici e riparte
+		 * (il nuovo vmx_run fa l'INVEPT della radice ricostruita).
+		 */
+		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+		    vcpu->nested->vept_keep && vmx_vept_memgen_stale(vcpu)) {
+			vcpu->nested->vept_memgen_pending = true;
+			vmexit->rip = rip;
+			vmexit->inst_length = 0;
+			vmexit->exitcode = VM_EXITCODE_NESTED;
+			break;
+		}
 		/*
 		 * Interrupts are disabled from this point on until the
 		 * guest starts executing. This is done for the following
@@ -3771,6 +3787,9 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		/* diagnostica: fotografia dell'ingresso in L2 che inietta
 		 * hw.vmm.vmx.diag_vec, qui e non alla composizione (Astra #13) */
 		nested_diag_pre_entry(vcpu);
+		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+		    vcpu->nested->vept_keep)
+			vmx_vept_enter_check(vcpu);	/* B1: deve restare 0 */
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
 		/* nested: TSC al momento dell'uscita, per IA32_TSC nella lista
 		 * "store all'uscita" (SDM: valore all'uscita, non alla

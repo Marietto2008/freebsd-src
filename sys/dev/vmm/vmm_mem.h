@@ -61,6 +61,13 @@ struct vm_mem {
 	struct vm_mem_seg	mem_segs[VM_MAX_MEMSEGS];
 	struct sx		mem_segs_lock;
 	struct vmspace		*mem_vmspace;
+	/*
+	 * Generazione dei mapping (nested, B1): cresce a ogni mapping creato o
+	 * tolto, sempre a vCPU fermi (ioctl con LOCK_ALL_VCPUS). Chi conserva
+	 * traduzioni GPA -> HPA oltre la vita di un vm_gpa_hold (lo shadow EPT
+	 * del nested) la confronta prima di riusarle.
+	 */
+	uint64_t		mem_maps_gen;
 };
 
 int	vm_mem_init(struct vm_mem *mem, vm_offset_t lo, vm_offset_t hi);
@@ -101,6 +108,9 @@ void *vm_gpa_hold_global(struct vm *vm, vm_paddr_t gpa, size_t len,
     int prot, void **cookie);
 void vm_gpa_release(void *cookie);
 bool vm_mem_allocated(struct vcpu *vcpu, vm_paddr_t gpa);
+bool vm_mem_wired(struct vm *vm, vm_paddr_t gpa);
+uint64_t vm_memmap_generation(struct vm *vm);
+void vm_memmap_generation_bump(struct vm *vm);	/* memseg xlock, vCPU fermi */
 
 int vm_gla2gpa_nofault(struct vcpu *vcpu, struct vm_guest_paging *paging,
     uint64_t gla, int prot, uint64_t *gpa, int *is_fault);

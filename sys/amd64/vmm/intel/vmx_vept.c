@@ -25,6 +25,7 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
+#include <sys/proc.h>
 #include <sys/sdt.h>
 #include <sys/sysctl.h>
 
@@ -82,6 +83,130 @@ SDT_PROBE_DEFINE5(vmm, vmx, nested, veptdiag2, "int", "uint64_t", "uint64_t",
 /* veptdiag3(vcpuid, traduzioni shadow vive nella radice, cioe' le foglie
  * 4K che un B0 conserverebbe o un B1 dovrebbe giudicare) */
 SDT_PROBE_DEFINE2(vmm, vmx, nested, veptdiag3, "int", "uint64_t");
+
+/*
+ * B1 (parere #28 di Astra). Con hw.vmm.vmx.vept_keep=1 (letto alla creazione
+ * del nested di ogni vCPU) un INVEPT non svuota piu' la radice: rilegge le
+ * tabelle EPT12 tracciate, invalida nella shadow i soli intervalli L2-GPA
+ * delle voci cambiate e aggiorna quelle voci delle fotografie. Ogni dubbio
+ * (tabella ambigua, voce di PML4, tetto, tabella illeggibile o cambiata fra
+ * le due passate, radice non conservabile) svuota la radice come prima.
+ *
+ * Contratto TLB (audit del parere #28 §2): la shadow si modifica SOLO nello
+ * slow path (vmx_nested_exit, vCPU FROZEN). Dopo, vm_run riparte con un
+ * vmx_run nuovo che, se in L2, fa INVEPT single-context dell'EPTP shadow
+ * sulla CPU corrente PRIMA del primo ingresso; vmx_run gira tutto sotto il
+ * critical_enter di vm_run, quindi niente migrazioni fra l'INVEPT e gli
+ * ingressi. Su un'altra CPU dove il vCPU aveva girato restano traduzioni
+ * vecchie della stessa radice, ma il vCPU ci rientra solo passando da un
+ * altro vmx_run, cioe' da un altro INVEPT. Le radici sono per vCPU. Le
+ * tabelle intermedie della shadow non si staccano mai in B1 (si azzerano le
+ * foglie): si liberano solo allo svuotamento, come gia' prima di B1.
+ */
+static int vept_keep = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_keep, CTLFLAG_RWTUN, &vept_keep, 0,
+    "nested: B1, conserva la shadow EPT all'INVEPT (letto alla creazione "
+    "del vCPU nested)");
+static int vept_verify_hpa = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_verify_hpa, CTLFLAG_RWTUN,
+    &vept_verify_hpa, 0,
+    "nested: B1, riverifica a campione le foglie conservate (0 = no)");
+
+#define	VEPT_CTR(name, descr)						\
+	static u_long name;						\
+	SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, name, CTLFLAG_RD, &name, 0, descr)
+VEPT_CTR(vept_keep_partial_invepts, "B1: INVEPT con la radice conservata");
+VEPT_CTR(vept_keep_retained_leaves, "B1: foglie conservate (somma)");
+VEPT_CTR(vept_keep_invalidated_leaves, "B1: foglie invalidate (somma)");
+VEPT_CTR(vept_keep_full_fallbacks, "B1: INVEPT con svuotamento completo");
+VEPT_CTR(vept_keep_scan_race_fallbacks,
+    "B1: svuotamenti per tabella cambiata fra le due passate");
+VEPT_CTR(vept_keep_shadow_flushes,
+    "B1: INVEPT hardware dovuti a una shadow ridotta");
+VEPT_CTR(vept_keep_walk_zaps, "B1: voci cambiate viste da un walk");
+VEPT_CTR(vept_keep_verify_checked, "B1: foglie riverificate");
+VEPT_CTR(vept_keep_verify_mismatch, "B1: foglie riverificate DISCORDANTI");
+VEPT_CTR(vept_memgen_changes_detected,
+    "B1: generazioni dei mapping cambiate viste da un vCPU");
+VEPT_CTR(vept_memgen_roots_invalidated,
+    "B1: radici svuotate per generazione cambiata");
+VEPT_CTR(vept_stale_root_enters,
+    "B1: ingressi in L2 con una radice di generazione vecchia (deve essere 0)");
+VEPT_CTR(vept_shadow_pages, "nested: pagine di tabelle shadow EPT allocate");
+VEPT_CTR(vept_shadow_pages_high, "nested: massimo di vept_shadow_pages");
+
+/*
+ * veptkeep(vcpu, eptp12, foglie vive prima, foglie invalidate, intervalli |
+ * voci cambiate << 32, motivi di svuotamento (16 bit) | tabelle tracciate
+ * << 16 (16 bit) | ns << 32). Motivi 0 = radice conservata.
+ */
+SDT_PROBE_DEFINE6(vmm, vmx, nested, veptkeep, "int", "uint64_t", "uint64_t",
+    "uint64_t", "uint64_t", "uint64_t");
+#define	VEPT_KEEP_A5(fb, ntr, t0)	((uint64_t)(fb) |		\
+	(uint64_t)MIN((ntr), 0xffff) << 16 |				\
+	(uint64_t)MIN(sbttons(sbinuptime() - (t0)), 0xffffffff) << 32)
+/* veptmemgen(vcpu, generazione nuova, radici svuotate) */
+SDT_PROBE_DEFINE3(vmm, vmx, nested, veptmemgen, "int", "uint64_t", "int");
+/* veptverify(vcpu, l2gpa, foglia shadow, attesa: hpa | permessi, esito) */
+SDT_PROBE_DEFINE5(vmm, vmx, nested, veptverify, "int", "uint64_t",
+    "uint64_t", "uint64_t", "int");
+
+bool
+vmx_vept_keep_enabled(void)
+{
+	return (vept_keep != 0);
+}
+
+/* Pagina di tabella shadow (puo' dormire) e suo rilascio, con il conto. */
+static uint64_t *
+vept_page_alloc(void)
+{
+	u_long m;
+
+	m = atomic_fetchadd_long(&vept_shadow_pages, 1) + 1;
+	if (m > vept_shadow_pages_high)
+		vept_shadow_pages_high = m;		/* indicativo */
+	return (malloc_aligned(PAGE_SIZE, PAGE_SIZE, M_VMX_VEPT,
+	    M_WAITOK | M_ZERO));
+}
+
+static void
+vept_page_free(uint64_t *p)
+{
+	free(p, M_VMX_VEPT);
+	atomic_subtract_long(&vept_shadow_pages, 1);
+}
+
+/*
+ * B1: azzera le foglie shadow del sottoalbero tbl (livello lvl, che copre da
+ * tb) dentro [s, e); le tabelle intermedie restano. Ritorna le foglie tolte.
+ */
+static uint64_t
+vept_zap_range(uint64_t *tbl, int lvl, uint64_t tb, uint64_t s, uint64_t e)
+{
+	uint64_t span = 1ULL << (12 + 9 * lvl), lo, n = 0;
+	int i, i0, i1;
+
+	KASSERT(curthread->td_critnest == 0,
+	    ("%s: shadow modificata in sezione critica", __func__));
+	if (e <= tb)
+		return (0);
+	i0 = s > tb ? (int)((s - tb) / span) : 0;
+	i1 = (int)MIN((e - tb + span - 1) / span, 512);
+	for (i = i0; i < i1; i++) {
+		if ((tbl[i] & EPT_RWX) == 0)
+			continue;
+		lo = tb + (uint64_t)i * span;
+		if (lvl == 0) {
+			tbl[i] = 0;
+			n++;
+		} else
+			n += vept_zap_range((uint64_t *)PHYS_TO_DMAP(
+			    EPT_ADDR(tbl[i])), lvl - 1, lo, MAX(s, lo),
+			    MIN(e, lo + span));
+	}
+	return (n);
+}
 
 /* Foglie presenti nel sottoalbero shadow (livello 0 = tabella di foglie). */
 static uint64_t
@@ -181,6 +306,15 @@ struct vept_obs_ent {
 	uint64_t	*snap;		/* 512 voci alla prima traversata */
 	uint64_t	base;		/* C2: L2-GPA coperto dalla voce 0 */
 	bool		ambiguous;	/* C2: raggiunta da piu' basi o livelli */
+	int		chg_first;	/* B1: sue voci cambiate in obs->chg */
+	int		chg_n;
+};
+
+/* B1: voce EPT12 cambiata, trovata dalla prima passata dell'INVEPT */
+struct vept_chg {
+	uint64_t	val;		/* valore letto */
+	uint32_t	ent;		/* tabella: indice in obs->ent[] */
+	uint32_t	j;		/* voce */
 };
 
 /* C2: intervallo L2-GPA [start, end) da invalidare in una B1 */
@@ -199,6 +333,9 @@ struct vept_obs {
 	uint32_t	epoch;		/* C2.1: svuotamenti della radice */
 	uint64_t	dtotal, reuse;	/* C2.1 */
 	sbintime_t	dreport;	/* C2.1: ultimo riepilogo */
+	struct vmx_nested *nested;	/* B1: proprietario e slot della radice */
+	int		slot;
+	struct vept_chg	*chg;		/* B1: VEPT_RNG_MAX voci cambiate */
 };
 
 static struct vept_obs *
@@ -208,9 +345,12 @@ vept_obs_get(struct vmx_nested *n, uint64_t *root)
 
 	for (i = 0; i < VEPT_NROOTS; i++)
 		if (n->vept_slot[i].root == root) {
-			if (n->vept_obs[i] == NULL)
-				n->vept_obs[i] = vept_diag_alloc(
-				    sizeof(struct vept_obs));
+			if (n->vept_obs[i] == NULL &&
+			    (n->vept_obs[i] = vept_diag_alloc(
+			    sizeof(struct vept_obs))) != NULL) {
+				n->vept_obs[i]->nested = n;
+				n->vept_obs[i]->slot = i;
+			}
 			return (n->vept_obs[i]);
 		}
 	return (NULL);
@@ -254,6 +394,7 @@ vept_obs_free(struct vept_obs *o)
 	for (i = 0; i < VEPT_OBS_HASH; i++)
 		vept_diag_free(o->ent[i].snap, PAGE_SIZE);
 	vept_diag_free(o->rng, VEPT_RNG_MAX * sizeof(struct vept_rng));
+	vept_diag_free(o->chg, VEPT_RNG_MAX * sizeof(struct vept_chg));
 	vept_diag_free(o->dist, VEPT_DIST_HASH * sizeof(struct vept_dent));
 	vept_diag_free(o, sizeof(struct vept_obs));
 }
@@ -324,14 +465,18 @@ vept_dist_report(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12)
 	    MIN(d60, 0x1fffff) << 42, o->dtotal, o->reuse, o->n);
 }
 
+static void vept_walk_changed(struct vept_obs *o, struct vept_obs_ent *e,
+    int idx, uint64_t val);
+
 /*
  * Tabella EPT12 attraversata da un walk di vmx_vept_fault: prima volta,
- * fotografia; volte successive, confronto della sola voce usata (la
- * fotografia NON si aggiorna).
+ * fotografia; volte successive, confronto della sola voce usata. Senza B1 la
+ * fotografia non si aggiorna; con B1 vept_walk_changed invalida le foglie
+ * della voce vecchia e aggiorna quella sola voce.
  */
 static void
 vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
-    int idx, uint64_t base)
+    int idx, uint64_t pte, uint64_t base)
 {
 	struct vept_obs_ent *e;
 	uint32_t h;
@@ -339,15 +484,19 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 
 	if (o == NULL || gpa == 0)
 		return;
-	vept_dist_note(o, gpa, level, base);
+	if (vept_diag)
+		vept_dist_note(o, gpa, level, base);
 	h = (uint32_t)((gpa >> 12) * 2654435761U);
 	for (i = 0; i < VEPT_OBS_HASH; i++) {
 		e = &o->ent[(h + i) & (VEPT_OBS_HASH - 1)];
 		if (e->gpa == gpa) {
-			if (e->snap[idx] != page[idx])
-				o->walk_mismatch++;
 			if (e->base != base || e->level != level)
 				e->ambiguous = true;	/* C2: aliasing */
+			if (e->snap[idx] != pte) {
+				o->walk_mismatch++;
+				if (o->nested != NULL && o->nested->vept_keep)
+					vept_walk_changed(o, e, idx, pte);
+			}
 			return;
 		}
 		if (e->gpa == 0)
@@ -362,6 +511,9 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 		return;
 	}
 	memcpy(e->snap, page, PAGE_SIZE);
+	/* B1: la voce che il walk usa e' quella letta UNA volta dal walk;
+	 * un altro LP dell'L1 puo' averla cambiata prima della copia */
+	e->snap[idx] = pte;
 	e->gpa = gpa;
 	e->level = level;
 	e->base = base;
@@ -383,6 +535,11 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 #define	VEPT_FB_UNREAD	0x08	/* tabella illeggibile */
 #define	VEPT_FB_WALK	0x10	/* disallineamento gia' visto nei walk */
 #define	VEPT_FB_NRNG	0x20	/* troppi intervalli */
+#define	VEPT_FB_RACE	0x40	/* B1: tabella cambiata fra le due passate */
+#define	VEPT_FB_NOKEEP	0x80	/* B1: radice non conservabile */
+#define	VEPT_FB_NOMEM	0x100	/* B1: osservazioni o buffer non allocati */
+#define	VEPT_FB_FORCE	0x200	/* B1: walk cambiato su ambigua o PML4 */
+#define	VEPT_FB_VERIFY	0x400	/* B1: verifica a campione discorde */
 
 SDT_PROBE_DEFINE6(vmm, vmx, nested, veptdiag4, "int", "uint64_t", "uint64_t",
     "int", "int", "uint64_t");	/* vcpu, vive, colpite, intervalli, motivi, ns */
@@ -531,6 +688,326 @@ vept_obs_scan(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
 
 
 /*
+ * B1: un walk ha trovato la voce idx della tabella e diversa dalla fotografia
+ * (il controesempio del parere #25 §3). Le foglie shadow costruite dalla voce
+ * vecchia stanno tutte nel suo intervallo L2-GPA, perche' la tabella e'
+ * raggiunta da una base sola: si azzerano PRIMA, poi si aggiorna quella sola
+ * voce della fotografia, e il walk prosegue e installa la traduzione nuova.
+ * Senza aggiornarla un A -> B -> A lascerebbe conservata una foglia fatta da
+ * B. Tabella ambigua o voce di PML4: la fotografia resta com'e' e il prossimo
+ * INVEPT svuota tutta la radice; fino ad allora l'L2 puo' ancora usare
+ * traduzioni vecchie, come col TLB, perche' l'L1 non ha ancora fatto INVEPT.
+ */
+static void
+vept_walk_changed(struct vept_obs *o, struct vept_obs_ent *e, int idx,
+    uint64_t val)
+{
+	struct vmx_nested *n = o->nested;
+	struct vept_kslot *k = &n->vept_ks[o->slot];
+	uint64_t span, st, z;
+
+	if (e->ambiguous || e->level >= 3) {
+		k->force_full = true;
+		return;
+	}
+	span = 1ULL << (12 + 9 * e->level);
+	st = e->base + (uint64_t)idx * span;
+	z = vept_zap_range(n->vept_slot[o->slot].root, 3, 0, st, st + span);
+	k->leaves -= z;
+	if (z != 0)
+		n->vept_flush_pending = true;
+	e->snap[idx] = val;
+	atomic_add_long(&vept_keep_walk_zaps, 1);
+	atomic_add_long(&vept_keep_invalidated_leaves, z);
+}
+
+static struct vept_obs_ent *
+vept_obs_find(struct vept_obs *o, uint64_t gpa)
+{
+	struct vept_obs_ent *e;
+	uint32_t h = (uint32_t)((gpa >> 12) * 2654435761U);
+	int i;
+
+	for (i = 0; i < VEPT_OBS_HASH; i++) {
+		e = &o->ent[(h + i) & (VEPT_OBS_HASH - 1)];
+		if (e->gpa == gpa)
+			return (e);
+		if (e->gpa == 0)
+			break;
+	}
+	return (NULL);
+}
+
+/*
+ * B1, verifica: lo stesso cammino di ept12_translate ma sulle FOTOGRAFIE,
+ * cioe' su cio' che la conservazione assume. -1 se una tabella del cammino
+ * non e' tracciata: una foglia che ne dipende non dovrebbe esistere.
+ */
+static int
+vept_snap_translate(struct vept_obs *o, uint64_t eptp12, uint64_t l2gpa,
+    uint64_t *l1gpa, uint64_t *perm)
+{
+	struct vept_obs_ent *e;
+	uint64_t tbl_gpa = EPT_ADDR(eptp12), pte, acc = EPT_RWX, mask;
+	int level;
+
+	for (level = 3; level >= 0; level--) {
+		if ((e = vept_obs_find(o, tbl_gpa)) == NULL)
+			return (-1);
+		pte = e->snap[EPT_IDX(l2gpa, level)];
+		if ((pte & EPT_RWX) == 0)
+			return (VEPT_VIOL);
+		acc &= pte;
+		if (level == 0 || (pte & EPT_PG_PS) != 0) {
+			mask = (1ULL << (12 + 9 * level)) - 1;
+			*l1gpa = (EPT_ADDR(pte) & ~mask) | (l2gpa & mask);
+			*perm = acc & EPT_RWX;
+			return (VEPT_OK);
+		}
+		tbl_gpa = EPT_ADDR(pte);
+	}
+	return (VEPT_VIOL);
+}
+
+/*
+ * B1, hw.vmm.vmx.vept_verify_hpa: dopo un INVEPT che conserva la radice, fino
+ * a VEPT_VERIFY_MAX foglie sparse riconfrontate con il cammino sulle
+ * fotografie e con l'HPA di vm_gpa_hold dell'L1-GPA (parere #28 §6). Ritorna
+ * le discordanze; il chiamante allora svuota la radice.
+ */
+#define	VEPT_VERIFY_MAX	64
+
+static int
+vept_verify(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
+    uint64_t *root, uint64_t leaves)
+{
+	uint64_t *t2, *t1, *t0, l2gpa, l1gpa, perm, exp, seen = 0, stride;
+	int i3, i2, i1, i0, checked = 0, bad = 0, r;
+	static int printed;
+	void *p, *ck;
+
+	stride = MAX(1, leaves / VEPT_VERIFY_MAX);
+	for (i3 = 0; i3 < 512; i3++) {
+		if ((root[i3] & EPT_RWX) == 0)
+			continue;
+		t2 = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(root[i3]));
+		for (i2 = 0; i2 < 512; i2++) {
+			if ((t2[i2] & EPT_RWX) == 0)
+				continue;
+			t1 = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(t2[i2]));
+			for (i1 = 0; i1 < 512; i1++) {
+				if ((t1[i1] & EPT_RWX) == 0)
+					continue;
+				t0 = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(t1[i1]));
+				for (i0 = 0; i0 < 512; i0++) {
+					if ((t0[i0] & EPT_RWX) == 0 ||
+					    seen++ % stride != 0)
+						continue;
+					if (checked++ >= VEPT_VERIFY_MAX)
+						goto done;
+					l2gpa = (uint64_t)i3 << 39 |
+					    (uint64_t)i2 << 30 |
+					    (uint64_t)i1 << 21 | (uint64_t)i0 << 12;
+					r = vept_snap_translate(o, eptp12,
+					    l2gpa, &l1gpa, &perm);
+					exp = 0;
+					if (r == VEPT_OK && (p = vm_gpa_hold(
+					    vcpu->vcpu, l1gpa & ~(uint64_t)PAGE_MASK,
+					    PAGE_SIZE, VM_PROT_READ, &ck)) != NULL) {
+						exp = DMAP_TO_PHYS((vm_offset_t)p) |
+						    (perm & EPT_RWX);
+						vm_gpa_release(ck);
+					}
+					if (exp != 0 && (t0[i0] & (EPT_ADDR(~0ULL) |
+					    EPT_RWX)) == exp)
+						continue;
+					bad++;
+					SDT_PROBE5(vmm, vmx, nested, veptverify,
+					    vcpu->vcpuid, l2gpa, t0[i0], exp, r);
+					if (printed++ < 8)
+						printf("nested: B1 verifica vcpu%d "
+						    "l2gpa %#lx foglia %#lx attesa "
+						    "%#lx (r=%d)\n", vcpu->vcpuid,
+						    (u_long)l2gpa, (u_long)t0[i0],
+						    (u_long)exp, r);
+				}
+			}
+		}
+	}
+done:
+	atomic_add_long(&vept_keep_verify_checked, MIN(checked, VEPT_VERIFY_MAX));
+	atomic_add_long(&vept_keep_verify_mismatch, bad);
+	return (bad);
+}
+
+static void vept_root_wipe(struct vmx_nested *n, int i);
+
+/*
+ * B1: INVEPT dell'L1 che colpisce la radice dello slot i. Ritorna true se la
+ * radice e' stata conservata, false se svuotata.
+ *  1. prima passata: per ogni tabella tracciata, le voci diverse dalla
+ *     fotografia; ognuna da' un intervallo L2-GPA (2^(12+9L) alla base della
+ *     tabella) e va nella lista dei cambi, col valore letto;
+ *  2. seconda passata: si rileggono TUTTE le tabelle tracciate, anche quelle
+ *     trovate invariate, e devono valere fotografia + cambi; se no un altro
+ *     LP dell'L1 sta scrivendo mentre si legge e si svuota tutto (parere #28
+ *     §3: rilevatore conservativo, non una prova di atomicita');
+ *  3. intervalli ordinati e uniti, foglie shadow azzerate, INVEPT hw dovuto;
+ *  4. solo allora, nelle fotografie, le sole voci cambiate.
+ * Una scrittura dopo la seconda passata la vedra' il prossimo INVEPT, che
+ * l'L1 deve comunque fare per renderla visibile.
+ */
+static bool
+vept_keep_invept(struct vmx_vcpu *vcpu, int i)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vept_slot *s = &n->vept_slot[i];
+	struct vept_kslot *k = &n->vept_ks[i];
+	struct vept_obs *o = n->vept_obs[i];
+	struct vept_obs_ent *e;
+	uint64_t *page, span, expect, v, live = k->leaves, inval = 0;
+	sbintime_t t0 = sbinuptime();
+	void *cookie;
+	int fb = 0, nr = 0, nc = 0, t, j, c, m, ntr = 0;
+
+	KASSERT(curthread->td_critnest == 0,
+	    ("%s: shadow modificata in sezione critica", __func__));
+	if (k->nokeep)
+		fb |= VEPT_FB_NOKEEP;
+	if (k->force_full)
+		fb |= VEPT_FB_FORCE;
+	if (o == NULL)
+		fb |= VEPT_FB_NOMEM;
+	else {
+		ntr = o->n;
+		if (o->overflow)
+			fb |= VEPT_FB_OVERFL;
+		if (o->rng == NULL)
+			o->rng = vept_diag_alloc(VEPT_RNG_MAX *
+			    sizeof(struct vept_rng));
+		if (o->chg == NULL)
+			o->chg = vept_diag_alloc(VEPT_RNG_MAX *
+			    sizeof(struct vept_chg));
+		if (o->rng == NULL || o->chg == NULL)
+			fb |= VEPT_FB_NOMEM;
+	}
+	if (fb != 0)
+		goto full;
+
+	/* 1. voci cambiate */
+	for (t = 0; t < VEPT_OBS_HASH && fb == 0; t++) {
+		e = &o->ent[t];
+		e->chg_first = nc;
+		e->chg_n = 0;
+		if (e->gpa == 0)
+			continue;
+		page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE, VM_PROT_READ,
+		    &cookie);
+		if (page == NULL) {
+			fb |= VEPT_FB_UNREAD;
+			break;
+		}
+		span = 1ULL << (12 + 9 * (e->level & 3));
+		for (j = 0; j < 512; j++) {
+			v = atomic_load_64(&page[j]);
+			if (v == e->snap[j])
+				continue;
+			if (e->ambiguous)
+				fb |= VEPT_FB_AMBIG;
+			else if (e->level >= 3)
+				fb |= VEPT_FB_L3;
+			else if (nc >= VEPT_RNG_MAX)
+				fb |= VEPT_FB_NRNG;
+			if (fb != 0)
+				break;
+			o->chg[nc].val = v;
+			o->chg[nc].ent = t;
+			o->chg[nc].j = j;
+			o->rng[nc].start = e->base + (uint64_t)j * span;
+			o->rng[nc].end = o->rng[nc].start + span;
+			nc++;
+		}
+		vm_gpa_release(cookie);
+		e->chg_n = nc - e->chg_first;
+	}
+	if (fb != 0)
+		goto full;
+
+	/* 2. rilettura di tutte le tabelle */
+	for (t = 0; t < VEPT_OBS_HASH && fb == 0; t++) {
+		e = &o->ent[t];
+		if (e->gpa == 0)
+			continue;
+		page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE, VM_PROT_READ,
+		    &cookie);
+		if (page == NULL) {
+			fb |= VEPT_FB_UNREAD;
+			break;
+		}
+		c = e->chg_first;
+		m = c + e->chg_n;
+		for (j = 0; j < 512; j++) {
+			expect = (c < m && o->chg[c].j == (uint32_t)j) ?
+			    o->chg[c++].val : e->snap[j];
+			if (atomic_load_64(&page[j]) != expect) {
+				fb |= VEPT_FB_RACE;
+				break;
+			}
+		}
+		vm_gpa_release(cookie);
+	}
+	if (fb != 0)
+		goto full;
+
+	/* 3. intervalli uniti, foglie azzerate */
+	nr = nc;
+	if (nr > 1) {
+		qsort(o->rng, nr, sizeof(struct vept_rng), vept_rng_cmp);
+		for (c = 0, j = 1; j < nr; j++) {
+			if (o->rng[j].start <= o->rng[c].end) {
+				if (o->rng[j].end > o->rng[c].end)
+					o->rng[c].end = o->rng[j].end;
+			} else
+				o->rng[++c] = o->rng[j];
+		}
+		nr = c + 1;
+	}
+	for (j = 0; j < nr; j++)
+		inval += vept_zap_range(s->root, 3, 0, o->rng[j].start,
+		    o->rng[j].end);
+	k->leaves -= inval;
+	if (inval != 0)
+		n->vept_flush_pending = true;
+
+	/* 4. fotografie: solo le voci cambiate, dopo le invalidazioni */
+	for (c = 0; c < nc; c++)
+		o->ent[o->chg[c].ent].snap[o->chg[c].j] = o->chg[c].val;
+
+	if (vept_verify_hpa && vept_verify(vcpu, o, s->eptp12, s->root,
+	    k->leaves) != 0) {
+		fb |= VEPT_FB_VERIFY;
+		goto full;
+	}
+	atomic_add_long(&vept_keep_partial_invepts, 1);
+	atomic_add_long(&vept_keep_retained_leaves, k->leaves);
+	atomic_add_long(&vept_keep_invalidated_leaves, inval);
+	SDT_PROBE6(vmm, vmx, nested, veptkeep, vcpu->vcpuid, s->eptp12, live,
+	    inval, (uint64_t)nr | (uint64_t)nc << 32, VEPT_KEEP_A5(0, ntr, t0));
+	return (true);
+
+full:
+	atomic_add_long(&vept_keep_full_fallbacks, 1);
+	if (fb & VEPT_FB_RACE)
+		atomic_add_long(&vept_keep_scan_race_fallbacks, 1);
+	atomic_add_long(&vept_keep_invalidated_leaves, live);
+	SDT_PROBE6(vmm, vmx, nested, veptkeep, vcpu->vcpuid, s->eptp12, live,
+	    live, (uint64_t)nr | (uint64_t)nc << 32, VEPT_KEEP_A5(fb, ntr, t0));
+	vept_root_wipe(n, i);
+	return (false);
+}
+
+
+/*
  * Prepara la radice shadow per l'EPTP12 corrente: riprende quella gia' fatta
  * per lo stesso EPTP12, altrimenti ne alloca una VUOTA (o svuota la meno usata
  * di recente, oltre VEPT_NROOTS). PUO' DORMIRE (malloc/free):
@@ -551,6 +1028,8 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 	struct vept_slot *s, *pick = NULL;
 	int i;
 
+	if (n->vept_keep)
+		vmx_vept_memgen_sync(vcpu);	/* prima di riusare una radice */
 	/*
 	 * Radice gia' costruita per questo EPTP12 (cambio VTL di Hyper-V):
 	 * la si riprende COSI' COM'E'. Le sue voci valgono finche' l'L1 non
@@ -576,11 +1055,9 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 				pick = s;
 		}
 		if (pick->root == NULL)
-			pick->root = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
-			    M_VMX_VEPT, M_WAITOK | M_ZERO);
+			pick->root = vept_page_alloc();
 		else {
-			vept_wipe(pick->root);
-			vept_obs_reset(n->vept_obs[pick - n->vept_slot]);
+			vept_root_wipe(n, pick - n->vept_slot);
 			vept_dist_clear(n->vept_obs[pick - n->vept_slot]);
 		}
 		pick->eptp12 = eptp12;
@@ -626,6 +1103,18 @@ vept_wipe(uint64_t *root)
 	}
 }
 
+/* Svuota la radice dello slot i e le sue osservazioni (l'insieme cumulativo
+ * della diagnostica resta: si azzera solo se lo slot cambia EPTP12). */
+static void
+vept_root_wipe(struct vmx_nested *n, int i)
+{
+	vept_wipe(n->vept_slot[i].root);
+	vept_obs_reset(n->vept_obs[i]);
+	n->vept_ks[i].leaves = 0;
+	n->vept_ks[i].nokeep = false;
+	n->vept_ks[i].force_full = false;
+}
+
 /*
  * INVEPT dell'L1. All-context (tipo 2): svuota tutte le radici. Single-
  * context (tipo 1, parere #24 di Astra, come handle_invept di KVM): solo le
@@ -660,8 +1149,12 @@ vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp)
 		if (vept_diag)		/* fase C: solo misura, PRIMA di svuotare */
 			vept_obs_scan(vcpu, n->vept_obs[i], s->eptp12,
 			    s->root);
-		vept_wipe(s->root);
-		vept_obs_reset(n->vept_obs[i]);
+		if (n->vept_keep) {	/* B1: conservata o svuotata */
+			if (!vept_keep_invept(vcpu, i))
+				wiped++;
+			continue;
+		}
+		vept_root_wipe(n, i);
 		wiped++;
 	}
 	return (wiped);
@@ -682,7 +1175,7 @@ vept_free_level(uint64_t *tbl, int level)
 			}
 		}
 	}
-	free(tbl, M_VMX_VEPT);
+	vept_page_free(tbl);
 }
 
 void
@@ -699,7 +1192,9 @@ vmx_vept_flush(struct vmx_nested *n)
 		n->vept_slot[i].used = 0;
 		vept_obs_free(n->vept_obs[i]);
 		n->vept_obs[i] = NULL;
+		memset(&n->vept_ks[i], 0, sizeof(n->vept_ks[i]));
 	}
+	n->vept_flush_pending = false;
 	n->vept_root = NULL;
 	n->vept_eptp12 = 0;
 }
@@ -730,9 +1225,10 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 		    VM_PROT_READ, &cookie);
 		if (page == NULL)
 			return (-1);
-		pte = page[idx];
-		vept_obs_note(obs, tbl_gpa, level, page, idx, level >= 3 ? 0 :
-		    l2gpa & ~((1ULL << (12 + 9 * (level + 1))) - 1));
+		/* una sola lettura: la memoria dell'L1 puo' cambiare sotto */
+		pte = atomic_load_64(&page[idx]);
+		vept_obs_note(obs, tbl_gpa, level, page, idx, pte, level >= 3 ?
+		    0 : l2gpa & ~((1ULL << (12 + 9 * (level + 1))) - 1));
 		vm_gpa_release(cookie);
 		if ((pte & EPT_RWX) == 0)
 			return (VEPT_VIOL);		/* non presente */
@@ -756,8 +1252,8 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 
 /* Installa una foglia shadow 4K: l2gpa -> hpa con permessi e memtype WB. */
 static int
-vept_install(struct vmx_nested *n, uint64_t l2gpa, uint64_t hpa, uint64_t perm,
-    int mt)
+vept_install(struct vmx_nested *n, struct vept_kslot *k, uint64_t l2gpa,
+    uint64_t hpa, uint64_t perm, int mt)
 {
 	uint64_t *tbl = n->vept_root;
 	int level, idx;
@@ -765,16 +1261,29 @@ vept_install(struct vmx_nested *n, uint64_t l2gpa, uint64_t hpa, uint64_t perm,
 	for (level = 3; level > 0; level--) {
 		idx = EPT_IDX(l2gpa, level);
 		if ((tbl[idx] & EPT_RWX) == 0) {
-			uint64_t *np = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
-			    M_VMX_VEPT, M_WAITOK | M_ZERO);
+			uint64_t *np = vept_page_alloc();
 			tbl[idx] = vtophys(np) | EPT_RWX;
 		}
 		tbl = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(tbl[idx]));
 	}
 	idx = EPT_IDX(l2gpa, 0);
+	if ((tbl[idx] & EPT_RWX) == 0)
+		k->leaves++;
 	tbl[idx] = (hpa & ~0xfffULL) | (perm & EPT_RWX) |
 	    EPT_PG_MEMORY_TYPE(mt) | EPT_PG_IGNORE_PAT;
 	return (0);
+}
+
+/* Slot della radice corrente (vept_root non NULL). */
+static int
+vept_cur_slot(struct vmx_nested *n)
+{
+	int i;
+
+	for (i = 0; i < VEPT_NROOTS; i++)
+		if (n->vept_slot[i].root == n->vept_root)
+			return (i);
+	panic("%s: radice corrente %p senza slot", __func__, n->vept_root);
 }
 
 /*
@@ -788,6 +1297,8 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c = nested_current_cache(n);
+	struct vept_kslot *k;
+	struct vept_obs *obs = NULL;
 	uint64_t eptp12, hpa, access;
 	void *p, *ck;
 	int r;
@@ -803,9 +1314,16 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	eptp12 = vmcs12_read_field(c, VMCS_EPTP);
 	if (n->vept_root == NULL || n->vept_eptp12 != eptp12)
 		vmx_vept_prepare(vcpu);		/* allinea radice ed EPTP12 */
+	k = &n->vept_ks[vept_cur_slot(n)];
 
-	r = ept12_translate(vcpu, eptp12, l2gpa, l1gpa, perm,
-	    vept_diag ? vept_obs_get(n, n->vept_root) : NULL);
+	/* B1: un walk non tracciato rende la radice non conservabile fino al
+	 * prossimo svuotamento */
+	if (vept_diag || n->vept_keep) {
+		obs = vept_obs_get(n, n->vept_root);
+		if (obs == NULL && n->vept_keep)
+			k->force_full = true;
+	}
+	r = ept12_translate(vcpu, eptp12, l2gpa, l1gpa, perm, obs);
 	if (r < 0)
 		return (VEPT_VIOL);		/* tabella dell'L1 illeggibile */
 	if (r != VEPT_OK)
@@ -830,14 +1348,20 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	if (p != NULL) {
 		hpa = DMAP_TO_PHYS((vm_offset_t)p);
 		vm_gpa_release(ck);
-		vept_install(n, l2gpa, hpa, *perm, 6);	/* RAM: WB */
+		/* B1: si conservano solo foglie di RAM wired (GPA -> HPA fisso
+		 * finche' il mapping esiste: generazione dei mapping) */
+		if (n->vept_keep && !vm_mem_wired(vcpu->vmx->vm,
+		    *l1gpa & ~(uint64_t)PAGE_MASK))
+			k->nokeep = true;
+		vept_install(n, k, l2gpa, hpa, *perm, 6);	/* RAM: WB */
 		return (VEPT_OK);
 	}
 	/* Non RAM. Se l'EPT01 mappa gia' l'L1-GPA (BAR di un dispositivo in
 	 * passthrough) si usa la stessa pagina host, non cacheable. */
 	hpa = pmap_extract(vcpu->vmx->pmap, *l1gpa);
 	if (hpa != 0) {
-		vept_install(n, l2gpa, hpa, *perm, 0);	/* MMIO: UC */
+		k->nokeep = true;		/* B1: MMIO mai conservata */
+		vept_install(n, k, l2gpa, hpa, *perm, 0);	/* MMIO: UC */
 		return (VEPT_OK);
 	}
 	return (VEPT_MMIO);			/* dispositivo emulato dell'L1 */
@@ -885,4 +1409,69 @@ vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa)
 		tbl = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(e));
 	}
 	return (tbl[EPT_IDX(l2gpa, 0)]);
+}
+
+/*
+ * B1, generazione dei mapping di L0 (parere #28 §4, §6). Una foglia shadow
+ * contiene l'HPA preso da vm_gpa_hold: con la radice conservata a lungo, un
+ * mapping tolto o rifatto la renderebbe falsa. La generazione cambia solo con
+ * tutti i vCPU IDLE (ioctl con LOCK_ALL_VCPUS), quindi mai durante uno slow
+ * path o un vmx_run: basta confrontarla all'inizio dello slow path, in
+ * vmx_vept_prepare e in vmx_run prima di ogni ingresso in L2.
+ */
+void
+vmx_vept_memgen_sync(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t g = vm_memmap_generation(vcpu->vmx->vm);
+	int i, inv = 0;
+
+	for (i = 0; i < VEPT_NROOTS; i++) {
+		if (n->vept_ks[i].memgen == g)
+			continue;
+		if (n->vept_slot[i].root != NULL) {
+			vept_root_wipe(n, i);
+			inv++;
+		}
+		n->vept_ks[i].memgen = g;
+	}
+	if (inv != 0) {
+		atomic_add_long(&vept_memgen_changes_detected, 1);
+		atomic_add_long(&vept_memgen_roots_invalidated, inv);
+		SDT_PROBE3(vmm, vmx, nested, veptmemgen, vcpu->vcpuid, g, inv);
+	}
+}
+
+/* La radice corrente e' di una generazione vecchia? Non dorme. */
+bool
+vmx_vept_memgen_stale(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	int i;
+
+	if (n->vept_root == NULL)
+		return (false);
+	for (i = 0; i < VEPT_NROOTS; i++)
+		if (n->vept_slot[i].root == n->vept_root)
+			return (n->vept_ks[i].memgen !=
+			    vm_memmap_generation(vcpu->vmx->vm));
+	return (false);
+}
+
+/* vmx_run ha appena fatto INVEPT dell'EPTP shadow su questa CPU. */
+void
+vmx_vept_hw_flushed(struct vmx_vcpu *vcpu)
+{
+	if (vcpu->nested->vept_flush_pending) {
+		vcpu->nested->vept_flush_pending = false;
+		atomic_add_long(&vept_keep_shadow_flushes, 1);
+	}
+}
+
+/* Subito prima di un ingresso in L2 con la shadow: l'invariante, contato. */
+void
+vmx_vept_enter_check(struct vmx_vcpu *vcpu)
+{
+	if (vmx_vept_memgen_stale(vcpu))
+		atomic_add_long(&vept_stale_root_enters, 1);
 }

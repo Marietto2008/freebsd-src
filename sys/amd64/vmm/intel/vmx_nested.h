@@ -112,6 +112,12 @@ void	vmx_vept_flush(struct vmx_nested *n);
 int	vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp);
 void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
+/* B1 */
+bool	vmx_vept_keep_enabled(void);		/* hw.vmm.vmx.vept_keep */
+void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
+bool	vmx_vept_memgen_stale(struct vmx_vcpu *vcpu);	/* non dorme */
+void	vmx_vept_hw_flushed(struct vmx_vcpu *vcpu);	/* dopo l'INVEPT hw */
+void	vmx_vept_enter_check(struct vmx_vcpu *vcpu);	/* prima dell'ingresso */
 struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
 uint64_t vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc);
 /* Secondari del VMCS12 come li vede la CPU: 0 se i primari non li attivano
@@ -345,6 +351,21 @@ struct vmx_nested {
 	 * spostare gli offset usati da DTrace.
 	 */
 	struct vept_obs	*vept_obs[VEPT_NROOTS];
+	/*
+	 * B1 (parere #28 di Astra): shadow EPT conservata all'INVEPT, con
+	 * invalidazione per intervallo delle sole traduzioni che dipendono da
+	 * voci EPT12 cambiate. vept_keep e' hw.vmm.vmx.vept_keep letto alla
+	 * creazione del nested: spento, tutto come prima (31b286d).
+	 */
+	bool		vept_keep;
+	bool		vept_memgen_pending;	/* vmx_run: generazione cambiata */
+	bool		vept_flush_pending;	/* shadow ridotta: INVEPT hw dovuto */
+	struct vept_kslot {
+		uint64_t	memgen;		/* generazione dei mapping di L0 */
+		uint64_t	leaves;		/* foglie shadow vive */
+		bool		nokeep;		/* foglia non wired o MMIO */
+		bool		force_full;	/* il prossimo INVEPT svuota tutto */
+	}		vept_ks[VEPT_NROOTS];
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);

@@ -172,6 +172,42 @@ vm_mem_allocated(struct vcpu *vcpu, vm_paddr_t gpa)
 	return (false);
 }
 
+/*
+ * 'gpa' sta in un mapping WIRED di un memseg (nested, B1). Entrambi i tipi
+ * di memseg sono oggetti OBJT_SWAP: sysmem e devmem (la RAM di QEMU con
+ * l'acceleratore bhyve e' devmem) non contano, conta che le pagine siano
+ * wired, cioe' che GPA -> HPA resti fisso finche' il mapping esiste. Come
+ * vm_mem_allocated: un vCPU non IDLE fa da lock implicito su mem_maps[].
+ */
+bool
+vm_mem_wired(struct vm *vm, vm_paddr_t gpa)
+{
+	struct vm_mem_map *mm;
+	int i;
+
+	for (i = 0; i < VM_MAX_MEMMAPS; i++) {
+		mm = &vm_mem(vm)->mem_maps[i];
+		if (mm->len != 0 && gpa >= mm->gpa && gpa < mm->gpa + mm->len)
+			return ((mm->flags & VM_MEMMAP_F_WIRED) != 0);
+	}
+	return (false);
+}
+
+uint64_t
+vm_memmap_generation(struct vm *vm)
+{
+	return (atomic_load_64(&vm_mem(vm)->mem_maps_gen));
+}
+
+/* Solo per la prova d'iniezione (VM_NESTED_MEMGEN_BUMP): stessi lock di
+ * VM_MMAP_MEMSEG, nessun mapping cambia. */
+void
+vm_memmap_generation_bump(struct vm *vm)
+{
+	vm_assert_memseg_xlocked(vm);
+	atomic_add_64(&vm_mem(vm)->mem_maps_gen, 1);
+}
+
 int
 vm_alloc_memseg(struct vm *vm, int ident, size_t len, bool sysmem,
     struct domainset *obj_domainset)
@@ -325,6 +361,7 @@ vm_mmap_memseg(struct vm *vm, vm_paddr_t gpa, int segid, vm_ooffset_t first,
 	map->segid = segid;
 	map->prot = prot;
 	map->flags = flags;
+	atomic_add_64(&mem->mem_maps_gen, 1);	/* solo a mapping riuscito */
 	return (0);
 }
 
@@ -401,6 +438,7 @@ vm_free_memmap(struct vm *vm, int ident)
 		KASSERT(error == KERN_SUCCESS, ("%s: vm_map_remove error %d",
 		    __func__, error));
 		bzero(mm, sizeof(struct vm_mem_map));
+		atomic_add_64(&vm_mem(vm)->mem_maps_gen, 1);
 	}
 }
 

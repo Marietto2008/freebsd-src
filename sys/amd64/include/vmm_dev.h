@@ -354,6 +354,9 @@ enum {
 
 	/* Atomic LAPIC IRR clearing (no TOCTOU race) */
 	IOCNUM_LAPIC_CLEAR_IRR = 130,
+
+	/* nested, prova d'iniezione della generazione dei mapping (B1) */
+	IOCNUM_NESTED_MEMGEN_BUMP = 131,
 };
 
 #define	VM_RUN		\
@@ -494,4 +497,6 @@ enum {
 	_IOWR('v', IOCNUM_RESTORE_TIME, int)
 #define	VM_LAPIC_CLEAR_IRR \
 	_IOW('v', IOCNUM_LAPIC_CLEAR_IRR, struct vm_lapic_clear_irr)
+#define	VM_NESTED_MEMGEN_BUMP \
+	_IOR('v', IOCNUM_NESTED_MEMGEN_BUMP, uint64_t)
 #endif
