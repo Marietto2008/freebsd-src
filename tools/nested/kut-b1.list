@@ -3,3 +3,4 @@
 # nome | file.flat | args | qemu_params | smp | mem | timeout
 b1_casi     | vmx.flat | vmx_ept_b1_test         | -cpu max | 1 | 1024 | 180
 b1_persist  | vmx.flat | vmx_ept_b1_persist_test | -cpu max | 1 | 1024 | 1200
+b1_conc     | vmx.flat | vmx_ept_b1_conc_test    | -cpu max | 2 | 1024 | 600
