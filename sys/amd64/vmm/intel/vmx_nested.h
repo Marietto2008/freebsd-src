@@ -109,7 +109,7 @@ uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
 	    uint64_t *out);
 void	vmx_vept_flush(struct vmx_nested *n);
-int	vmx_vept_invept(struct vmx_nested *n, uint64_t type, uint64_t eptp);
+int	vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp);
 void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
 struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
@@ -338,6 +338,13 @@ struct vmx_nested {
 	volatile uint8_t *diag_simp;	/* sua KVA, NULL se non agganciata */
 	uint64_t	diag_simp_gpa;	/* suo GPA */
 	struct nested_diag diag;
+	/*
+	 * Diagnostica della shadow EPT (fase C, parere #25 di Astra): per ogni
+	 * radice, le tabelle EPT12 attraversate per costruirla con la loro
+	 * PRIMA fotografia. Solo con hw.vmm.vmx.vept_diag; in coda per non
+	 * spostare gli offset usati da DTrace.
+	 */
+	struct vept_obs	*vept_obs[VEPT_NROOTS];
 };
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);

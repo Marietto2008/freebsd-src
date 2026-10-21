@@ -26,6 +26,7 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/sdt.h>
+#include <sys/sysctl.h>
 
 #include <vm/vm.h>
 #include <vm/vm_extern.h>
@@ -45,6 +46,221 @@ MALLOC_DEFINE(M_VMX_VEPT, "vmx_vept", "Intel VMX nested shadow EPT");
 #define	EPT_RWX		(EPT_PG_READ | EPT_PG_WRITE | EPT_PG_EXECUTE)
 #define	EPT_ADDR(e)	((e) & 0x000ffffffffff000ULL)
 #define	EPT_IDX(gpa, lvl)	(((gpa) >> (12 + 9 * (lvl))) & 0x1ff)
+
+/*
+ * Diagnostica della shadow EPT (fase C, parere #25 di Astra). Domanda: quando
+ * l'L1 fa INVEPT su una radice, quante delle tabelle EPT12 servite a
+ * costruirne le traduzioni shadow sono DIVERSE dalla versione usata per
+ * costruirle? SOLO misura: la radice si svuota comunque come prima (31b286d).
+ *
+ * Per radice: le tabelle EPT12 attraversate dai walk di vmx_vept_fault, con
+ * la fotografia (4 KB) presa alla PRIMA traversata. La fotografia non si
+ * aggiorna mai fino allo svuotamento della radice: un walk successivo che
+ * trova la voce usata diversa dalla fotografia conta un "disallineamento
+ * durante il walk" (il controesempio del parere #25 §3: aggiornarla
+ * nasconderebbe la modifica a un INVEPT seguente). All'INVEPT si rilegge
+ * ogni tabella e si confrontano le 512 voci: per livello e per tipo di
+ * cambiamento. Spenta per difetto (hw.vmm.vmx.vept_diag).
+ */
+SYSCTL_DECL(_hw_vmm_vmx);
+static int vept_diag = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_diag, CTLFLAG_RWTUN, &vept_diag, 0,
+    "nested: diagnostica delle tabelle EPT12 all'INVEPT (0 = spenta)");
+
+/*
+ * veptdiag(vcpuid, eptp12, tabelle tracciate, tabelle cambiate, voci
+ * cambiate, ns di scansione) e veptdiag2(vcpuid, voci cambiate per livello
+ * (4 x 16 bit, livello 0 in basso), per tipo (6 x 10 bit: indirizzo,
+ * permessi, page size, attributi, A/D, altro), disallineamenti durante i
+ * walk, illeggibili | tetto superato << 32).
+ */
+SDT_PROVIDER_DECLARE(vmm);
+SDT_PROBE_DEFINE6(vmm, vmx, nested, veptdiag, "int", "uint64_t", "int", "int",
+    "int", "uint64_t");
+SDT_PROBE_DEFINE5(vmm, vmx, nested, veptdiag2, "int", "uint64_t", "uint64_t",
+    "uint64_t", "uint64_t");
+/* veptdiag3(vcpuid, traduzioni shadow vive nella radice, cioe' le foglie
+ * 4K che un B0 conserverebbe o un B1 dovrebbe giudicare) */
+SDT_PROBE_DEFINE2(vmm, vmx, nested, veptdiag3, "int", "uint64_t");
+
+/* Foglie presenti nel sottoalbero shadow (livello 0 = tabella di foglie). */
+static uint64_t
+vept_count_leaves(const uint64_t *tbl, int level)
+{
+	uint64_t n = 0;
+	int i;
+
+	for (i = 0; i < 512; i++) {
+		if ((tbl[i] & EPT_RWX) == 0)
+			continue;
+		if (level == 0)
+			n++;
+		else
+			n += vept_count_leaves((const uint64_t *)PHYS_TO_DMAP(
+			    EPT_ADDR(tbl[i])), level - 1);
+	}
+	return (n);
+}
+
+#define	VEPT_OBS_MAX	512		/* tabelle tracciate per radice */
+#define	VEPT_OBS_HASH	1024		/* bucket (potenza di 2, > MAX) */
+
+struct vept_obs_ent {
+	uint64_t	gpa;		/* tabella EPT12 (GPA dell'L1); 0 = vuota */
+	int		level;		/* 3 = PML4 ... 0 = PT */
+	uint64_t	*snap;		/* 512 voci alla prima traversata */
+};
+
+struct vept_obs {
+	struct vept_obs_ent ent[VEPT_OBS_HASH];
+	int		n;		/* tabelle tracciate */
+	uint64_t	walk_mismatch;	/* voce usata != fotografia */
+	bool		overflow;	/* tetto superato: misura incompleta */
+};
+
+static struct vept_obs *
+vept_obs_get(struct vmx_nested *n, uint64_t *root)
+{
+	int i;
+
+	for (i = 0; i < VEPT_NROOTS; i++)
+		if (n->vept_slot[i].root == root) {
+			if (n->vept_obs[i] == NULL)
+				n->vept_obs[i] = malloc(sizeof(struct vept_obs),
+				    M_VMX_VEPT, M_WAITOK | M_ZERO);
+			return (n->vept_obs[i]);
+		}
+	return (NULL);
+}
+
+/* Svuota le osservazioni (le fotografie restano allocate e si riusano). */
+static void
+vept_obs_reset(struct vept_obs *o)
+{
+	int i;
+
+	if (o == NULL)
+		return;
+	for (i = 0; i < VEPT_OBS_HASH; i++)
+		o->ent[i].gpa = 0;
+	o->n = 0;
+	o->walk_mismatch = 0;
+	o->overflow = false;
+}
+
+static void
+vept_obs_free(struct vept_obs *o)
+{
+	int i;
+
+	if (o == NULL)
+		return;
+	for (i = 0; i < VEPT_OBS_HASH; i++)
+		if (o->ent[i].snap != NULL)
+			free(o->ent[i].snap, M_VMX_VEPT);
+	free(o, M_VMX_VEPT);
+}
+
+/*
+ * Tabella EPT12 attraversata da un walk di vmx_vept_fault: prima volta,
+ * fotografia; volte successive, confronto della sola voce usata (la
+ * fotografia NON si aggiorna).
+ */
+static void
+vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
+    int idx)
+{
+	struct vept_obs_ent *e;
+	uint32_t h;
+	int i;
+
+	if (o == NULL || gpa == 0)
+		return;
+	h = (uint32_t)((gpa >> 12) * 2654435761U);
+	for (i = 0; i < VEPT_OBS_HASH; i++) {
+		e = &o->ent[(h + i) & (VEPT_OBS_HASH - 1)];
+		if (e->gpa == gpa) {
+			if (e->snap[idx] != page[idx])
+				o->walk_mismatch++;
+			return;
+		}
+		if (e->gpa == 0)
+			break;
+	}
+	if (i == VEPT_OBS_HASH || o->n >= VEPT_OBS_MAX) {
+		o->overflow = true;
+		return;
+	}
+	if (e->snap == NULL)
+		e->snap = malloc(PAGE_SIZE, M_VMX_VEPT, M_WAITOK);
+	memcpy(e->snap, page, PAGE_SIZE);
+	e->gpa = gpa;
+	e->level = level;
+	o->n++;
+}
+
+/* All'INVEPT su una radice: confronta e riporta. Non cambia nulla. */
+static void
+vept_obs_scan(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
+    const uint64_t *root)
+{
+	struct vept_obs_ent *e;
+	uint64_t *page, x, levels = 0, kinds = 0;
+	uint64_t lv[4] = { 0 }, k[6] = { 0 };
+	sbintime_t t0 = sbinuptime();
+	void *cookie;
+	int i, j, tch = 0, ech = 0, unread = 0, c;
+
+	if (o == NULL)
+		return;
+	for (i = 0; i < VEPT_OBS_HASH; i++) {
+		e = &o->ent[i];
+		if (e->gpa == 0)
+			continue;
+		page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE, VM_PROT_READ,
+		    &cookie);
+		if (page == NULL) {
+			unread++;
+			continue;
+		}
+		c = 0;
+		for (j = 0; j < 512; j++) {
+			x = page[j] ^ e->snap[j];
+			if (x == 0)
+				continue;
+			c++;
+			if (x & 0x000ffffffffff000ULL)
+				k[0]++;			/* indirizzo */
+			else if (x & 0x407ULL)
+				k[1]++;			/* R/W/X, X utente */
+			else if (x & EPT_PG_PS)
+				k[2]++;			/* page size */
+			else if (x & 0x78ULL)
+				k[3]++;			/* memtype, ignore PAT */
+			else if (x & 0x300ULL)
+				k[4]++;			/* accessed/dirty */
+			else
+				k[5]++;
+		}
+		vm_gpa_release(cookie);
+		if (c != 0) {
+			tch++;
+			ech += c;
+			lv[e->level & 3] += c;
+		}
+	}
+	for (i = 0; i < 4; i++)
+		levels |= MIN(lv[i], 0xffff) << (16 * i);
+	for (i = 0; i < 6; i++)
+		kinds |= MIN(k[i], 0x3ff) << (10 * i);
+	SDT_PROBE6(vmm, vmx, nested, veptdiag, vcpu->vcpuid, eptp12, o->n, tch,
+	    ech, (uint64_t)sbttons(sbinuptime() - t0));
+	SDT_PROBE5(vmm, vmx, nested, veptdiag2, vcpu->vcpuid, levels, kinds,
+	    o->walk_mismatch, (uint64_t)unread | ((uint64_t)o->overflow << 32));
+	SDT_PROBE2(vmm, vmx, nested, veptdiag3, vcpu->vcpuid,
+	    vept_count_leaves(root, 3));
+}
+
 
 /*
  * Prepara la radice shadow per l'EPTP12 corrente: riprende quella gia' fatta
@@ -94,8 +310,10 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 		if (pick->root == NULL)
 			pick->root = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
 			    M_VMX_VEPT, M_WAITOK | M_ZERO);
-		else
+		else {
 			vept_wipe(pick->root);
+			vept_obs_reset(n->vept_obs[pick - n->vept_slot]);
+		}
 		pick->eptp12 = eptp12;
 	}
 	pick->used = ++n->vept_tick;
@@ -157,8 +375,9 @@ vept_wipe(uint64_t *root)
 #define	VEPT_EPTP_BASE	0x000ffffffffff000ULL	/* bit 51:12 */
 
 int
-vmx_vept_invept(struct vmx_nested *n, uint64_t type, uint64_t eptp)
+vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp)
 {
+	struct vmx_nested *n = vcpu->nested;
 	struct vept_slot *s;
 	int i, wiped = 0;
 
@@ -169,7 +388,11 @@ vmx_vept_invept(struct vmx_nested *n, uint64_t type, uint64_t eptp)
 		if (type == 1 && (s->eptp12 & VEPT_EPTP_BASE) !=
 		    (eptp & VEPT_EPTP_BASE))
 			continue;
+		if (vept_diag)		/* fase C: solo misura, PRIMA di svuotare */
+			vept_obs_scan(vcpu, n->vept_obs[i], s->eptp12,
+			    s->root);
 		vept_wipe(s->root);
+		vept_obs_reset(n->vept_obs[i]);
 		wiped++;
 	}
 	return (wiped);
@@ -205,6 +428,8 @@ vmx_vept_flush(struct vmx_nested *n)
 		}
 		n->vept_slot[i].eptp12 = 0;
 		n->vept_slot[i].used = 0;
+		vept_obs_free(n->vept_obs[i]);
+		n->vept_obs[i] = NULL;
 	}
 	n->vept_root = NULL;
 	n->vept_eptp12 = 0;
@@ -220,7 +445,7 @@ vmx_vept_flush(struct vmx_nested *n)
  */
 static int
 ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
-    uint64_t *l1gpa, uint64_t *perm)
+    uint64_t *l1gpa, uint64_t *perm, struct vept_obs *obs)
 {
 	uint64_t tbl_gpa, pte, acc, mt;
 	uint64_t *page;
@@ -237,6 +462,7 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 		if (page == NULL)
 			return (-1);
 		pte = page[idx];
+		vept_obs_note(obs, tbl_gpa, level, page, idx);
 		vm_gpa_release(cookie);
 		if ((pte & EPT_RWX) == 0)
 			return (VEPT_VIOL);		/* non presente */
@@ -308,7 +534,8 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	if (n->vept_root == NULL || n->vept_eptp12 != eptp12)
 		vmx_vept_prepare(vcpu);		/* allinea radice ed EPTP12 */
 
-	r = ept12_translate(vcpu, eptp12, l2gpa, l1gpa, perm);
+	r = ept12_translate(vcpu, eptp12, l2gpa, l1gpa, perm,
+	    vept_diag ? vept_obs_get(n, n->vept_root) : NULL);
 	if (r < 0)
 		return (VEPT_VIOL);		/* tabella dell'L1 illeggibile */
 	if (r != VEPT_OK)
@@ -364,7 +591,7 @@ vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot, uint64_t *out)
 	    PROCBASED2_ENABLE_EPT) == 0)
 		return (0);
 	if (ept12_translate(vcpu, vmcs12_read_field(c, VMCS_EPTP), gpa, out,
-	    &perm) != VEPT_OK || (prot & ~perm & EPT_RWX) != 0)
+	    &perm, NULL) != VEPT_OK || (prot & ~perm & EPT_RWX) != 0)
 		return (EFAULT);
 	return (0);
 }

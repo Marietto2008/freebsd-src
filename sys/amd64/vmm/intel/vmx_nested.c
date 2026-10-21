@@ -3288,7 +3288,7 @@ nested_invept(struct vmx_vcpu *vcpu)
 	}
 	if (type == 1 && nested_read_operand_u64(vcpu, &eptp) != 0)
 		return (0);			/* eccezione o VMfail gia' dati */
-	wiped = vmx_vept_invept(n, type, eptp);
+	wiped = vmx_vept_invept(vcpu, type, eptp);
 	vmm_stat_incr(vcpu->vcpu, type == 1 ? VMX_NESTED_INVEPT_SINGLE :
 	    VMX_NESTED_INVEPT_ALL, 1);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VEPT_WIPED, wiped);
