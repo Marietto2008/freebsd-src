@@ -1,0 +1,5 @@
+# T1 per B1 (pareri #26/#27): semantica dell'INVEPT con shadow EPT conservata.
+# sudo kut-run.sh --nested kut-b1.list
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+b1_casi     | vmx.flat | vmx_ept_b1_test         | -cpu max | 1 | 1024 | 180
+b1_persist  | vmx.flat | vmx_ept_b1_persist_test | -cpu max | 1 | 1024 | 1200
