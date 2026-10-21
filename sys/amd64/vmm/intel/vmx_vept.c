@@ -109,13 +109,22 @@ struct vept_obs_ent {
 	uint64_t	gpa;		/* tabella EPT12 (GPA dell'L1); 0 = vuota */
 	int		level;		/* 3 = PML4 ... 0 = PT */
 	uint64_t	*snap;		/* 512 voci alla prima traversata */
+	uint64_t	base;		/* C2: L2-GPA coperto dalla voce 0 */
+	bool		ambiguous;	/* C2: raggiunta da piu' basi o livelli */
 };
+
+/* C2: intervallo L2-GPA [start, end) da invalidare in una B1 */
+struct vept_rng {
+	uint64_t	start, end;
+};
+#define	VEPT_RNG_MAX	8192
 
 struct vept_obs {
 	struct vept_obs_ent ent[VEPT_OBS_HASH];
 	int		n;		/* tabelle tracciate */
 	uint64_t	walk_mismatch;	/* voce usata != fotografia */
 	bool		overflow;	/* tetto superato: misura incompleta */
+	struct vept_rng	*rng;		/* C2: buffer degli intervalli */
 };
 
 static struct vept_obs *
@@ -141,8 +150,10 @@ vept_obs_reset(struct vept_obs *o)
 
 	if (o == NULL)
 		return;
-	for (i = 0; i < VEPT_OBS_HASH; i++)
+	for (i = 0; i < VEPT_OBS_HASH; i++) {
 		o->ent[i].gpa = 0;
+		o->ent[i].ambiguous = false;
+	}
 	o->n = 0;
 	o->walk_mismatch = 0;
 	o->overflow = false;
@@ -158,6 +169,8 @@ vept_obs_free(struct vept_obs *o)
 	for (i = 0; i < VEPT_OBS_HASH; i++)
 		if (o->ent[i].snap != NULL)
 			free(o->ent[i].snap, M_VMX_VEPT);
+	if (o->rng != NULL)
+		free(o->rng, M_VMX_VEPT);
 	free(o, M_VMX_VEPT);
 }
 
@@ -168,7 +181,7 @@ vept_obs_free(struct vept_obs *o)
  */
 static void
 vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
-    int idx)
+    int idx, uint64_t base)
 {
 	struct vept_obs_ent *e;
 	uint32_t h;
@@ -182,6 +195,8 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 		if (e->gpa == gpa) {
 			if (e->snap[idx] != page[idx])
 				o->walk_mismatch++;
+			if (e->base != base || e->level != level)
+				e->ambiguous = true;	/* C2: aliasing */
 			return;
 		}
 		if (e->gpa == 0)
@@ -196,7 +211,62 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 	memcpy(e->snap, page, PAGE_SIZE);
 	e->gpa = gpa;
 	e->level = level;
+	e->base = base;
+	e->ambiguous = false;
 	o->n++;
+}
+
+/*
+ * C2 (parere #26 di Astra): simulazione di B1. Ogni voce EPT12 cambiata a
+ * livello L di una tabella con base B invaliderebbe l'intervallo L2-GPA
+ * [B + j * 2^(12+9L), + 2^(12+9L)); livello 3 = tutta la radice. Si contano
+ * le foglie shadow vive che cadono negli intervalli (uniti), e i motivi per
+ * cui una B1 dovrebbe invece svuotare tutto. La shadow ha solo foglie 4K
+ * (vept_install): nessuna superpage shadow da spezzare.
+ */
+#define	VEPT_FB_AMBIG	0x01	/* tabella cambiata raggiunta da piu' basi */
+#define	VEPT_FB_L3	0x02	/* voce di PML4 cambiata */
+#define	VEPT_FB_OVERFL	0x04	/* tetto di tabelle superato */
+#define	VEPT_FB_UNREAD	0x08	/* tabella illeggibile */
+#define	VEPT_FB_WALK	0x10	/* disallineamento gia' visto nei walk */
+#define	VEPT_FB_NRNG	0x20	/* troppi intervalli */
+
+SDT_PROBE_DEFINE6(vmm, vmx, nested, veptdiag4, "int", "uint64_t", "uint64_t",
+    "int", "int", "uint64_t");	/* vcpu, vive, colpite, intervalli, motivi, ns */
+
+static int
+vept_rng_cmp(const void *a, const void *b)
+{
+	const struct vept_rng *x = a, *y = b;
+
+	return (x->start < y->start ? -1 : x->start > y->start);
+}
+
+/* Foglie vive del sottoalbero tbl (livello lvl, che copre da tb) dentro
+ * [s, e). Si scende solo dove c'e' sovrapposizione. */
+static uint64_t
+vept_count_range(const uint64_t *tbl, int lvl, uint64_t tb, uint64_t s,
+    uint64_t e)
+{
+	uint64_t span = 1ULL << (12 + 9 * lvl), lo, n = 0;
+	int i, i0, i1;
+
+	if (e <= tb)
+		return (0);
+	i0 = s > tb ? (int)((s - tb) / span) : 0;
+	i1 = (int)MIN((e - tb + span - 1) / span, 512);
+	for (i = i0; i < i1; i++) {
+		if ((tbl[i] & EPT_RWX) == 0)
+			continue;
+		lo = tb + (uint64_t)i * span;
+		if (lvl == 0)
+			n++;
+		else
+			n += vept_count_range((const uint64_t *)PHYS_TO_DMAP(
+			    EPT_ADDR(tbl[i])), lvl - 1, lo, MAX(s, lo),
+			    MIN(e, lo + span));
+	}
+	return (n);
 }
 
 /* All'INVEPT su una radice: confronta e riporta. Non cambia nulla. */
@@ -211,8 +281,19 @@ vept_obs_scan(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
 	void *cookie;
 	int i, j, tch = 0, ech = 0, unread = 0, c;
 
+	int nr = 0, fb = 0;
+	uint64_t live, hit = 0, span;
+	sbintime_t t1;
+
 	if (o == NULL)
 		return;
+	if (o->rng == NULL)
+		o->rng = malloc(VEPT_RNG_MAX * sizeof(struct vept_rng),
+		    M_VMX_VEPT, M_WAITOK);
+	if (o->overflow)
+		fb |= VEPT_FB_OVERFL;
+	if (o->walk_mismatch != 0)
+		fb |= VEPT_FB_WALK;
 	for (i = 0; i < VEPT_OBS_HASH; i++) {
 		e = &o->ent[i];
 		if (e->gpa == 0)
@@ -221,14 +302,28 @@ vept_obs_scan(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
 		    &cookie);
 		if (page == NULL) {
 			unread++;
+			fb |= VEPT_FB_UNREAD;
 			continue;
 		}
 		c = 0;
+		span = 1ULL << (12 + 9 * (e->level & 3));
 		for (j = 0; j < 512; j++) {
 			x = page[j] ^ e->snap[j];
 			if (x == 0)
 				continue;
 			c++;
+			/* C2: intervallo che B1 invaliderebbe */
+			if (e->ambiguous)
+				fb |= VEPT_FB_AMBIG;
+			else if (e->level >= 3)
+				fb |= VEPT_FB_L3;
+			else if (nr >= VEPT_RNG_MAX)
+				fb |= VEPT_FB_NRNG;
+			else {
+				o->rng[nr].start = e->base + (uint64_t)j * span;
+				o->rng[nr].end = o->rng[nr].start + span;
+				nr++;
+			}
 			if (x & 0x000ffffffffff000ULL)
 				k[0]++;			/* indirizzo */
 			else if (x & 0x407ULL)
@@ -257,8 +352,26 @@ vept_obs_scan(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
 	    ech, (uint64_t)sbttons(sbinuptime() - t0));
 	SDT_PROBE5(vmm, vmx, nested, veptdiag2, vcpu->vcpuid, levels, kinds,
 	    o->walk_mismatch, (uint64_t)unread | ((uint64_t)o->overflow << 32));
-	SDT_PROBE2(vmm, vmx, nested, veptdiag3, vcpu->vcpuid,
-	    vept_count_leaves(root, 3));
+	live = vept_count_leaves(root, 3);
+	SDT_PROBE2(vmm, vmx, nested, veptdiag3, vcpu->vcpuid, live);
+	/* C2: intervalli uniti, foglie vive colpite */
+	t1 = sbinuptime();
+	if (nr > 1) {
+		qsort(o->rng, nr, sizeof(struct vept_rng), vept_rng_cmp);
+		for (i = 0, j = 1; j < nr; j++) {
+			if (o->rng[j].start <= o->rng[i].end) {
+				if (o->rng[j].end > o->rng[i].end)
+					o->rng[i].end = o->rng[j].end;
+			} else
+				o->rng[++i] = o->rng[j];
+		}
+		nr = i + 1;
+	}
+	for (i = 0; i < nr; i++)
+		hit += vept_count_range(root, 3, 0, o->rng[i].start,
+		    o->rng[i].end);
+	SDT_PROBE6(vmm, vmx, nested, veptdiag4, vcpu->vcpuid, live, hit, nr,
+	    fb, (uint64_t)sbttons(sbinuptime() - t1));
 }
 
 
@@ -462,7 +575,8 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 		if (page == NULL)
 			return (-1);
 		pte = page[idx];
-		vept_obs_note(obs, tbl_gpa, level, page, idx);
+		vept_obs_note(obs, tbl_gpa, level, page, idx, level >= 3 ? 0 :
+		    l2gpa & ~((1ULL << (12 + 9 * (level + 1))) - 1));
 		vm_gpa_release(cookie);
 		if ((pte & EPT_RWX) == 0)
 			return (VEPT_VIOL);		/* non presente */
