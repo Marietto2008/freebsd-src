@@ -146,6 +146,10 @@ SDT_PROBE_DEFINE3(vmm, vmx, nested, immexit, "int", "int", "int");
 /* INVEPT dell'L1 (parere #24): invept(vcpuid, tipo, eptp del descrittore,
  * radici shadow svuotate). */
 SDT_PROBE_DEFINE4(vmm, vmx, nested, invept, "int", "int", "uint64_t", "int");
+/* Parere #29 §4: invept2(vcpuid, RIP dell'L1, VMCS12 corrente, tipo, eptp del
+ * descrittore, radici svuotate | conservate << 16). */
+SDT_PROBE_DEFINE6(vmm, vmx, nested, invept2, "int", "uint64_t", "uint64_t",
+    "int", "uint64_t", "uint64_t");
 /*
  * Uscita INTR_WINDOW da L2 gestita da L0: chi possedeva il bit nel VMCS02.
  * owner 0 = solo L0 (nested_compose_vmcs02, T2.6): atteso. owner 1 = anche
@@ -3277,8 +3281,8 @@ nested_invept(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	uint32_t info = (uint32_t)n->exit_insn_info;
-	uint64_t type, eptp = 0, cap = n->vmx_msr[0x48c - 0x480];
-	int wiped;
+	uint64_t type, eptp = 0, cap = n->vmx_msr[0x48c - 0x480], rip;
+	int wiped, kept;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
 	type = vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
@@ -3290,7 +3294,11 @@ nested_invept(struct vmx_vcpu *vcpu)
 	}
 	if (type == 1 && nested_read_operand_u64(vcpu, &eptp) != 0)
 		return (0);			/* eccezione o VMfail gia' dati */
-	wiped = vmx_vept_invept(vcpu, type, eptp);
+	wiped = vmx_vept_invept(vcpu, type, eptp, &kept);
+	vm_get_register(vcpu->vcpu, VM_REG_GUEST_RIP, &rip);
+	SDT_PROBE6(vmm, vmx, nested, invept2, vcpu->vcpuid, rip,
+	    n->current_vmcs12, (int)type, eptp,
+	    (uint64_t)wiped | (uint64_t)kept << 16);
 	vmm_stat_incr(vcpu->vcpu, type == 1 ? VMX_NESTED_INVEPT_SINGLE :
 	    VMX_NESTED_INVEPT_ALL, 1);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_VEPT_WIPED, wiped);

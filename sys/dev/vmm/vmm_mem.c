@@ -10,6 +10,7 @@
 #include <sys/malloc.h>
 #include <sys/sx.h>
 #include <sys/systm.h>
+#include <sys/sdt.h>
 
 #include <machine/vmm.h>
 
@@ -173,6 +174,15 @@ vm_mem_allocated(struct vcpu *vcpu, vm_paddr_t gpa)
 }
 
 /*
+ * Parere #29 §8: ogni cambio di mem_maps_gen. gen(op: 1 mmap, 2 munmap/free,
+ * 3 iniezione; gpa, len, segid, flags | sysmem << 16, generazione dopo).
+ * Il chiamante lo dice stack().
+ */
+SDT_PROVIDER_DECLARE(vmm);
+SDT_PROBE_DEFINE6(vmm, mem, memmap, gen, "int", "uint64_t", "uint64_t", "int",
+    "int", "uint64_t");
+
+/*
  * 'gpa' sta in un mapping WIRED di un memseg (nested, B1). Entrambi i tipi
  * di memseg sono oggetti OBJT_SWAP: sysmem e devmem (la RAM di QEMU con
  * l'acceleratore bhyve e' devmem) non contano, conta che le pagine siano
@@ -206,6 +216,8 @@ vm_memmap_generation_bump(struct vm *vm)
 {
 	vm_assert_memseg_xlocked(vm);
 	atomic_add_64(&vm_mem(vm)->mem_maps_gen, 1);
+	SDT_PROBE6(vmm, mem, memmap, gen, 3, 0, 0, -1, 0,
+	    vm_mem(vm)->mem_maps_gen);
 }
 
 int
@@ -362,6 +374,8 @@ vm_mmap_memseg(struct vm *vm, vm_paddr_t gpa, int segid, vm_ooffset_t first,
 	map->prot = prot;
 	map->flags = flags;
 	atomic_add_64(&mem->mem_maps_gen, 1);	/* solo a mapping riuscito */
+	SDT_PROBE6(vmm, mem, memmap, gen, 1, gpa, len, segid,
+	    flags | (seg->sysmem ? 1 << 16 : 0), mem->mem_maps_gen);
 	return (0);
 }
 
@@ -433,6 +447,8 @@ vm_free_memmap(struct vm *vm, int ident)
 
 	mm = &vm_mem(vm)->mem_maps[ident];
 	if (mm->len) {
+		SDT_PROBE6(vmm, mem, memmap, gen, 2, mm->gpa, mm->len,
+		    mm->segid, mm->flags, vm_mem(vm)->mem_maps_gen + 1);
 		error = vm_map_remove(&vm_vmspace(vm)->vm_map, mm->gpa,
 		    mm->gpa + mm->len);
 		KASSERT(error == KERN_SUCCESS, ("%s: vm_map_remove error %d",

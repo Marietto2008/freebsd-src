@@ -133,6 +133,38 @@ VEPT_CTR(vept_memgen_roots_invalidated,
 VEPT_CTR(vept_stale_root_enters,
     "B1: ingressi in L2 con una radice di generazione vecchia (deve essere 0)");
 VEPT_CTR(vept_shadow_pages, "nested: pagine di tabelle shadow EPT allocate");
+/*
+ * Parere #29 di Astra, §3: foglie shadow perse, per motivo. Ogni foglia tolta
+ * finisce in UNA sola voce. partial = intervalli cambiati di un INVEPT che
+ * conserva la radice; walk = voce cambiata vista da un walk; race, alias,
+ * capacity (tetto, troppi cambi, memoria), backing (MMIO/non wired), force
+ * (walk non tracciato), other (PML4, illeggibile, verifica) = svuotamenti
+ * completi di B1; memgen = generazione dei mapping; keep0 = INVEPT con
+ * vept_keep=0; lru = slot ripreso per un altro EPTP12.
+ */
+VEPT_CTR(vept_leaves_zapped_partial, "B1: foglie tolte da INVEPT conservati");
+VEPT_CTR(vept_leaves_zapped_walk, "B1: foglie tolte da voci cambiate nei walk");
+VEPT_CTR(vept_leaves_zapped_race, "B1: foglie perse per corsa fra le passate");
+VEPT_CTR(vept_leaves_zapped_alias, "B1: foglie perse per tabella ambigua");
+VEPT_CTR(vept_leaves_zapped_capacity, "B1: foglie perse per tetti o memoria");
+VEPT_CTR(vept_leaves_zapped_backing, "B1: foglie perse per MMIO o RAM non wired");
+VEPT_CTR(vept_leaves_zapped_force, "B1: foglie perse per walk non tracciato");
+VEPT_CTR(vept_leaves_zapped_walkfull,
+    "B1: foglie perse per walk su tabella ambigua o PML4 cambiata");
+VEPT_CTR(vept_keep_walk_wipes,
+    "B1: radici svuotate subito da un walk (ambigua o PML4 cambiata)");
+VEPT_CTR(vept_leaves_zapped_other, "B1: foglie perse per PML4, illeggibile, verifica");
+VEPT_CTR(vept_leaves_zapped_memgen, "nested: foglie perse per generazione dei mapping");
+VEPT_CTR(vept_leaves_zapped_keep0, "nested: foglie perse da INVEPT con vept_keep=0");
+VEPT_CTR(vept_leaves_zapped_lru, "nested: foglie perse riprendendo uno slot");
+/* Parere #29, §1: INVEPT dell'L1 e radici elaborate. Invariante:
+ * roots_matched = roots_kept + roots_fallback. */
+VEPT_CTR(vept_invept_single, "nested: INVEPT single-context dell'L1");
+VEPT_CTR(vept_invept_all, "nested: INVEPT all-context dell'L1");
+VEPT_CTR(vept_invept_roots_matched, "nested: radici colpite da un INVEPT");
+VEPT_CTR(vept_invept_roots_kept, "nested: radici colpite e conservate (B1)");
+VEPT_CTR(vept_invept_roots_fallback, "nested: radici colpite e svuotate");
+VEPT_CTR(vept_invept_roots_unmatched, "nested: radici esistenti non colpite");
 VEPT_CTR(vept_shadow_pages_high, "nested: massimo di vept_shadow_pages");
 
 /*
@@ -538,7 +570,7 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 #define	VEPT_FB_RACE	0x40	/* B1: tabella cambiata fra le due passate */
 #define	VEPT_FB_NOKEEP	0x80	/* B1: radice non conservabile */
 #define	VEPT_FB_NOMEM	0x100	/* B1: osservazioni o buffer non allocati */
-#define	VEPT_FB_FORCE	0x200	/* B1: walk cambiato su ambigua o PML4 */
+#define	VEPT_FB_FORCE	0x200	/* B1: walk non tracciato (memoria, o 2 svuotamenti) */
 #define	VEPT_FB_VERIFY	0x400	/* B1: verifica a campione discorde */
 
 SDT_PROBE_DEFINE6(vmm, vmx, nested, veptdiag4, "int", "uint64_t", "uint64_t",
@@ -694,9 +726,10 @@ vept_obs_scan(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
  * raggiunta da una base sola: si azzerano PRIMA, poi si aggiorna quella sola
  * voce della fotografia, e il walk prosegue e installa la traduzione nuova.
  * Senza aggiornarla un A -> B -> A lascerebbe conservata una foglia fatta da
- * B. Tabella ambigua o voce di PML4: la fotografia resta com'e' e il prossimo
- * INVEPT svuota tutta la radice; fino ad allora l'L2 puo' ancora usare
- * traduzioni vecchie, come col TLB, perche' l'L1 non ha ancora fatto INVEPT.
+ * B. Tabella ambigua o voce di PML4: la shadow non e' piu' certificabile e si
+ * svuota SUBITO (parere #29 §5), non al prossimo INVEPT dell'L1: wipe_now,
+ * eseguito da vmx_vept_fault a walk finito (a meta' walk si perderebbero le
+ * fotografie delle tabelle gia' annotate), prima di qualunque rientro in L2.
  */
 static void
 vept_walk_changed(struct vept_obs *o, struct vept_obs_ent *e, int idx,
@@ -707,7 +740,7 @@ vept_walk_changed(struct vept_obs *o, struct vept_obs_ent *e, int idx,
 	uint64_t span, st, z;
 
 	if (e->ambiguous || e->level >= 3) {
-		k->force_full = true;
+		k->wipe_now = true;
 		return;
 	}
 	span = 1ULL << (12 + 9 * e->level);
@@ -719,6 +752,7 @@ vept_walk_changed(struct vept_obs *o, struct vept_obs_ent *e, int idx,
 	e->snap[idx] = val;
 	atomic_add_long(&vept_keep_walk_zaps, 1);
 	atomic_add_long(&vept_keep_invalidated_leaves, z);
+	atomic_add_long(&vept_leaves_zapped_walk, z);
 }
 
 static struct vept_obs_ent *
@@ -991,6 +1025,7 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	atomic_add_long(&vept_keep_partial_invepts, 1);
 	atomic_add_long(&vept_keep_retained_leaves, k->leaves);
 	atomic_add_long(&vept_keep_invalidated_leaves, inval);
+	atomic_add_long(&vept_leaves_zapped_partial, inval);
 	SDT_PROBE6(vmm, vmx, nested, veptkeep, vcpu->vcpuid, s->eptp12, live,
 	    inval, (uint64_t)nr | (uint64_t)nc << 32, VEPT_KEEP_A5(0, ntr, t0));
 	return (true);
@@ -1000,6 +1035,13 @@ full:
 	if (fb & VEPT_FB_RACE)
 		atomic_add_long(&vept_keep_scan_race_fallbacks, 1);
 	atomic_add_long(&vept_keep_invalidated_leaves, live);
+	atomic_add_long((fb & VEPT_FB_RACE) ? &vept_leaves_zapped_race :
+	    (fb & VEPT_FB_AMBIG) ? &vept_leaves_zapped_alias :
+	    (fb & (VEPT_FB_OVERFL | VEPT_FB_NRNG | VEPT_FB_NOMEM)) ?
+	    &vept_leaves_zapped_capacity :
+	    (fb & VEPT_FB_NOKEEP) ? &vept_leaves_zapped_backing :
+	    (fb & VEPT_FB_FORCE) ? &vept_leaves_zapped_force :
+	    &vept_leaves_zapped_other, live);
 	SDT_PROBE6(vmm, vmx, nested, veptkeep, vcpu->vcpuid, s->eptp12, live,
 	    live, (uint64_t)nr | (uint64_t)nc << 32, VEPT_KEEP_A5(fb, ntr, t0));
 	vept_root_wipe(n, i);
@@ -1057,6 +1099,8 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 		if (pick->root == NULL)
 			pick->root = vept_page_alloc();
 		else {
+			atomic_add_long(&vept_leaves_zapped_lru,
+			    n->vept_ks[pick - n->vept_slot].leaves);
 			vept_root_wipe(n, pick - n->vept_slot);
 			vept_dist_clear(n->vept_obs[pick - n->vept_slot]);
 		}
@@ -1113,6 +1157,7 @@ vept_root_wipe(struct vmx_nested *n, int i)
 	n->vept_ks[i].leaves = 0;
 	n->vept_ks[i].nokeep = false;
 	n->vept_ks[i].force_full = false;
+	n->vept_ks[i].wipe_now = false;
 }
 
 /*
@@ -1133,27 +1178,39 @@ vept_root_wipe(struct vmx_nested *n, int i)
 #define	VEPT_EPTP_BASE	0x000ffffffffff000ULL	/* bit 51:12 */
 
 int
-vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp)
+vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp, int *kept)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vept_slot *s;
 	int i, wiped = 0;
 
+	*kept = 0;
+	atomic_add_long(type == 1 ? &vept_invept_single : &vept_invept_all, 1);
 	for (i = 0; i < VEPT_NROOTS; i++) {
 		s = &n->vept_slot[i];
 		if (s->root == NULL)
 			continue;
 		if (type == 1 && (s->eptp12 & VEPT_EPTP_BASE) !=
-		    (eptp & VEPT_EPTP_BASE))
+		    (eptp & VEPT_EPTP_BASE)) {
+			atomic_add_long(&vept_invept_roots_unmatched, 1);
 			continue;
+		}
+		atomic_add_long(&vept_invept_roots_matched, 1);
 		if (vept_diag)		/* fase C: solo misura, PRIMA di svuotare */
 			vept_obs_scan(vcpu, n->vept_obs[i], s->eptp12,
 			    s->root);
 		if (n->vept_keep) {	/* B1: conservata o svuotata */
-			if (!vept_keep_invept(vcpu, i))
+			if (!vept_keep_invept(vcpu, i)) {
 				wiped++;
+				atomic_add_long(&vept_invept_roots_fallback, 1);
+			} else {
+				(*kept)++;
+				atomic_add_long(&vept_invept_roots_kept, 1);
+			}
 			continue;
 		}
+		atomic_add_long(&vept_leaves_zapped_keep0, n->vept_ks[i].leaves);
+		atomic_add_long(&vept_invept_roots_fallback, 1);
 		vept_root_wipe(n, i);
 		wiped++;
 	}
@@ -1324,6 +1381,25 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 			k->force_full = true;
 	}
 	r = ept12_translate(vcpu, eptp12, l2gpa, l1gpa, perm, obs);
+	if (k->wipe_now) {
+		/*
+		 * B1: il walk ha visto cambiata una voce di una tabella ambigua o
+		 * di PML4. Radice svuotata ORA e walk rifatto sulla radice vuota
+		 * (le sue tabelle si fotografano di nuovo). Se capita ancora
+		 * (tabella cambiata fra due visite dello stesso walk) si svuota di
+		 * nuovo e il walk resta non tracciato: force_full.
+		 */
+		atomic_add_long(&vept_keep_walk_wipes, 1);
+		atomic_add_long(&vept_leaves_zapped_walkfull, k->leaves);
+		vept_root_wipe(n, vept_cur_slot(n));
+		r = ept12_translate(vcpu, eptp12, l2gpa, l1gpa, perm, obs);
+		if (k->wipe_now) {
+			atomic_add_long(&vept_keep_walk_wipes, 1);
+			atomic_add_long(&vept_leaves_zapped_walkfull, k->leaves);
+			vept_root_wipe(n, vept_cur_slot(n));
+			k->force_full = true;
+		}
+	}
 	if (r < 0)
 		return (VEPT_VIOL);		/* tabella dell'L1 illeggibile */
 	if (r != VEPT_OK)
@@ -1430,6 +1506,8 @@ vmx_vept_memgen_sync(struct vmx_vcpu *vcpu)
 		if (n->vept_ks[i].memgen == g)
 			continue;
 		if (n->vept_slot[i].root != NULL) {
+			atomic_add_long(&vept_leaves_zapped_memgen,
+			    n->vept_ks[i].leaves);
 			vept_root_wipe(n, i);
 			inv++;
 		}

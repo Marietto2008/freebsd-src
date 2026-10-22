@@ -109,7 +109,8 @@ uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
 	    uint64_t *out);
 void	vmx_vept_flush(struct vmx_nested *n);
-int	vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp);
+int	vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp,
+	    int *kept);
 void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
 /* B1 */
@@ -365,6 +366,7 @@ struct vmx_nested {
 		uint64_t	leaves;		/* foglie shadow vive */
 		bool		nokeep;		/* foglia non wired o MMIO */
 		bool		force_full;	/* il prossimo INVEPT svuota tutto */
+		bool		wipe_now;	/* walk: svuotare prima di rientrare */
 	}		vept_ks[VEPT_NROOTS];
 };
 
