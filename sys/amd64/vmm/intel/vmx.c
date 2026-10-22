@@ -3466,6 +3466,7 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 {
 	int rc, handled, launched;
 	u_int vmrun_iters = 0;		/* anti-freeze del loop interno (nested) */
+	uint64_t entry_tsc = 0;
 	struct vmx *vmx;
 	struct vmx_vcpu *vcpu;
 	struct vmxctx *vmxctx;
@@ -3790,12 +3791,22 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
 		    vcpu->nested->vept_keep)
 			vmx_vept_enter_check(vcpu);	/* B1: deve restare 0 */
+		if (vcpu->nested != NULL)
+			entry_tsc = rdtsc();	/* parere #30: tempo in L1/L2 */
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
 		/* nested: TSC al momento dell'uscita, per IA32_TSC nella lista
 		 * "store all'uscita" (SDM: valore all'uscita, non alla
 		 * riflessione; rdtsc_vmexit_diff_test tollera 750 cicli) */
-		if (vcpu->nested != NULL && vcpu->nested->in_l2)
-			vcpu->nested->exit_tsc = rdtsc();
+		if (vcpu->nested != NULL) {
+			uint64_t now = rdtsc();
+
+			if (vcpu->nested->in_l2) {
+				vcpu->nested->exit_tsc = now;
+				vcpu->nested->st_l2_entries++;
+				vcpu->nested->st_l2_tsc += now - entry_tsc;
+			} else
+				vcpu->nested->st_l1_tsc += now - entry_tsc;
+		}
 
 		vmx_pmap_deactivate(vmx, pmap);
 		vmx_dr_leave_guest(vmxctx);

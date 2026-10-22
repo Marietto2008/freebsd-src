@@ -901,6 +901,43 @@ VEPT_CTR(vept_scan_retry_budget_fallback,
     "B1: svuotamento per budget di tempo esaurito");
 VEPT_CTR(vept_scan_retries_done, "B1: retry eseguiti");
 VEPT_CTR(vept_scan_bytes_read, "B1: byte di EPT12 letti dalle due passate");
+/*
+ * Parere #30 §2: tempi per fase (somme in ns, massimi azzerabili) e, per
+ * tentativo, tempo delle due passate e foglie conservate dai successi: le
+ * foglie salvate dal retry n sono quelle che il retry n-1 avrebbe perso.
+ * Il budget vept_scan_budget_us e' un tetto sul tempo TOTALE dall'inizio
+ * dell'INVEPT, controllato prima di ogni nuovo tentativo: non si moltiplica
+ * per i tentativi, ma non interrompe un tentativo gia' iniziato.
+ */
+VEPT_CTR(vept_t_scan_ns, "B1: tempo nelle due passate, tutti i tentativi (ns)");
+VEPT_CTR(vept_t_partial_ns, "B1: tempo di invalidazione parziale e commit (ns)");
+VEPT_CTR(vept_t_full_ns, "B1: tempo di svuotamento nei fallback (ns)");
+VEPT_CTR(vept_t_attempt0_ns, "B1: tempo delle passate, primo tentativo (ns)");
+VEPT_CTR(vept_t_attempt1_ns, "B1: tempo delle passate, 1o retry (ns)");
+VEPT_CTR(vept_t_attempt2_ns, "B1: tempo delle passate, 2o retry (ns)");
+VEPT_CTR(vept_retry_1_leaves_saved, "B1: foglie conservate da successi al 1o retry");
+VEPT_CTR(vept_retry_2_leaves_saved, "B1: foglie conservate da successi al 2o retry");
+VEPT_CTR(vept_retry_1_leaves_invalidated,
+    "B1: foglie invalidate dai successi al 1o retry");
+VEPT_CTR(vept_retry_2_leaves_invalidated,
+    "B1: foglie invalidate dai successi al 2o retry");
+static u_long vept_t_scan_max_ns, vept_t_partial_max_ns, vept_t_full_max_ns;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_t_scan_max_ns, CTLFLAG_RW,
+    &vept_t_scan_max_ns, 0, "B1: massimo delle due passate (ns)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_t_partial_max_ns, CTLFLAG_RW,
+    &vept_t_partial_max_ns, 0, "B1: massimo dell'invalidazione parziale (ns)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_t_full_max_ns, CTLFLAG_RW,
+    &vept_t_full_max_ns, 0, "B1: massimo dello svuotamento (ns)");
+
+static void
+vept_time_note(u_long *sum, u_long *max, sbintime_t from)
+{
+	u_long ns = (u_long)sbttons(sbinuptime() - from);
+
+	atomic_add_long(sum, ns);
+	if (max != NULL && ns > *max)
+		*max = ns;			/* indicativo: senza CAS */
+}
 static u_long vept_scan_max_ns;
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_scan_max_ns, CTLFLAG_RW,
     &vept_scan_max_ns, 0, "B1: durata massima di un INVEPT (ns, 0 per azzerare)");
@@ -987,7 +1024,7 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	struct vept_obs *o = n->vept_obs[i];
 	struct vept_obs_ent *e;
 	uint64_t *page, span, expect, v, live = k->leaves, inval = 0, bytes = 0;
-	sbintime_t t0 = sbinuptime();
+	sbintime_t t0 = sbinuptime(), ts, ta, tp;
 	void *cookie;
 	int fb = 0, nr = 0, nc = 0, t, j, c, m, ntr = 0;
 	int attempt = 0, retries, inj_t, inj_j;
@@ -1025,7 +1062,9 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	 * riuscita. Oltre il budget di tempo, svuotamento.
 	 */
 	retries = MIN(MAX(vept_scan_retries, 0), VEPT_MAX_SCAN_RETRIES);
+	ts = sbinuptime();
 	for (attempt = 0;; attempt++) {
+		ta = sbinuptime();
 		nc = 0;
 		inj_t = -1;
 		inj_j = 0;
@@ -1106,6 +1145,9 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 			}
 			vm_gpa_release(cookie);
 		}
+		vept_time_note(attempt == 0 ? &vept_t_attempt0_ns :
+		    attempt == 1 ? &vept_t_attempt1_ns : &vept_t_attempt2_ns,
+		    NULL, ta);
 		if (fb != VEPT_FB_RACE || attempt >= retries)
 			break;
 		if (sbttons(sbinuptime() - t0) > (int64_t)vept_scan_budget_us *
@@ -1117,6 +1159,8 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 		fb = 0;			/* nuova transazione dalle fotografie */
 	}
 	atomic_add_long(&vept_scan_bytes_read, bytes);
+	vept_time_note(&vept_t_scan_ns, &vept_t_scan_max_ns, ts);
+	tp = sbinuptime();
 	if (fb != 0) {
 		if (fb == VEPT_FB_RACE && attempt > 0)
 			atomic_add_long(&vept_scan_retry_exhausted, 1);
@@ -1157,6 +1201,14 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 		fb |= VEPT_FB_VERIFY;
 		goto full;
 	}
+	vept_time_note(&vept_t_partial_ns, &vept_t_partial_max_ns, tp);
+	if (attempt == 1) {
+		atomic_add_long(&vept_retry_1_leaves_saved, k->leaves);
+		atomic_add_long(&vept_retry_1_leaves_invalidated, inval);
+	} else if (attempt == 2) {
+		atomic_add_long(&vept_retry_2_leaves_saved, k->leaves);
+		atomic_add_long(&vept_retry_2_leaves_invalidated, inval);
+	}
 	atomic_add_long(&vept_keep_partial_invepts, 1);
 	atomic_add_long(&vept_keep_retained_leaves, k->leaves);
 	atomic_add_long(&vept_keep_invalidated_leaves, inval);
@@ -1180,7 +1232,9 @@ full:
 	    &vept_leaves_zapped_other, live);
 	SDT_PROBE6(vmm, vmx, nested, veptkeep, vcpu->vcpuid, s->eptp12, live,
 	    live, (uint64_t)nr | (uint64_t)nc << 32, VEPT_KEEP_A5(fb, ntr, t0));
+	tp = sbinuptime();
 	vept_root_wipe(n, i);
+	vept_time_note(&vept_t_full_ns, &vept_t_full_max_ns, tp);
 	vept_scan_note_ns(t0);
 	return (false);
 }

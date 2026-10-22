@@ -204,6 +204,47 @@ VMM_STAT_INTEL(VMX_NESTED_L2_ENTRIES, "ingressi in L2");
 VMM_STAT_INTEL(VMX_NESTED_REFLECTIONS, "exit riflesse all'L1");
 VMM_STAT_INTEL(VMX_NESTED_SYNTH_EXITS, "exit sintetiche verso l'L1");
 VMM_STAT_INTEL(VMX_NESTED_SLOWPATH, "exit nested gestite nello slow path");
+
+/*
+ * Parere #30 §3: EPT violation dell'L2 risolte da L0 (shadow costruita) contro
+ * quelle che Hyper-V vede davvero (riflesse all'L1), e tempo di guest in L2 e
+ * in L1. Contatori leggeri per tutta la campagna; la sonda veptrefl per le
+ * tracce brevi dettagliate.
+ */
+#define	NESTED_CTR(name, descr)						\
+	static u_long name;						\
+	SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, name, CTLFLAG_RD, &name, 0, descr)
+NESTED_CTR(nested_ept02_faults_l0, "nested: EPT violation dell'L2 risolte da L0");
+NESTED_CTR(nested_ept_mmio_emulated,
+    "nested: EPT violation dell'L2 emulate come MMIO dell'L1");
+NESTED_CTR(nested_ept12_viol_reflected,
+    "nested: EPT violation riflesse all'L1 (Hyper-V le vede)");
+NESTED_CTR(nested_ept12_misconf_reflected,
+    "nested: EPT misconfiguration riflesse all'L1");
+NESTED_CTR(nested_l2_entries, "nested: ingressi in L2");
+NESTED_CTR(nested_l2_tsc, "nested: cicli TSC di guest in L2");
+NESTED_CTR(nested_l1_tsc, "nested: cicli TSC di guest in L1 (vCPU nested)");
+NESTED_CTR(nested_invept_ns_sum, "nested: tempo nel gestore INVEPT (ns)");
+static u_long nested_invept_ns_max;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_invept_ns_max, CTLFLAG_RW,
+    &nested_invept_ns_max, 0, "nested: massimo del gestore INVEPT (ns)");
+/* veptrefl(vcpuid, eptp12, l2gpa, qualificazione, esito, HOST_RIP del VMCS12) */
+SDT_PROBE_DEFINE6(vmm, vmx, nested, veptrefl, "int", "uint64_t", "uint64_t",
+    "uint64_t", "int", "uint64_t");
+
+void
+nested_stats_flush(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+
+	if (n->st_l2_entries != 0)
+		atomic_add_long(&nested_l2_entries, n->st_l2_entries);
+	if (n->st_l2_tsc != 0)
+		atomic_add_long(&nested_l2_tsc, n->st_l2_tsc);
+	if (n->st_l1_tsc != 0)
+		atomic_add_long(&nested_l1_tsc, n->st_l1_tsc);
+	n->st_l2_entries = n->st_l2_tsc = n->st_l1_tsc = 0;
+}
 VMM_STAT_INTEL(VMX_NESTED_VMFAIL, "VMfailValid restituiti all'L1");
 VMM_STAT_INTEL(VMX_NESTED_VMFAIL_INVALID, "VMfailInvalid restituiti all'L1");
 VMM_STAT_INTEL(VMX_NESTED_MSRBM_UNMAPPED,
@@ -3282,6 +3323,8 @@ nested_invept(struct vmx_vcpu *vcpu)
 	struct vmx_nested *n = vcpu->nested;
 	uint32_t info = (uint32_t)n->exit_insn_info;
 	uint64_t type, eptp = 0, cap = n->vmx_msr[0x48c - 0x480], rip;
+	sbintime_t t0;
+	u_long ns;
 	int wiped, kept;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
@@ -3294,7 +3337,12 @@ nested_invept(struct vmx_vcpu *vcpu)
 	}
 	if (type == 1 && nested_read_operand_u64(vcpu, &eptp) != 0)
 		return (0);			/* eccezione o VMfail gia' dati */
+	t0 = sbinuptime();
 	wiped = vmx_vept_invept(vcpu, type, eptp, &kept);
+	ns = (u_long)sbttons(sbinuptime() - t0);
+	atomic_add_long(&nested_invept_ns_sum, ns);
+	if (ns > nested_invept_ns_max)
+		nested_invept_ns_max = ns;		/* indicativo: senza CAS */
 	vm_get_register(vcpu->vcpu, VM_REG_GUEST_RIP, &rip);
 	SDT_PROBE6(vmm, vmx, nested, invept2, vcpu->vcpuid, rip,
 	    n->current_vmcs12, (int)type, eptp,
@@ -3399,8 +3447,10 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 	int r;
 
 	r = vmx_vept_fault(vcpu, n->ept_gpa, n->ept_qual, &l1gpa, &perm);
-	if (r == VEPT_OK)
+	if (r == VEPT_OK) {
+		atomic_add_long(&nested_ept02_faults_l0, 1);
 		return (0);
+	}
 	if (r == VEPT_MMIO && (n->ept_qual & 0x3) != 0 &&
 	    (n->ept_qual & 0x180) == 0x180) {
 		/* lettura/scrittura dati da un indirizzo lineare (come
@@ -3409,8 +3459,15 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 		vmexit->u.inst_emul.gpa = l1gpa;
 		vmexit->exitcode = VM_EXITCODE_INST_EMUL;
 		vmexit->inst_length = 0;
+		atomic_add_long(&nested_ept_mmio_emulated, 1);
 		return (0);
 	}
+	atomic_add_long(r == VEPT_MISCONF ? &nested_ept12_misconf_reflected :
+	    &nested_ept12_viol_reflected, 1);
+	if ((c = nested_current_cache(n)) != NULL)
+		SDT_PROBE6(vmm, vmx, nested, veptrefl, vcpu->vcpuid,
+		    vmcs12_read_field(c, VMCS_EPTP), n->ept_gpa, n->ept_qual, r,
+		    vmcs12_read_field(c, VMCS_HOST_RIP));
 	if (__predict_false(vmx_nested_probe == 9))
 		nested_probe_walk(vcpu, r, l1gpa, perm);
 	VMPTRLD(vcpu->vmcs);			/* il VMCS02 */
@@ -3443,6 +3500,8 @@ vmx_nested_exit(void *vcpui)
 
 	SDT_PROBE1(vmm, vmx, nested, slowpath, vcpu);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
+	if (vcpu->nested != NULL)
+		nested_stats_flush(vcpu);
 
 	/*
 	 * B1: generazione dei mapping di L0 cambiata -> tutte le radici shadow

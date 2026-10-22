@@ -368,7 +368,16 @@ struct vmx_nested {
 		bool		force_full;	/* il prossimo INVEPT svuota tutto */
 		bool		wipe_now;	/* walk: svuotare prima di rientrare */
 	}		vept_ks[VEPT_NROOTS];
+	/*
+	 * Parere #30 §3: tempo di guest in L2 e in L1 e ingressi in L2, contati
+	 * per vCPU nel percorso veloce (niente variabili condivise) e versati
+	 * nei contatori globali hw.vmm.vmx.nested_* nello slow path.
+	 */
+	uint64_t	st_l2_entries;
+	uint64_t	st_l2_tsc;
+	uint64_t	st_l1_tsc;
 };
+void	nested_stats_flush(struct vmx_vcpu *vcpu);
 
 int	vmx_nested_init(struct vmx_vcpu *vcpu);
 int	vmx_nested_exit(void *vcpui);
