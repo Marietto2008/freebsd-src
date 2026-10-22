@@ -805,72 +805,125 @@ vept_snap_translate(struct vept_obs *o, uint64_t eptp12, uint64_t l2gpa,
 
 /*
  * B1, hw.vmm.vmx.vept_verify_hpa: dopo un INVEPT che conserva la radice, fino
- * a VEPT_VERIFY_MAX foglie sparse riconfrontate con il cammino sulle
- * fotografie e con l'HPA di vm_gpa_hold dell'L1-GPA (parere #28 §6). Ritorna
- * le discordanze; il chiamante allora svuota la radice.
+ * a VEPT_VERIFY_MAX foglie riconfrontate con il cammino sulle fotografie e con
+ * l'HPA di vm_gpa_hold dell'L1-GPA (parere #28 §6). Ritorna le discordanze; il
+ * chiamante allora svuota la radice.
+ *
+ * Parere #31 §2: i candidati non si cercano piu' percorrendo tutta la radice
+ * (fino a 26 ms con ~628 k foglie) ma in un reservoir di VEPT_VS_N L2-GPA per
+ * radice, campione uniforme delle foglie installate dall'ultimo svuotamento
+ * (algoritmo R), azzerato a ogni svuotamento, quindi anche a ogni cambio della
+ * generazione dei mapping. Solo indirizzi logici: a verifica si rifa' il
+ * cammino dalla radice (profondita' 4) e una foglia non piu' presente si salta.
+ * Costo O(K x D), non O(foglie vive). I candidati ruotano fra un INVEPT e
+ * l'altro.
  */
 #define	VEPT_VERIFY_MAX	64
 
+static void vept_time_note(u_long *sum, u_long *max, sbintime_t from);
+VEPT_CTR(vept_keep_verify_stale, "B1: candidati alla verifica senza foglia");
+VEPT_CTR(vept_t_verify_ns, "B1: tempo della verifica HPA (ns)");
+static u_long vept_t_verify_max_ns;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_t_verify_max_ns, CTLFLAG_RW,
+    &vept_t_verify_max_ns, 0, "B1: massimo della verifica HPA (ns)");
+/*
+ * Prova del rilevatore (parere #31 §2), SOLO per i test: con
+ * hw.vmm.vmx.vept_test_verify_corrupt=1 la verifica successiva confronta,
+ * per il primo candidato, un HPA alterato di una pagina invece di quello
+ * della foglia. La foglia vera non si tocca e l'L2 non gira mai con un
+ * mapping sbagliato: la discordanza deve essere vista e la radice svuotata.
+ */
+static int vept_test_verify_corrupt = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_test_verify_corrupt, CTLFLAG_RW,
+    &vept_test_verify_corrupt, 0,
+    "nested: SOLO PROVE, una discordanza simulata nella prossima verifica HPA");
+VEPT_CTR(vept_test_verify_injected, "B1: discordanze simulate nella verifica");
+
+/* Reservoir dei candidati: chiamata per ogni foglia nuova (algoritmo R). */
+static void
+vept_vs_note(struct vept_kslot *k, uint64_t l2gpa)
+{
+	uint64_t x, r;
+
+	k->vs_n++;
+	if (k->vs_n <= VEPT_VS_N) {
+		k->vs_gpa[k->vs_n - 1] = l2gpa;
+		return;
+	}
+	x = k->vs_rng != 0 ? k->vs_rng :
+	    0x9e3779b97f4a7c15ULL ^ (uint64_t)(uintptr_t)k;
+	x ^= x << 13;
+	x ^= x >> 7;
+	x ^= x << 17;
+	k->vs_rng = x;
+	r = x % k->vs_n;
+	if (r < VEPT_VS_N)
+		k->vs_gpa[r] = l2gpa;
+}
+
+/* Voce foglia shadow per l2gpa nella radice, 0 se assente. */
+static uint64_t
+vept_leaf_get(uint64_t *tbl, uint64_t l2gpa)
+{
+	int level;
+
+	for (level = 3; level > 0; level--) {
+		if ((tbl[EPT_IDX(l2gpa, level)] & EPT_RWX) == 0)
+			return (0);
+		tbl = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(
+		    tbl[EPT_IDX(l2gpa, level)]));
+	}
+	return (tbl[EPT_IDX(l2gpa, 0)]);
+}
+
 static int
 vept_verify(struct vmx_vcpu *vcpu, struct vept_obs *o, uint64_t eptp12,
-    uint64_t *root, uint64_t leaves)
+    uint64_t *root, struct vept_kslot *k)
 {
-	uint64_t *t2, *t1, *t0, l2gpa, l1gpa, perm, exp, seen = 0, stride;
-	int i3, i2, i1, i0, checked = 0, bad = 0, r;
+	uint64_t l2gpa, l1gpa, perm, exp, leaf, v;
+	sbintime_t t0 = sbinuptime();
+	int i, n, checked = 0, bad = 0, stale = 0, r;
 	static int printed;
 	void *p, *ck;
 
-	stride = MAX(1, leaves / VEPT_VERIFY_MAX);
-	for (i3 = 0; i3 < 512; i3++) {
-		if ((root[i3] & EPT_RWX) == 0)
+	n = (int)MIN(k->vs_n, VEPT_VS_N);
+	for (i = 0; i < n && checked < VEPT_VERIFY_MAX; i++) {
+		l2gpa = k->vs_gpa[(k->vs_start + i) % n];
+		if (((leaf = vept_leaf_get(root, l2gpa)) & EPT_RWX) == 0) {
+			stale++;
 			continue;
-		t2 = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(root[i3]));
-		for (i2 = 0; i2 < 512; i2++) {
-			if ((t2[i2] & EPT_RWX) == 0)
-				continue;
-			t1 = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(t2[i2]));
-			for (i1 = 0; i1 < 512; i1++) {
-				if ((t1[i1] & EPT_RWX) == 0)
-					continue;
-				t0 = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(t1[i1]));
-				for (i0 = 0; i0 < 512; i0++) {
-					if ((t0[i0] & EPT_RWX) == 0 ||
-					    seen++ % stride != 0)
-						continue;
-					if (checked++ >= VEPT_VERIFY_MAX)
-						goto done;
-					l2gpa = (uint64_t)i3 << 39 |
-					    (uint64_t)i2 << 30 |
-					    (uint64_t)i1 << 21 | (uint64_t)i0 << 12;
-					r = vept_snap_translate(o, eptp12,
-					    l2gpa, &l1gpa, &perm);
-					exp = 0;
-					if (r == VEPT_OK && (p = vm_gpa_hold(
-					    vcpu->vcpu, l1gpa & ~(uint64_t)PAGE_MASK,
-					    PAGE_SIZE, VM_PROT_READ, &ck)) != NULL) {
-						exp = DMAP_TO_PHYS((vm_offset_t)p) |
-						    (perm & EPT_RWX);
-						vm_gpa_release(ck);
-					}
-					if (exp != 0 && (t0[i0] & (EPT_ADDR(~0ULL) |
-					    EPT_RWX)) == exp)
-						continue;
-					bad++;
-					SDT_PROBE5(vmm, vmx, nested, veptverify,
-					    vcpu->vcpuid, l2gpa, t0[i0], exp, r);
-					if (printed++ < 8)
-						printf("nested: B1 verifica vcpu%d "
-						    "l2gpa %#lx foglia %#lx attesa "
-						    "%#lx (r=%d)\n", vcpu->vcpuid,
-						    (u_long)l2gpa, (u_long)t0[i0],
-						    (u_long)exp, r);
-				}
-			}
 		}
+		checked++;
+		r = vept_snap_translate(o, eptp12, l2gpa, &l1gpa, &perm);
+		exp = 0;
+		if (r == VEPT_OK && (p = vm_gpa_hold(vcpu->vcpu,
+		    l1gpa & ~(uint64_t)PAGE_MASK, PAGE_SIZE, VM_PROT_READ,
+		    &ck)) != NULL) {
+			exp = DMAP_TO_PHYS((vm_offset_t)p) | (perm & EPT_RWX);
+			vm_gpa_release(ck);
+		}
+		v = leaf & (EPT_ADDR(~0ULL) | EPT_RWX);
+		if (vept_test_verify_corrupt != 0) {
+			vept_test_verify_corrupt = 0;
+			v ^= PAGE_SIZE;		/* HPA alterato, solo nel confronto */
+			atomic_add_long(&vept_test_verify_injected, 1);
+		}
+		if (exp != 0 && v == exp)
+			continue;
+		bad++;
+		SDT_PROBE5(vmm, vmx, nested, veptverify, vcpu->vcpuid, l2gpa, leaf,
+		    exp, r);
+		if (printed++ < 8)
+			printf("nested: B1 verifica vcpu%d l2gpa %#lx foglia %#lx "
+			    "attesa %#lx (r=%d)\n", vcpu->vcpuid, (u_long)l2gpa,
+			    (u_long)leaf, (u_long)exp, r);
 	}
-done:
-	atomic_add_long(&vept_keep_verify_checked, MIN(checked, VEPT_VERIFY_MAX));
+	if (n > 0)
+		k->vs_start = (k->vs_start + VEPT_VERIFY_MAX) % n;
+	atomic_add_long(&vept_keep_verify_checked, checked);
+	atomic_add_long(&vept_keep_verify_stale, stale);
 	atomic_add_long(&vept_keep_verify_mismatch, bad);
+	vept_time_note(&vept_t_verify_ns, &vept_t_verify_max_ns, t0);
 	return (bad);
 }
 
@@ -1196,8 +1249,7 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	for (c = 0; c < nc; c++)
 		o->ent[o->chg[c].ent].snap[o->chg[c].j] = o->chg[c].val;
 
-	if (vept_verify_hpa && vept_verify(vcpu, o, s->eptp12, s->root,
-	    k->leaves) != 0) {
+	if (vept_verify_hpa && vept_verify(vcpu, o, s->eptp12, s->root, k) != 0) {
 		fb |= VEPT_FB_VERIFY;
 		goto full;
 	}
@@ -1349,6 +1401,8 @@ vept_root_wipe(struct vmx_nested *n, int i)
 	n->vept_ks[i].nokeep = false;
 	n->vept_ks[i].force_full = false;
 	n->vept_ks[i].wipe_now = false;
+	n->vept_ks[i].vs_n = 0;		/* reservoir della verifica */
+	n->vept_ks[i].vs_start = 0;
 }
 
 /*
@@ -1515,8 +1569,11 @@ vept_install(struct vmx_nested *n, struct vept_kslot *k, uint64_t l2gpa,
 		tbl = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(tbl[idx]));
 	}
 	idx = EPT_IDX(l2gpa, 0);
-	if ((tbl[idx] & EPT_RWX) == 0)
+	if ((tbl[idx] & EPT_RWX) == 0) {
 		k->leaves++;
+		if (vept_verify_hpa)
+			vept_vs_note(k, l2gpa);	/* candidati della verifica */
+	}
 	tbl[idx] = (hpa & ~0xfffULL) | (perm & EPT_RWX) |
 	    EPT_PG_MEMORY_TYPE(mt) | EPT_PG_IGNORE_PAT;
 	return (0);

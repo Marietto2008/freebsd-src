@@ -367,6 +367,13 @@ struct vmx_nested {
 		bool		nokeep;		/* foglia non wired o MMIO */
 		bool		force_full;	/* il prossimo INVEPT svuota tutto */
 		bool		wipe_now;	/* walk: svuotare prima di rientrare */
+		/* verifica HPA (parere #31): reservoir di L2-GPA di foglie
+		 * installate dall'ultimo svuotamento, niente puntatori */
+#define	VEPT_VS_N	128
+		uint64_t	vs_gpa[VEPT_VS_N];
+		uint64_t	vs_n;		/* foglie viste dallo svuotamento */
+		uint64_t	vs_rng;		/* xorshift64 */
+		uint32_t	vs_start;	/* rotazione fra un INVEPT e l'altro */
 	}		vept_ks[VEPT_NROOTS];
 	/*
 	 * Parere #30 §3: tempo di guest in L2 e in L1 e ingressi in L2, contati
