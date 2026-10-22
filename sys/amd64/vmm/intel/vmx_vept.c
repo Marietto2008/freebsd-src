@@ -877,6 +877,92 @@ done:
 static void vept_root_wipe(struct vmx_nested *n, int i);
 
 /*
+ * B1, retry delle due passate (parere #29 §2). vept_scan_retries: tentativi
+ * in piu' dopo una corsa, 0..VEPT_MAX_SCAN_RETRIES (0 = come 0d5bd14).
+ * vept_scan_budget_us: oltre questo tempo dall'inizio dell'INVEPT non si
+ * ritenta piu'.
+ */
+#define	VEPT_MAX_SCAN_RETRIES	2
+static int vept_scan_retries = 1;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_scan_retries, CTLFLAG_RWTUN,
+    &vept_scan_retries, 0,
+    "nested: B1, nuovi tentativi delle due passate dopo una corsa (0..2)");
+static int vept_scan_budget_us = 2000;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_scan_budget_us, CTLFLAG_RWTUN,
+    &vept_scan_budget_us, 0,
+    "nested: B1, oltre questi us dall'inizio dell'INVEPT niente retry");
+VEPT_CTR(vept_scan_first_pass_ok, "B1: validazione riuscita al primo tentativo");
+VEPT_CTR(vept_scan_retry_1_success, "B1: validazione riuscita al 1o retry");
+VEPT_CTR(vept_scan_retry_2_success, "B1: validazione riuscita al 2o retry");
+VEPT_CTR(vept_scan_retry_exhausted, "B1: svuotamento per corsa dopo i retry");
+VEPT_CTR(vept_scan_retry_nonrace_fallback,
+    "B1: svuotamento per altro motivo durante un retry");
+VEPT_CTR(vept_scan_retry_budget_fallback,
+    "B1: svuotamento per budget di tempo esaurito");
+VEPT_CTR(vept_scan_retries_done, "B1: retry eseguiti");
+VEPT_CTR(vept_scan_bytes_read, "B1: byte di EPT12 letti dalle due passate");
+static u_long vept_scan_max_ns;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_scan_max_ns, CTLFLAG_RW,
+    &vept_scan_max_ns, 0, "B1: durata massima di un INVEPT (ns, 0 per azzerare)");
+
+static void
+vept_scan_note_ns(sbintime_t t0)
+{
+	u_long ns = (u_long)sbttons(sbinuptime() - t0);
+
+	if (ns > vept_scan_max_ns)
+		vept_scan_max_ns = ns;		/* indicativo: senza CAS */
+}
+
+/*
+ * Prova deterministica della corsa (parere #29 §7), SOLO per i test:
+ * hw.vmm.vmx.vept_test_race = 1 una volta, 2 a ogni tentativo. Fra la prima
+ * e la seconda passata L0 fa cio' che farebbe un altro LP dell'L1: inverte
+ * il bit W di una voce EPT12 di livello 0 invariata, scrivibile e con una
+ * foglia shadow viva. La seconda passata deve vedere la corsa; il retry deve
+ * incorporare la modifica (foglia invalidata, le altre conservate).
+ */
+static int vept_test_race = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_test_race, CTLFLAG_RW,
+    &vept_test_race, 0,
+    "nested: SOLO PROVE, scrittura EPT12 fra le passate (1 una volta, 2 sempre)");
+VEPT_CTR(vept_test_race_injected, "B1: scritture iniettate fra le passate");
+
+static bool
+vept_leaf_present(uint64_t *tbl, uint64_t l2gpa)
+{
+	int level;
+
+	for (level = 3; level > 0; level--) {
+		if ((tbl[EPT_IDX(l2gpa, level)] & EPT_RWX) == 0)
+			return (false);
+		tbl = (uint64_t *)PHYS_TO_DMAP(EPT_ADDR(
+		    tbl[EPT_IDX(l2gpa, level)]));
+	}
+	return ((tbl[EPT_IDX(l2gpa, 0)] & EPT_RWX) != 0);
+}
+
+static void
+vept_test_race_inject(struct vmx_vcpu *vcpu, struct vept_obs_ent *e, int j)
+{
+	uint64_t *page;
+	void *ck;
+
+	page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE,
+	    VM_PROT_READ | VM_PROT_WRITE, &ck);
+	if (page == NULL)
+		return;
+	if (atomic_load_64(&page[j]) & EPT_PG_WRITE)
+		atomic_clear_64(&page[j], EPT_PG_WRITE);
+	else
+		atomic_set_64(&page[j], EPT_PG_WRITE);
+	vm_gpa_release(ck);
+	atomic_add_long(&vept_test_race_injected, 1);
+	if (vept_test_race == 1)
+		vept_test_race = 0;
+}
+
+/*
  * B1: INVEPT dell'L1 che colpisce la radice dello slot i. Ritorna true se la
  * radice e' stata conservata, false se svuotata.
  *  1. prima passata: per ogni tabella tracciata, le voci diverse dalla
@@ -884,8 +970,9 @@ static void vept_root_wipe(struct vmx_nested *n, int i);
  *     tabella) e va nella lista dei cambi, col valore letto;
  *  2. seconda passata: si rileggono TUTTE le tabelle tracciate, anche quelle
  *     trovate invariate, e devono valere fotografia + cambi; se no un altro
- *     LP dell'L1 sta scrivendo mentre si legge e si svuota tutto (parere #28
- *     §3: rilevatore conservativo, non una prova di atomicita');
+ *     LP dell'L1 sta scrivendo mentre si legge (parere #28 §3: rilevatore
+ *     conservativo, non una prova di atomicita'): si rifanno 1 e 2 fino a
+ *     vept_scan_retries volte, poi si svuota tutto;
  *  3. intervalli ordinati e uniti, foglie shadow azzerate, INVEPT hw dovuto;
  *  4. solo allora, nelle fotografie, le sole voci cambiate.
  * Una scrittura dopo la seconda passata la vedra' il prossimo INVEPT, che
@@ -899,10 +986,11 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	struct vept_kslot *k = &n->vept_ks[i];
 	struct vept_obs *o = n->vept_obs[i];
 	struct vept_obs_ent *e;
-	uint64_t *page, span, expect, v, live = k->leaves, inval = 0;
+	uint64_t *page, span, expect, v, live = k->leaves, inval = 0, bytes = 0;
 	sbintime_t t0 = sbinuptime();
 	void *cookie;
 	int fb = 0, nr = 0, nc = 0, t, j, c, m, ntr = 0;
+	int attempt = 0, retries, inj_t, inj_j;
 
 	KASSERT(curthread->td_critnest == 0,
 	    ("%s: shadow modificata in sezione critica", __func__));
@@ -928,70 +1016,117 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	if (fb != 0)
 		goto full;
 
-	/* 1. voci cambiate */
-	for (t = 0; t < VEPT_OBS_HASH && fb == 0; t++) {
-		e = &o->ent[t];
-		e->chg_first = nc;
-		e->chg_n = 0;
-		if (e->gpa == 0)
-			continue;
-		page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE, VM_PROT_READ,
-		    &cookie);
-		if (page == NULL) {
-			fb |= VEPT_FB_UNREAD;
-			break;
-		}
-		span = 1ULL << (12 + 9 * (e->level & 3));
-		for (j = 0; j < 512; j++) {
-			v = atomic_load_64(&page[j]);
-			if (v == e->snap[j])
+	/*
+	 * 1 + 2, ripetute al massimo vept_scan_retries volte se la seconda
+	 * passata trova una corsa (parere #29 §2). Ogni tentativo riparte dalle
+	 * fotografie PERSISTENTI, che nessun tentativo modifica: snapshot A,
+	 * prima lettura B, seconda C -> il tentativo dopo trova A -> C, non
+	 * B -> C. Shadow e fotografie si toccano solo dopo una validazione
+	 * riuscita. Oltre il budget di tempo, svuotamento.
+	 */
+	retries = MIN(MAX(vept_scan_retries, 0), VEPT_MAX_SCAN_RETRIES);
+	for (attempt = 0;; attempt++) {
+		nc = 0;
+		inj_t = -1;
+		inj_j = 0;
+		/* 1. voci cambiate */
+		for (t = 0; t < VEPT_OBS_HASH && fb == 0; t++) {
+			e = &o->ent[t];
+			e->chg_first = nc;
+			e->chg_n = 0;
+			if (e->gpa == 0)
 				continue;
-			if (e->ambiguous)
-				fb |= VEPT_FB_AMBIG;
-			else if (e->level >= 3)
-				fb |= VEPT_FB_L3;
-			else if (nc >= VEPT_RNG_MAX)
-				fb |= VEPT_FB_NRNG;
-			if (fb != 0)
-				break;
-			o->chg[nc].val = v;
-			o->chg[nc].ent = t;
-			o->chg[nc].j = j;
-			o->rng[nc].start = e->base + (uint64_t)j * span;
-			o->rng[nc].end = o->rng[nc].start + span;
-			nc++;
-		}
-		vm_gpa_release(cookie);
-		e->chg_n = nc - e->chg_first;
-	}
-	if (fb != 0)
-		goto full;
-
-	/* 2. rilettura di tutte le tabelle */
-	for (t = 0; t < VEPT_OBS_HASH && fb == 0; t++) {
-		e = &o->ent[t];
-		if (e->gpa == 0)
-			continue;
-		page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE, VM_PROT_READ,
-		    &cookie);
-		if (page == NULL) {
-			fb |= VEPT_FB_UNREAD;
-			break;
-		}
-		c = e->chg_first;
-		m = c + e->chg_n;
-		for (j = 0; j < 512; j++) {
-			expect = (c < m && o->chg[c].j == (uint32_t)j) ?
-			    o->chg[c++].val : e->snap[j];
-			if (atomic_load_64(&page[j]) != expect) {
-				fb |= VEPT_FB_RACE;
+			page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE,
+			    VM_PROT_READ, &cookie);
+			if (page == NULL) {
+				fb |= VEPT_FB_UNREAD;
 				break;
 			}
+			bytes += PAGE_SIZE;
+			span = 1ULL << (12 + 9 * (e->level & 3));
+			for (j = 0; j < 512; j++) {
+				v = atomic_load_64(&page[j]);
+				if (v == e->snap[j]) {
+					if (vept_test_race != 0 && inj_t < 0 &&
+					    e->level == 0 && !e->ambiguous &&
+					    (v & EPT_PG_WRITE) != 0 &&
+					    vept_leaf_present(s->root, e->base +
+					    (uint64_t)j * PAGE_SIZE)) {
+						inj_t = t;
+						inj_j = j;
+					}
+					continue;
+				}
+				if (e->ambiguous)
+					fb |= VEPT_FB_AMBIG;
+				else if (e->level >= 3)
+					fb |= VEPT_FB_L3;
+				else if (nc >= VEPT_RNG_MAX)
+					fb |= VEPT_FB_NRNG;
+				if (fb != 0)
+					break;
+				o->chg[nc].val = v;
+				o->chg[nc].ent = t;
+				o->chg[nc].j = j;
+				o->rng[nc].start = e->base + (uint64_t)j * span;
+				o->rng[nc].end = o->rng[nc].start + span;
+				nc++;
+			}
+			vm_gpa_release(cookie);
+			e->chg_n = nc - e->chg_first;
 		}
-		vm_gpa_release(cookie);
+		if (fb != 0)
+			break;
+
+		/* prova del parere #29 §7: un "altro LP" scrive fra le passate */
+		if (inj_t >= 0)
+			vept_test_race_inject(vcpu, &o->ent[inj_t], inj_j);
+
+		/* 2. rilettura di tutte le tabelle */
+		for (t = 0; t < VEPT_OBS_HASH && fb == 0; t++) {
+			e = &o->ent[t];
+			if (e->gpa == 0)
+				continue;
+			page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE,
+			    VM_PROT_READ, &cookie);
+			if (page == NULL) {
+				fb |= VEPT_FB_UNREAD;
+				break;
+			}
+			bytes += PAGE_SIZE;
+			c = e->chg_first;
+			m = c + e->chg_n;
+			for (j = 0; j < 512; j++) {
+				expect = (c < m && o->chg[c].j == (uint32_t)j) ?
+				    o->chg[c++].val : e->snap[j];
+				if (atomic_load_64(&page[j]) != expect) {
+					fb |= VEPT_FB_RACE;
+					break;
+				}
+			}
+			vm_gpa_release(cookie);
+		}
+		if (fb != VEPT_FB_RACE || attempt >= retries)
+			break;
+		if (sbttons(sbinuptime() - t0) > (int64_t)vept_scan_budget_us *
+		    1000) {
+			atomic_add_long(&vept_scan_retry_budget_fallback, 1);
+			break;
+		}
+		atomic_add_long(&vept_scan_retries_done, 1);
+		fb = 0;			/* nuova transazione dalle fotografie */
 	}
-	if (fb != 0)
+	atomic_add_long(&vept_scan_bytes_read, bytes);
+	if (fb != 0) {
+		if (fb == VEPT_FB_RACE && attempt > 0)
+			atomic_add_long(&vept_scan_retry_exhausted, 1);
+		else if (attempt > 0)
+			atomic_add_long(&vept_scan_retry_nonrace_fallback, 1);
 		goto full;
+	}
+	atomic_add_long(attempt == 0 ? &vept_scan_first_pass_ok :
+	    attempt == 1 ? &vept_scan_retry_1_success :
+	    &vept_scan_retry_2_success, 1);
 
 	/* 3. intervalli uniti, foglie azzerate */
 	nr = nc;
@@ -1028,6 +1163,7 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	atomic_add_long(&vept_leaves_zapped_partial, inval);
 	SDT_PROBE6(vmm, vmx, nested, veptkeep, vcpu->vcpuid, s->eptp12, live,
 	    inval, (uint64_t)nr | (uint64_t)nc << 32, VEPT_KEEP_A5(0, ntr, t0));
+	vept_scan_note_ns(t0);
 	return (true);
 
 full:
@@ -1045,6 +1181,7 @@ full:
 	SDT_PROBE6(vmm, vmx, nested, veptkeep, vcpu->vcpuid, s->eptp12, live,
 	    live, (uint64_t)nr | (uint64_t)nc << 32, VEPT_KEEP_A5(fb, ntr, t0));
 	vept_root_wipe(n, i);
+	vept_scan_note_ns(t0);
 	return (false);
 }
 
