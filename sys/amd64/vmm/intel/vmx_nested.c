@@ -1786,6 +1786,7 @@ vmx_shvmcs_enter(struct vmx_vcpu *vcpu)
 		if (n->sh_inject_vmx) {
 			n->sh_inject_vmx = false;
 			err = EIO;
+			inj = 3;	/* il motivo porta 0x80 anche se armata prima */
 		}
 		for (i = 0; i < SHV_N && err == 0; i++) {
 			if ((n->sh_push & (1U << i)) == 0)
