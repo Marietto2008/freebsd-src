@@ -32,6 +32,7 @@
 #include <vm/vm.h>
 #include <vm/vm_extern.h>
 #include <vm/pmap.h>
+#include <machine/clock.h>	/* tsc_freq (parere #41 §6) */
 #include <machine/vmparam.h>
 #include <machine/vmm.h>
 #include <dev/vmm/vmm_mem.h>
@@ -1069,6 +1070,54 @@ VST_SYSCTL(VST_H_NULL, vst_h_null, "hold contati falliti (NULL)");
 VST_SYSCTL(VST_H_RELEASE, vst_h_release, "rilasci contati");
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vst_pk_peak, CTLFLAG_RD, &vept_st_pk_peak, 0,
     "B1: massimo di riferimenti tenuti fra le passate da un gestore");
+VST_SYSCTL(VST_T_EXIT_L1, vst_t_exit_l1, "vmx_run: cicli a interrupt disabilitati dopo un'uscita dall'L1");
+VST_SYSCTL(VST_T_EXIT_L1_N, vst_t_exit_l1_n, "vmx_run: uscite dall'L1 misurate");
+VST_SYSCTL(VST_T_EXIT_L2, vst_t_exit_l2, "vmx_run: cicli a interrupt disabilitati dopo un'uscita dall'L2");
+VST_SYSCTL(VST_T_EXIT_L2_N, vst_t_exit_l2_n, "vmx_run: uscite dall'L2 misurate");
+VST_SYSCTL(VST_T_ENT_L1, vst_t_ent_l1, "vmx_run: cicli a interrupt disabilitati prima di entrare in L1");
+VST_SYSCTL(VST_T_ENT_L1_N, vst_t_ent_l1_n, "vmx_run: ingressi in L1 misurati");
+VST_SYSCTL(VST_T_ENT_L2, vst_t_ent_l2, "vmx_run: cicli a interrupt disabilitati prima di entrare in L2");
+VST_SYSCTL(VST_T_ENT_L2_N, vst_t_ent_l2_n, "vmx_run: ingressi in L2 misurati");
+VST_SYSCTL(VST_T_EXIT_B0, vst_t_exit_b0, "tratto d'uscita < 1 us");
+VST_SYSCTL(VST_T_EXIT_B1, vst_t_exit_b1, "tratto d'uscita 1-5 us");
+VST_SYSCTL(VST_T_EXIT_B2, vst_t_exit_b2, "tratto d'uscita 5-20 us");
+VST_SYSCTL(VST_T_EXIT_B3, vst_t_exit_b3, "tratto d'uscita >= 20 us");
+VST_SYSCTL(VST_T_ENT_B0, vst_t_ent_b0, "tratto d'ingresso < 1 us");
+VST_SYSCTL(VST_T_ENT_B1, vst_t_ent_b1, "tratto d'ingresso 1-5 us");
+VST_SYSCTL(VST_T_ENT_B2, vst_t_ent_b2, "tratto d'ingresso 5-20 us");
+VST_SYSCTL(VST_T_ENT_B3, vst_t_ent_b3, "tratto d'ingresso >= 20 us");
+VST_SYSCTL(VST_T_RDTSC, vst_t_rdtsc, "cicli di due rdtsc di fila (campione 1/256)");
+VST_SYSCTL(VST_T_RDTSC_N, vst_t_rdtsc_n, "campioni di vst_t_rdtsc");
+static u_long vept_st_tmax[4];
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vst_tmax_exit_l1, CTLFLAG_RD, &vept_st_tmax[0], 0,
+    "vmx_run: massimo del tratto d'uscita dall'L1 (cicli)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vst_tmax_exit_l2, CTLFLAG_RD, &vept_st_tmax[1], 0,
+    "vmx_run: massimo del tratto d'uscita dall'L2 (cicli)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vst_tmax_ent_l1, CTLFLAG_RD, &vept_st_tmax[2], 0,
+    "vmx_run: massimo del tratto d'ingresso in L1 (cicli)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vst_tmax_ent_l2, CTLFLAG_RD, &vept_st_tmax[3], 0,
+    "vmx_run: massimo del tratto d'ingresso in L2 (cicli)");
+
+/*
+ * Parere #41 §6: un tratto di vmx_run a interrupt disabilitati, per vCPU (gira con
+ * gli interrupt spenti, sul vCPU stesso: niente atomiche). base = somma, base+1 =
+ * conteggio; bucket0 = prima delle quattro classi; imax = indice del massimo.
+ */
+static uint64_t vst_cicli_us;		/* cicli TSC per microsecondo, al primo uso */
+
+void
+vst_tratto(struct vmx_nested *n, int base, int bucket0, int imax, uint64_t c)
+{
+	uint64_t f = vst_cicli_us;
+
+	if (__predict_false(f == 0))
+		f = vst_cicli_us = MAX(tsc_freq / 1000000, 1);
+	n->st_vept[base] += c;
+	n->st_vept[base + 1]++;
+	n->st_vept[bucket0 + (c < f ? 0 : c < 5 * f ? 1 : c < 20 * f ? 2 : 3)]++;
+	if (c > n->st_tmax[imax])
+		n->st_tmax[imax] = c;
+}
 
 void
 vept_stats_flush(struct vmx_nested *n)
@@ -1085,6 +1134,11 @@ vept_stats_flush(struct vmx_nested *n)
 	while ((p = vept_st_pk_peak) < n->st_vept_pk_peak &&
 	    !atomic_cmpset_long(&vept_st_pk_peak, p, n->st_vept_pk_peak))
 		;
+	for (i = 0; i < 4; i++) {
+		while ((p = vept_st_tmax[i]) < n->st_tmax[i] &&
+		    !atomic_cmpset_long(&vept_st_tmax[i], p, n->st_tmax[i]))
+			;
+	}
 }
 
 /* Hold e rilascio CONTATI (i soli siti del parere #39): vedi il bilancio sopra. */

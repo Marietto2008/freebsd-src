@@ -143,8 +143,21 @@ enum {
 	VST_H_SCAN2_REUSE,	/* passata 2: riferimento della passata 1 riusato */
 	VST_H_NULL,		/* hold (contati) falliti */
 	VST_H_RELEASE,		/* rilasci (contati) */
+	/*
+	 * Parere #41 §6: tratti di vmx_run a interrupt disabilitati, in cicli TSC.
+	 * USCITA: dal TSC letto subito dopo vmx_enter_guest all'enable_intr()
+	 * successivo; INGRESSO: dal disable_intr() all'entry_tsc. L1/L2 = contesto
+	 * dell'uscita / dell'ingresso. Classi: <1, 1-5, 5-20, >=20 us.
+	 */
+	VST_T_EXIT_L1, VST_T_EXIT_L1_N, VST_T_EXIT_L2, VST_T_EXIT_L2_N,
+	VST_T_ENT_L1, VST_T_ENT_L1_N, VST_T_ENT_L2, VST_T_ENT_L2_N,
+	VST_T_EXIT_B0, VST_T_EXIT_B1, VST_T_EXIT_B2, VST_T_EXIT_B3,
+	VST_T_ENT_B0, VST_T_ENT_B1, VST_T_ENT_B2, VST_T_ENT_B3,
+	VST_T_RDTSC, VST_T_RDTSC_N,	/* costo di due rdtsc di fila, 1 uscita su 256 */
 	VST_N
 };
+void	vst_tratto(struct vmx_nested *n, int base, int bucket0, int imax,
+	    uint64_t cicli);
 void	vept_stats_flush(struct vmx_nested *n);	/* da nested_stats_flush */
 /* B1 */
 bool	vmx_vept_keep_enabled(void);		/* hw.vmm.vmx.vept_keep */
@@ -421,8 +434,9 @@ struct vmx_nested {
 	 * tabelle EPT12, per vCPU (stesso schema dei precedenti), versati nei
 	 * globali hw.vmm.vmx.vst_* da vept_stats_flush.
 	 */
-	uint64_t	st_vept[32];
+	uint64_t	st_vept[64];
 	uint64_t	st_vept_pk_peak;	/* massimo di riferimenti tenuti */
+	uint64_t	st_tmax[4];	/* parere #41 §6: massimi dei tratti, cicli */
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 

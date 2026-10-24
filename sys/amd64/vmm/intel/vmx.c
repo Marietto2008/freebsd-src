@@ -3467,6 +3467,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	int rc, handled, launched;
 	u_int vmrun_iters = 0;		/* anti-freeze del loop interno (nested) */
 	uint64_t entry_tsc = 0;
+	uint64_t cli_tsc = 0, exit_tsc0 = 0;	/* parere #41 §6 */
+	bool exit_l2 = false;
 	struct vmx *vmx;
 	struct vmx_vcpu *vcpu;
 	struct vmxctx *vmxctx;
@@ -3599,6 +3601,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * pmap_invalidate_ept().
 		 */
 		disable_intr();
+		if (vcpu->nested != NULL)
+			cli_tsc = rdtsc();	/* parere #41 §6: tratto d'ingresso */
 		/*
 		 * Nested: un interrupt dell'L1 che l'L1 intercetta (EXTINT
 		 * exiting nel VMCS12) NON va iniettato in L2 ma consegnato
@@ -3791,8 +3795,16 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
 		    vcpu->nested->vept_keep)
 			vmx_vept_enter_check(vcpu);	/* B1: deve restare 0 */
-		if (vcpu->nested != NULL)
+		if (vcpu->nested != NULL) {
 			entry_tsc = rdtsc();	/* parere #30: tempo in L1/L2 */
+			/* parere #41 §6: dal disable_intr() a qui */
+			if (vcpu->nested->in_l2)
+				vst_tratto(vcpu->nested, VST_T_ENT_L2, VST_T_ENT_B0, 3,
+				    entry_tsc - cli_tsc);
+			else
+				vst_tratto(vcpu->nested, VST_T_ENT_L1, VST_T_ENT_B0, 2,
+				    entry_tsc - cli_tsc);
+		}
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
 		/* nested: TSC al momento dell'uscita, per IA32_TSC nella lista
 		 * "store all'uscita" (SDM: valore all'uscita, non alla
@@ -3800,6 +3812,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		if (vcpu->nested != NULL) {
 			uint64_t now = rdtsc();
 
+			exit_tsc0 = now;	/* parere #41 §6: tratto d'uscita */
+			exit_l2 = vcpu->nested->in_l2;
 			if (vcpu->nested->in_l2) {
 				vcpu->nested->exit_tsc = now;
 				vcpu->nested->st_l2_entries++;
@@ -3860,6 +3874,26 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		if (rc == VMX_GUEST_VMEXIT) {
 			vmx_exit_handle_nmi(vcpu, vmexit);
 			enable_intr();
+			if (vcpu->nested != NULL) {
+				/* parere #41 §6: dall'uscita all'enable_intr() */
+				uint64_t sti = rdtsc();
+				struct vmx_nested *nn = vcpu->nested;
+
+				if (exit_l2)
+					vst_tratto(nn, VST_T_EXIT_L2, VST_T_EXIT_B0, 1,
+					    sti - exit_tsc0);
+				else
+					vst_tratto(nn, VST_T_EXIT_L1, VST_T_EXIT_B0, 0,
+					    sti - exit_tsc0);
+				/* costo di due rdtsc di fila, 1 uscita su 256 */
+				if ((nn->st_vept[VST_T_EXIT_L1_N] +
+				    nn->st_vept[VST_T_EXIT_L2_N]) % 256 == 0) {
+					uint64_t a = rdtsc(), b = rdtsc();
+
+					nn->st_vept[VST_T_RDTSC] += b - a;
+					nn->st_vept[VST_T_RDTSC_N]++;
+				}
+			}
 			handled = vmx_exit_process(vmx, vcpu, vmexit);
 		} else {
 			enable_intr();
