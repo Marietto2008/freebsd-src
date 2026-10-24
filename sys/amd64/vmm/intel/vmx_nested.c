@@ -18,7 +18,11 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
+#include <sys/lock.h>
+#include <sys/sched.h>
 #include <sys/sdt.h>
+#include <sys/smp.h>
+#include <sys/sx.h>
 #include <sys/sysctl.h>
 
 #include <machine/vmm.h>
@@ -62,6 +66,9 @@ static uint32_t	nested_msr_list_entry(struct vmx_vcpu *vcpu,
 		    struct vmcs12_cache *c);
 static void	nested_reflect_to_l1(struct vmx_vcpu *vcpu,
 		    struct vm_exit *vmexit);
+/* S0 (pareri #43/#44): definiti piu' sotto */
+static struct sx nested_field_tab_sx;
+static void	nested_field_tab_build(void);
 
 /*
  * Probe SDT del nested. Non si sparano ancora (lo faranno T1.7+); definirle
@@ -368,6 +375,7 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	if (vcpu->nested != NULL)
 		return (0);
 
+	nested_field_tab_build();	/* S0: una volta sola, qui si puo' dormire */
 	n = malloc(sizeof(*n), M_VMX_NESTED, M_WAITOK | M_ZERO);
 	n->current_vmcs12 = VMCS12_GPA_NONE;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
@@ -1190,7 +1198,7 @@ vmcs12_write_field(struct vmcs12_cache *c, uint32_t enc, uint64_t val)
  * 0x1ff invece di 0x17).
  */
 static bool
-nested_field_ok(struct vmx_vcpu *vcpu, uint32_t field)
+nested_field_ok_hw(struct vmx_vcpu *vcpu, uint32_t field)
 {
 	uint64_t tmp;
 
@@ -1198,6 +1206,193 @@ nested_field_ok(struct vmx_vcpu *vcpu, uint32_t field)
 		return (false);
 	return (vm_get_register(vcpu->vcpu, VMCS_IDENT(field), &tmp) == 0);
 }
+
+/*
+ * S0 (pareri #43 §9 e #44 §6): la stessa risposta di nested_field_ok_hw senza
+ * istruzioni VMX. Col vCPU FROZEN nessun VMCS e' caricato e vm_get_register fa
+ * VMPTRLD + VMREAD + VMCLEAR di un VMCS vero per ogni VMREAD/VMWRITE dell'L1
+ * (decine di migliaia al secondo con Hyper-V). Qui l'esito si calcola UNA volta,
+ * con un VMREAD per encoding (bit 14:0) su un VMCS di prova, e poi e' un test di
+ * bit. La semantica NON cambia: "campo valido" = "il VMREAD dell'hardware
+ * dell'L0 riesce", come prima. Le altre due classi sono solo informazione:
+ *  NFT_RO     tipo "informazioni d'uscita" (bit 11:10 = 1), sola lettura per
+ *             l'SDM; la VMWRITE dell'L1 resta permessa come prima (MISC bit 29);
+ *  NFT_NOFEAT esiste sull'hardware ma la funzione che lo usa NON e' esposta
+ *             all'L1 (vmx_nested_init_msrs: shadowing, VID/APICv, PML, VMFUNC,
+ *             #VE, XSAVES, ENCLS/ENCLV, sub-page, TSC scaling); oggi l'L1 puo'
+ *             leggerlo e scriverlo, e lo si conta soltanto.
+ * hw.vmm.vmx.nested_fast_field_validate: 0 = come prima (difetto), 1 = tabella,
+ * 2 = tabella E metodo di prima a ogni accesso, con le discrepanze contate (la
+ * risposta resta quella della tabella, la discrepanza non si nasconde).
+ */
+#define	NFT_HW		0x01
+#define	NFT_RO		0x02
+#define	NFT_NOFEAT	0x04
+static uint8_t nested_field_tab[0x8000];
+static int nested_field_tab_ok;		/* 1 = tabella costruita */
+static struct sx nested_field_tab_sx;
+SX_SYSINIT(nested_field_tab, &nested_field_tab_sx, "nested field tab");
+static int nested_fast_field_validate = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_fast_field_validate, CTLFLAG_RWTUN,
+    &nested_fast_field_validate, 0,
+    "nested S0: validazione dell'encoding di VMREAD/VMWRITE dell'L1: 0 = "
+    "VMPTRLD/VMREAD/VMCLEAR (come prima), 1 = tabella, 2 = tabella + confronto");
+NESTED_CTR(nested_ffv_lookups, "nested S0: encoding validati con la tabella");
+NESTED_CTR(nested_ffv_nofeat,
+    "nested S0: accessi dell'L1 a campi di funzioni non esposte all'L1");
+NESTED_CTR(nested_ffv_mismatch,
+    "nested S0: tabella e metodo di prima in disaccordo (modalita' 2)");
+static u_long nested_ffv_first_mismatch = ~0UL;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_ffv_first_mismatch, CTLFLAG_RD,
+    &nested_ffv_first_mismatch, 0,
+    "nested S0: primo encoding in disaccordo (~0 = nessuno)");
+/* campi delle funzioni tolte all'L1 in vmx_nested_init_msrs (64 bit: anche HIGH) */
+static const uint16_t nested_nofeat_enc[] = {
+	0x0004,		/* EPTP index (#VE) */
+	0x0810,		/* guest interrupt status (virtual-interrupt delivery) */
+	0x0812,		/* PML index */
+	0x200e,		/* PML address */
+	0x2014,		/* APIC-access address (virtualize APIC accesses) */
+	0x2018,		/* VM-function controls */
+	0x201c, 0x201e, 0x2020, 0x2022,	/* EOI-exit bitmap (VID) */
+	0x2024,		/* EPTP list (VMFUNC) */
+	0x2026,		/* VMREAD bitmap (shadowing) */
+	0x2028,		/* VMWRITE bitmap (shadowing) */
+	0x202a,		/* #VE information address */
+	0x202c,		/* XSS-exiting bitmap (XSAVES/XRSTORS) */
+	0x202e,		/* ENCLS-exiting bitmap */
+	0x2030,		/* sub-page-permission table pointer */
+	0x2032,		/* TSC multiplier (TSC scaling) */
+	0x2036,		/* ENCLV-exiting bitmap */
+};
+
+/* Riempie t[] (0x8000 voci) sulla CPU corrente; 0 se il VMCS di prova va. */
+static int
+nested_field_tab_fill(uint8_t *t)
+{
+	struct vmcs *v;
+	uint64_t val;
+	uint32_t e;
+	u_int i;
+
+	v = malloc_aligned(sizeof(*v), PAGE_SIZE, M_VMX_NESTED,
+	    M_WAITOK | M_ZERO);
+	v->identifier = vmx_revision();
+	if (vmclear(v) != 0) {
+		free(v, M_VMX_NESTED);
+		return (EIO);
+	}
+	memset(t, 0, 0x8000);
+	VMPTRLD(v);			/* critical_enter */
+	for (e = 0; e < 0x8000; e++)
+		if (vmread(e, &val) == 0)
+			t[e] |= NFT_HW;
+	VMCLEAR(v);			/* critical_exit */
+	free(v, M_VMX_NESTED);
+	for (e = 0; e < 0x8000; e++)
+		if (((e >> 10) & 3) == 1)
+			t[e] |= NFT_RO;
+	for (i = 0; i < nitems(nested_nofeat_enc); i++) {
+		e = nested_nofeat_enc[i];
+		t[e] |= NFT_NOFEAT;
+		if (((e >> 13) & 3) == 1)	/* 64 bit: anche l'accesso HIGH */
+			t[e | 1] |= NFT_NOFEAT;
+	}
+	return (0);
+}
+
+/* Una volta, alla creazione del primo vCPU nested (si puo' dormire). */
+static void
+nested_field_tab_build(void)
+{
+	sx_xlock(&nested_field_tab_sx);
+	if (!nested_field_tab_ok && nested_field_tab_fill(nested_field_tab) == 0)
+		atomic_store_rel_int(&nested_field_tab_ok, 1);
+	sx_xunlock(&nested_field_tab_sx);
+}
+
+static bool
+nested_field_ok(struct vmx_vcpu *vcpu, uint32_t field)
+{
+	int mode = nested_fast_field_validate;
+	bool ok;
+
+	if (mode == 0 || atomic_load_acq_int(&nested_field_tab_ok) == 0)
+		return (nested_field_ok_hw(vcpu, field));
+	ok = (field & 0xffff8000) == 0 &&
+	    (nested_field_tab[field] & NFT_HW) != 0;
+	atomic_add_long(&nested_ffv_lookups, 1);
+	if (ok && (nested_field_tab[field] & NFT_NOFEAT) != 0)
+		atomic_add_long(&nested_ffv_nofeat, 1);
+	if (mode == 2 && ok != nested_field_ok_hw(vcpu, field)) {
+		atomic_add_long(&nested_ffv_mismatch, 1);
+		atomic_cmpset_long(&nested_ffv_first_mismatch, ~0UL, field);
+	}
+	return (ok);
+}
+
+/*
+ * Autotest di S0 (parere #44 §6): scrivendo 1, la tabella si ricostruisce su
+ * OGNI CPU e si confronta con quella in uso, encoding per encoding, per tutti
+ * i 65536 valori di 16 bit (sopra 0x7fff entrambi i metodi dicono "non
+ * valido" per il controllo dei bit 31:15). Esito: disaccordi totali (0 = ok) e
+ * le tre classi contate, in nested_ffv_selftest e nel messaggio del kernel.
+ */
+static u_long nested_ffv_selftest = ~0UL;
+static int
+nested_ffv_selftest_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	uint8_t *t;
+	u_long bad = 0, hw = 0, ro = 0, nf = 0;
+	int c, error, val = 0;
+	uint32_t e;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL || val != 1)
+		return (error);
+	nested_field_tab_build();
+	if (!nested_field_tab_ok)
+		return (EIO);
+	t = malloc(0x8000, M_VMX_NESTED, M_WAITOK);
+	CPU_FOREACH(c) {
+		thread_lock(curthread);
+		sched_bind(curthread, c);
+		thread_unlock(curthread);
+		if (nested_field_tab_fill(t) != 0) {
+			bad++;
+			continue;
+		}
+		for (e = 0; e < 0x10000; e++) {
+			bool a = (e & 0xffff8000) == 0 &&
+			    (nested_field_tab[e & 0x7fff] & NFT_HW) != 0;
+			bool b = e < 0x8000 && (t[e] & NFT_HW) != 0;
+			if (a != b || (e < 0x8000 && t[e] != nested_field_tab[e]))
+				bad++;
+		}
+	}
+	thread_lock(curthread);
+	sched_unbind(curthread);
+	thread_unlock(curthread);
+	free(t, M_VMX_NESTED);
+	for (e = 0; e < 0x8000; e++) {
+		hw += (nested_field_tab[e] & NFT_HW) != 0;
+		ro += (nested_field_tab[e] & (NFT_HW | NFT_RO)) == (NFT_HW | NFT_RO);
+		nf += (nested_field_tab[e] & (NFT_HW | NFT_NOFEAT)) ==
+		    (NFT_HW | NFT_NOFEAT);
+	}
+	nested_ffv_selftest = bad;
+	printf("nested S0: autotest su %d CPU: %lu disaccordi; encoding validi %lu, "
+	    "di sola lettura %lu, di funzioni non esposte %lu\n", mp_ncpus, bad,
+	    hw, ro, nf);
+	return (0);
+}
+SYSCTL_PROC(_hw_vmm_vmx, OID_AUTO, nested_ffv_selftest_run,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    nested_ffv_selftest_sysctl, "I",
+    "nested S0: scrivere 1 per l'autotest della tabella su tutte le CPU");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_ffv_selftest, CTLFLAG_RD,
+    &nested_ffv_selftest, 0,
+    "nested S0: disaccordi dell'ultimo autotest (~0 = mai eseguito)");
 
 /* Larghezza del campo (bit 14:13): 0=16, 1=64, 2=32, 3=naturale. */
 #define	NESTED_FIELD_WIDTH(f)	(((f) >> 13) & 3)
