@@ -3626,9 +3626,14 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * del VMCS01. PRIMA del controllo di sospensione: un errore ferma la
 		 * VM (fail-closed) e il controllo qui sotto esce senza entrare.
 		 */
-		if (vcpu->nested != NULL && !vcpu->nested->in_l2 &&
-		    vcpu->nested->sh_on)
-			vmx_shvmcs_enter_l1(vcpu);
+		if (vcpu->nested != NULL && vcpu->nested->sh_on &&
+		    vmx_shvmcs_enter(vcpu)) {
+			/* errore dello shadow: nessun ingresso, ne' L1 ne' L2
+			 * (parere #45 §3); vm_suspend e' gia' stato chiamato */
+			enable_intr();
+			vm_exit_suspended(vcpu->vcpu, rip);
+			break;
+		}
 
 		/*
 		 * Check for vcpu suspension after injecting events because
@@ -3814,6 +3819,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 				vst_tratto(vcpu->nested, VST_T_ENT_L1, VST_T_ENT_B0, 2,
 				    entry_tsc - cli_tsc);
 		}
+		if (vcpu->nested != NULL && __predict_false(vcpu->nested->sh_fault))
+			atomic_add_long(&nested_sh_entry_after_fault, 1);
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
 		/* nested: TSC al momento dell'uscita, per IA32_TSC nella lista
 		 * "store all'uscita" (SDM: valore all'uscita, non alla

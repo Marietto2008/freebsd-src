@@ -72,7 +72,7 @@ static int	nested_fast_field_validate;
 static int	nested_shadow_vmcs;
 static void	nested_field_tab_build(void);
 static int	shv_global_init(void);
-static void	shvmcs_pull(struct vmx_vcpu *vcpu);
+static int	shvmcs_pull(struct vmx_vcpu *vcpu);
 static void	shvmcs_set_current(struct vmx_nested *n, struct vmcs12_cache *c);
 static void	shvmcs_mark(struct vmx_nested *n, struct vmcs12_cache *c,
 		    uint32_t enc);
@@ -1506,6 +1506,21 @@ NESTED_CTR(nested_sh_verify, "nested shadow: confronti della modalita' di verifi
 NESTED_CTR(nested_sh_ar_norm,
     "nested shadow: AR di CS/SS normalizzati dall'hardware (solo bit riservati)");
 NESTED_CTR(nested_sh_faults, "nested shadow: errori (VM fermata)");
+/*
+ * Iniezione d'errore a un colpo per la prova del fail-closed (parere #45 §3):
+ * 1 = discrepanza su un RW alla prossima copia di ritorno, 2 = copia verso lo
+ * shadow di un RW non recuperato, 3 = errore VMX alla prossima copia verso lo
+ * shadow. Il motivo registrato porta il bit 0x80 (iniettato).
+ */
+static int nested_shadow_inject = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_shadow_inject, CTLFLAG_RW,
+    &nested_shadow_inject, 0,
+    "nested shadow: errore simulato a un colpo (1 RW, 2 sovrascrittura, 3 VMX)");
+u_long nested_sh_entry_after_fault;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_sh_entry_after_fault, CTLFLAG_RD,
+    &nested_sh_entry_after_fault, 0,
+    "nested shadow: ingressi avvenuti dopo un errore registrato (deve essere 0)");
+NESTED_CTR(nested_sh_blocked, "nested shadow: ingressi impediti da un errore");
 static u_long nested_sh_first_fault = 0;
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_sh_first_fault, CTLFLAG_RD,
     &nested_sh_first_fault, 0,
@@ -1539,6 +1554,7 @@ static uint8_t *shv_rbm, *shv_wbm;	/* bitmap VMREAD/VMWRITE: 1 = esce */
 #define	SHF_GUARD	2	/* L0 ha toccato un RW nel VMCS12 mentre era dello shadow */
 #define	SHF_CLOBBER	3	/* copia verso lo shadow di un RW non recuperato */
 #define	SHF_VERIFY	4	/* rilettura dello shadow diversa dal VMCS12 */
+#define	SHF_INJECTED	0x80	/* errore simulato (nested_shadow_inject) */
 
 static int
 shv_idx(uint32_t enc)
@@ -1618,7 +1634,7 @@ shv_guard(struct vmcs12_cache *c, uint32_t enc)
  * (vmx_run fa VMCLEAR del VMCS01 e dello shadow prima di tornare), su qualunque
  * CPU. Da chiamare all'inizio di ogni gestore che consuma il VMCS12.
  */
-static void
+static int
 shvmcs_pull(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
@@ -1627,8 +1643,17 @@ shvmcs_pull(struct vmx_vcpu *vcpu)
 	int err = 0;
 	u_int i;
 
-	if (!n->sh_on || !n->sh_live || c == NULL || !c->sh_rw_owned)
-		return;
+	if (!n->sh_on)
+		return (0);
+	if (n->sh_fault)
+		return (EIO);
+	if (!n->sh_live || c == NULL || !c->sh_rw_owned)
+		return (0);
+	if (nested_shadow_inject == 1 &&
+	    atomic_cmpset_int(&nested_shadow_inject, 1, 0)) {
+		shv_fault(vcpu, SHF_VERIFY | SHF_INJECTED, VMCS_GUEST_RIP);
+		return (EIO);
+	}
 	t0 = rdtsc();
 	critical_enter();
 	err = vmptrld(n->sh_vmcs);
@@ -1639,7 +1664,7 @@ shvmcs_pull(struct vmx_vcpu *vcpu)
 	critical_exit();
 	if (err != 0) {
 		shv_fault(vcpu, SHF_VMX, 0);
-		return;
+		return (EIO);
 	}
 	c->sh_rw_owned = false;
 	for (i = 0; i < SHV_N; i++) {
@@ -1654,12 +1679,15 @@ shvmcs_pull(struct vmx_vcpu *vcpu)
 		} else if (nested_shadow_verify && (n->sh_push & (1U << i)) == 0) {
 			/* RO non scritto da L0 dopo l'ultima copia: deve coincidere */
 			atomic_add_long(&nested_sh_verify, 1);
-			if (v[i] != old)
+			if (v[i] != old) {
 				shv_fault(vcpu, SHF_VERIFY, e);
+				return (EIO);
+			}
 		}
 	}
 	atomic_add_long(&nested_sh_pull, 1);
 	atomic_add_long(&nested_sh_pull_tsc, rdtsc() - t0);
+	return (0);
 }
 
 /* Il VMCS12 rispecchiato cambia (VMPTRLD) o sparisce (VMCLEAR, VMXOFF). */
@@ -1670,6 +1698,9 @@ shvmcs_set_current(struct vmx_nested *n, struct vmcs12_cache *c)
 		return;
 	KASSERT(n->sh_cache == NULL || !n->sh_cache->sh_rw_owned,
 	    ("shvmcs_set_current: RW non recuperati"));
+	/* una guardia scattata sullo slot che lascia lo shadow non va persa */
+	if (n->sh_cache != NULL && n->sh_cache->sh_guard_hit)
+		n->sh_fault = true;
 	n->sh_cache = c;
 	n->sh_live = c != NULL;
 	n->sh_push = c != NULL ? SHV_ALL : 0;	/* lo shadow e' tutto da riempire */
@@ -1700,31 +1731,62 @@ shvmcs_mark(struct vmx_nested *n, struct vmcs12_cache *c, uint32_t enc)
  * sempre i valori veri del VMCS01: bhyve riscrive i controlli secondari da
  * cap.proc_ctls2 in altri punti (x2APIC, capability).
  */
-void
-vmx_shvmcs_enter_l1(struct vmx_vcpu *vcpu)
+/*
+ * Pulizia dopo un errore nella copia verso lo shadow: lo shadow non deve
+ * restare attivo e il VMCS01 deve tornare corrente (errori ignorati: la VM si
+ * ferma comunque).
+ */
+static void
+shv_fault_cleanup(struct vmx_vcpu *vcpu)
+{
+	(void)vmclear(vcpu->nested->sh_vmcs);
+	(void)vmptrld(vcpu->vmcs01);
+}
+
+bool
+vmx_shvmcs_enter(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c = n->sh_cache;
 	uint64_t t0, link, want_link, proc2, rb;
 	bool want_ctl;
-	int err = 0;
+	int err = 0, inj;
 	u_int i, k = 0;
 
-	if (n->sh_fault) {
+	/* fail-closed sincrono (parere #45 §3): con un errore registrato non si
+	 * entra piu', ne' in L1 ne' in L2 */
+	if (n->sh_fault || (c != NULL && c->sh_guard_hit)) {
+		if (!n->sh_fault)
+			shv_fault(vcpu, SHF_GUARD, 0);
 		vm_suspend(vcpu->vmx->vm, VM_SUSPEND_POWEROFF);
-		return;
+		atomic_add_long(&nested_sh_blocked, 1);
+		return (true);
 	}
-	if (n->sh_live && c != NULL && c->sh_guard_hit) {
-		shv_fault(vcpu, SHF_GUARD, 0);
-		return;
+	if (n->in_l2)
+		return (false);		/* in L2 lo shadow non e' in uso */
+	inj = nested_shadow_inject;
+	if ((inj == 2 || inj == 3) &&
+	    atomic_cmpset_int(&nested_shadow_inject, inj, 0)) {
+		if (inj == 2) {
+			shv_fault(vcpu, SHF_CLOBBER | SHF_INJECTED, 0);
+			atomic_add_long(&nested_sh_blocked, 1);
+			return (true);
+		}
+		n->sh_push |= SHV_ALL & ~shv_rw_mask;	/* forza una copia... */
+		n->sh_inject_vmx = true;		/* ...che fallisce */
 	}
 	if (n->sh_live && c != NULL && n->sh_push != 0) {
 		if (c->sh_rw_owned && (n->sh_push & shv_rw_mask) != 0) {
 			shv_fault(vcpu, SHF_CLOBBER, 0);	/* parere #44 §3 */
-			return;
+			atomic_add_long(&nested_sh_blocked, 1);
+			return (true);
 		}
 		t0 = rdtsc();
 		err = vmptrld(n->sh_vmcs);
+		if (n->sh_inject_vmx) {
+			n->sh_inject_vmx = false;
+			err = EIO;
+		}
 		for (i = 0; i < SHV_N && err == 0; i++) {
 			if ((n->sh_push & (1U << i)) == 0)
 				continue;
@@ -1740,26 +1802,28 @@ vmx_shvmcs_enter_l1(struct vmx_vcpu *vcpu)
 				if (err == 0 && rb != want) {
 					/* AR: l'hardware puo' scartare i bit
 					 * riservati (parere #44 §2.1) */
-					if (i == 3 || i == 4) {
-						if (((rb ^ want) & ~0xfffe0f00ULL) == 0) {
-							atomic_add_long(
-							    &nested_sh_ar_norm, 1);
-							continue;
-						}
+					if ((i == 3 || i == 4) &&
+					    ((rb ^ want) & ~0xfffe0f00ULL) == 0) {
+						atomic_add_long(&nested_sh_ar_norm, 1);
+						continue;
 					}
-					(void)vmclear(n->sh_vmcs);
-					(void)vmptrld(vcpu->vmcs01);
+					shv_fault_cleanup(vcpu);
 					shv_fault(vcpu, SHF_VERIFY,
 					    shv_fields[i].enc);
-					return;
+					atomic_add_long(&nested_sh_blocked, 1);
+					return (true);
 				}
 			}
 		}
-		err |= vmclear(n->sh_vmcs);
-		err |= vmptrld(vcpu->vmcs01);	/* torna corrente; resta launched */
+		if (err == 0)
+			err = vmclear(n->sh_vmcs);
+		if (err == 0)
+			err = vmptrld(vcpu->vmcs01);	/* torna corrente; resta launched */
 		if (err != 0) {
-			shv_fault(vcpu, SHF_VMX, 0);
-			return;
+			shv_fault_cleanup(vcpu);
+			shv_fault(vcpu, SHF_VMX | (inj == 3 ? SHF_INJECTED : 0), 0);
+			atomic_add_long(&nested_sh_blocked, 1);
+			return (true);
 		}
 		n->sh_push = 0;
 		atomic_add_long(&nested_sh_push, 1);
@@ -1788,6 +1852,7 @@ vmx_shvmcs_enter_l1(struct vmx_vcpu *vcpu)
 		n->sh_active = true;	/* VMCLEAR a fine vmx_run (parere #44 §5) */
 		c->sh_rw_owned = true;	/* da qui i RW sono dello shadow */
 	}
+	return (false);
 }
 
 /*
@@ -1800,6 +1865,11 @@ vmx_shvmcs_run_end(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 
+	if (n->sh_fault && n->sh_vmcs != NULL) {
+		(void)vmclear(n->sh_vmcs);	/* dopo un errore: mai attivo */
+		n->sh_active = false;
+		return;
+	}
 	if (!n->sh_active)
 		return;
 	n->sh_active = false;
@@ -4155,8 +4225,10 @@ vmx_nested_exit(void *vcpui)
 	case EXIT_REASON_VMPTRLD:
 	case EXIT_REASON_VMLAUNCH:
 	case EXIT_REASON_VMRESUME:
-		if (vcpu->nested != NULL)
-			shvmcs_pull(vcpu);
+		/* errore: niente gestore, la VM e' gia' sospesa; il prossimo
+		 * vmx_run non entra (vmx_shvmcs_enter) */
+		if (vcpu->nested != NULL && shvmcs_pull(vcpu) != 0)
+			return (0);
 		break;
 	default:
 		break;

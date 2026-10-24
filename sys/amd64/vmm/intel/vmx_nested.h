@@ -98,9 +98,16 @@ extern uint64_t cr0_ones_mask, cr0_zeros_mask, cr4_ones_mask, cr4_zeros_mask;
 int	nested_compose_vmcs02(struct vmx_vcpu *vcpu);
 int	nested_vmcs02_check(struct vmx_vcpu *vcpu);
 bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
-/* shadow VMCS (pareri #43/#44), da vmx_run: interrupt spenti, VMCS01 corrente */
-void	vmx_shvmcs_enter_l1(struct vmx_vcpu *vcpu);
+/*
+ * Shadow VMCS (pareri #43-#45), da vmx_run con interrupt spenti e il VMCS del
+ * prossimo ingresso corrente. vmx_shvmcs_enter: true = errore, NON entrare
+ * (fail-closed sincrono, parere #45 §3); il chiamante esce da vmx_run come
+ * per una sospensione. nested_sh_entry_after_fault conta gli ingressi
+ * avvenuti con un errore gia' registrato: deve restare 0.
+ */
+bool	vmx_shvmcs_enter(struct vmx_vcpu *vcpu);
 void	vmx_shvmcs_run_end(struct vmx_vcpu *vcpu);
+extern u_long nested_sh_entry_after_fault;
 /* esiti di vmx_vept_fault */
 #define	VEPT_OK		0	/* shadow installata */
 #define	VEPT_VIOL	1	/* EPT violation da riflettere all'L1 */
@@ -325,6 +332,7 @@ struct vmx_nested {
 	bool		sh_live;	/* lo shadow rispecchia sh_cache */
 	bool		sh_active;	/* referenziato da un ingresso in questo vmx_run */
 	bool		sh_fault;	/* errore: la VM si ferma (fail-closed) */
+	bool		sh_inject_vmx;	/* prova: la prossima copia fallisce */
 	uint32_t	sh_push;	/* maschera dei campi da ricopiare */
 	struct vmcs	*sh_vmcs;	/* pagina dello shadow VMCS */
 	struct vmcs12_cache *sh_cache;	/* slot rispecchiato */
