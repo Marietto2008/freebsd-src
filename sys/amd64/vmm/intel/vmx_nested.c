@@ -68,6 +68,7 @@ static void	nested_reflect_to_l1(struct vmx_vcpu *vcpu,
 		    struct vm_exit *vmexit);
 /* S0 (pareri #43/#44): definiti piu' sotto */
 static struct sx nested_field_tab_sx;
+static int	nested_fast_field_validate;
 static void	nested_field_tab_build(void);
 
 /*
@@ -375,7 +376,9 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	if (vcpu->nested != NULL)
 		return (0);
 
-	nested_field_tab_build();	/* S0: una volta sola, qui si puo' dormire */
+	/* S0: la tabella solo se serve (parere #45 §4), qui si puo' dormire */
+	if (nested_fast_field_validate != 0)
+		nested_field_tab_build();
 	n = malloc(sizeof(*n), M_VMX_NESTED, M_WAITOK | M_ZERO);
 	n->current_vmcs12 = VMCS12_GPA_NONE;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
@@ -1317,7 +1320,17 @@ nested_field_ok(struct vmx_vcpu *vcpu, uint32_t field)
 	int mode = nested_fast_field_validate;
 	bool ok;
 
-	if (mode == 0 || atomic_load_acq_int(&nested_field_tab_ok) == 0)
+	if (mode == 0)
+		return (nested_field_ok_hw(vcpu, field));
+	/*
+	 * Acceso dopo la creazione del vCPU: la tabella si costruisce qui, la
+	 * prima volta (percorso lento, fuori dalla sezione critica: si puo'
+	 * dormire, VMX e' acceso). NON nel gestore del sysctl: col tunable al
+	 * caricamento del modulo VMX non e' ancora acceso.
+	 */
+	if (atomic_load_acq_int(&nested_field_tab_ok) == 0)
+		nested_field_tab_build();
+	if (atomic_load_acq_int(&nested_field_tab_ok) == 0)
 		return (nested_field_ok_hw(vcpu, field));
 	ok = (field & 0xffff8000) == 0 &&
 	    (nested_field_tab[field] & NFT_HW) != 0;
