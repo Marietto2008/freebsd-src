@@ -113,6 +113,39 @@ int	vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp,
 	    int *kept);
 void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
+/*
+ * Parere #39: indici di vmx_nested.st_vept[] (contatori per vCPU del percorso
+ * EPT02 e degli hold EPT12). Gli hold "sito" sono le sole chiamate contate: i
+ * rilasci contati devono pareggiare gli hold riusciti degli stessi siti.
+ */
+enum {
+	VST_FAULT = 0,		/* vmx_vept_fault chiamate */
+	VST_F_RAM,		/* foglia RAM installata */
+	VST_F_MMIO,		/* foglia MMIO (BAR) installata */
+	VST_F_VIOL_MISSING,	/* EPT12 non mappa: riflessa */
+	VST_F_VIOL_PERM,	/* EPT12 mappa ma nega l'accesso: riflessa */
+	VST_F_MISCONF,		/* EPT12 malformata: riflessa */
+	VST_F_EMUL,		/* MMIO dell'L1: emulazione */
+	VST_F_UNREAD,		/* tabella EPT12 illeggibile */
+	VST_F_REINSTALL,	/* foglia gia' presente riscritta */
+	VST_WALK,		/* ept12_translate chiamate (fault + emulazione) */
+	VST_WALK_D1,		/* walk fermati dopo 1 livello */
+	VST_WALK_D2,
+	VST_WALK_D3,
+	VST_WALK_D4,		/* walk fino al livello 0 (foglia 4K) */
+	VST_H_WALK3,		/* hold del walk per livello (3 = PML4) */
+	VST_H_WALK2,
+	VST_H_WALK1,
+	VST_H_WALK0,
+	VST_H_L1PAGE,		/* hold della pagina dell'L1-GPA nel fault */
+	VST_H_SCAN1,		/* hold della passata 1 di B1 */
+	VST_H_SCAN2,		/* hold della passata 2 di B1 */
+	VST_H_SCAN2_REUSE,	/* passata 2: riferimento della passata 1 riusato */
+	VST_H_NULL,		/* hold (contati) falliti */
+	VST_H_RELEASE,		/* rilasci (contati) */
+	VST_N
+};
+void	vept_stats_flush(struct vmx_nested *n);	/* da nested_stats_flush */
 /* B1 */
 bool	vmx_vept_keep_enabled(void);		/* hw.vmm.vmx.vept_keep */
 void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
@@ -383,6 +416,13 @@ struct vmx_nested {
 	uint64_t	st_l2_entries;
 	uint64_t	st_l2_tsc;
 	uint64_t	st_l1_tsc;
+	/*
+	 * Parere #39 §5/§6.2/§7: contatori del percorso EPT02 e degli hold delle
+	 * tabelle EPT12, per vCPU (stesso schema dei precedenti), versati nei
+	 * globali hw.vmm.vmx.vst_* da vept_stats_flush.
+	 */
+	uint64_t	st_vept[32];
+	uint64_t	st_vept_pk_peak;	/* massimo di riferimenti tenuti */
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 

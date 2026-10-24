@@ -355,6 +355,12 @@ struct vept_rng {
 };
 #define	VEPT_RNG_MAX	8192
 
+/* parere #39 §4: riferimento alla pagina di una tabella, dalla passata 1 alla 2 */
+struct vept_pk {
+	uint64_t	*page;
+	void		*cookie;
+};
+
 struct vept_obs {
 	struct vept_obs_ent ent[VEPT_OBS_HASH];
 	int		n;		/* tabelle tracciate */
@@ -368,6 +374,8 @@ struct vept_obs {
 	struct vmx_nested *nested;	/* B1: proprietario e slot della radice */
 	int		slot;
 	struct vept_chg	*chg;		/* B1: VEPT_RNG_MAX voci cambiate */
+	struct vept_pk	*pk;		/* parere #39: riferimenti fra le passate */
+	int		pk_live;	/* riferimenti tenuti ora */
 };
 
 static struct vept_obs *
@@ -428,6 +436,9 @@ vept_obs_free(struct vept_obs *o)
 	vept_diag_free(o->rng, VEPT_RNG_MAX * sizeof(struct vept_rng));
 	vept_diag_free(o->chg, VEPT_RNG_MAX * sizeof(struct vept_chg));
 	vept_diag_free(o->dist, VEPT_DIST_HASH * sizeof(struct vept_dent));
+	KASSERT(o->pk_live == 0, ("%s: %d riferimenti EPT12 ancora tenuti",
+	    __func__, o->pk_live));
+	vept_diag_free(o->pk, VEPT_OBS_HASH * sizeof(struct vept_pk));
 	vept_diag_free(o, sizeof(struct vept_obs));
 }
 
@@ -1018,6 +1029,117 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_test_race, CTLFLAG_RW,
     "nested: SOLO PROVE, scrittura EPT12 fra le passate (1 una volta, 2 sempre)");
 VEPT_CTR(vept_test_race_injected, "B1: scritture iniettate fra le passate");
 
+/*
+ * Parere #39 §5, §6.2, §7: contatori del percorso EPT02 (fault, walk EPT12) e
+ * degli hold delle tabelle EPT12, contati per vCPU in vmx_nested.st_vept[]
+ * (niente variabili condivise nel percorso caldo) e versati qui dallo slow path
+ * (nested_stats_flush). Bilancio: vst_h_release == somma degli hold contati -
+ * vst_h_null.
+ */
+CTASSERT(VST_N <= nitems(((struct vmx_nested *)0)->st_vept));
+static u_long vept_st_tot[VST_N];
+static u_long vept_st_pk_peak;
+#define	VST_SYSCTL(i, name, descr)					\
+	SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, name, CTLFLAG_RD,		\
+	    &vept_st_tot[i], 0, descr)
+VST_SYSCTL(VST_FAULT, vst_fault, "EPT02: fault arrivati a vmx_vept_fault");
+VST_SYSCTL(VST_F_RAM, vst_f_ram, "EPT02: foglie RAM installate");
+VST_SYSCTL(VST_F_MMIO, vst_f_mmio, "EPT02: foglie MMIO (BAR) installate");
+VST_SYSCTL(VST_F_VIOL_MISSING, vst_f_viol_missing, "EPT02: EPT12 non mappa (riflessa)");
+VST_SYSCTL(VST_F_VIOL_PERM, vst_f_viol_perm, "EPT02: EPT12 nega l'accesso (riflessa)");
+VST_SYSCTL(VST_F_MISCONF, vst_f_misconf, "EPT02: EPT12 malformata (riflessa)");
+VST_SYSCTL(VST_F_EMUL, vst_f_emul, "EPT02: MMIO dell'L1, emulazione");
+VST_SYSCTL(VST_F_UNREAD, vst_f_unread, "EPT02: tabella EPT12 illeggibile");
+VST_SYSCTL(VST_F_REINSTALL, vst_f_reinstall, "EPT02: foglia gia' presente riscritta");
+VST_SYSCTL(VST_WALK, vst_walk, "EPT12: walk (fault ed emulazione)");
+VST_SYSCTL(VST_WALK_D1, vst_walk_d1, "EPT12: walk fermati al 1o livello");
+VST_SYSCTL(VST_WALK_D2, vst_walk_d2, "EPT12: walk fermati al 2o livello");
+VST_SYSCTL(VST_WALK_D3, vst_walk_d3, "EPT12: walk fermati al 3o livello");
+VST_SYSCTL(VST_WALK_D4, vst_walk_d4, "EPT12: walk fino al 4o livello");
+VST_SYSCTL(VST_H_WALK3, vst_h_walk3, "hold EPT12 del walk, livello 3 (PML4)");
+VST_SYSCTL(VST_H_WALK2, vst_h_walk2, "hold EPT12 del walk, livello 2");
+VST_SYSCTL(VST_H_WALK1, vst_h_walk1, "hold EPT12 del walk, livello 1");
+VST_SYSCTL(VST_H_WALK0, vst_h_walk0, "hold EPT12 del walk, livello 0");
+VST_SYSCTL(VST_H_L1PAGE, vst_h_l1page, "hold della pagina dell'L1-GPA (fault)");
+VST_SYSCTL(VST_H_SCAN1, vst_h_scan1, "hold della passata 1 di B1");
+VST_SYSCTL(VST_H_SCAN2, vst_h_scan2, "hold della passata 2 di B1");
+VST_SYSCTL(VST_H_SCAN2_REUSE, vst_h_scan2_reuse,
+    "passata 2 di B1: riferimento della passata 1 riusato (hold evitati)");
+VST_SYSCTL(VST_H_NULL, vst_h_null, "hold contati falliti (NULL)");
+VST_SYSCTL(VST_H_RELEASE, vst_h_release, "rilasci contati");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vst_pk_peak, CTLFLAG_RD, &vept_st_pk_peak, 0,
+    "B1: massimo di riferimenti tenuti fra le passate da un gestore");
+
+void
+vept_stats_flush(struct vmx_nested *n)
+{
+	u_long p;
+	int i;
+
+	for (i = 0; i < VST_N; i++) {
+		if (n->st_vept[i] != 0) {
+			atomic_add_long(&vept_st_tot[i], n->st_vept[i]);
+			n->st_vept[i] = 0;
+		}
+	}
+	while ((p = vept_st_pk_peak) < n->st_vept_pk_peak &&
+	    !atomic_cmpset_long(&vept_st_pk_peak, p, n->st_vept_pk_peak))
+		;
+}
+
+/* Hold e rilascio CONTATI (i soli siti del parere #39): vedi il bilancio sopra. */
+static uint64_t *
+vept_hold(struct vmx_vcpu *vcpu, uint64_t gpa, void **cookie, int site)
+{
+	uint64_t *p;
+
+	p = vm_gpa_hold(vcpu->vcpu, gpa, PAGE_SIZE, VM_PROT_READ, cookie);
+	vcpu->nested->st_vept[site]++;
+	if (p == NULL)
+		vcpu->nested->st_vept[VST_H_NULL]++;
+	return (p);
+}
+
+static void
+vept_rel(struct vmx_vcpu *vcpu, void *cookie)
+{
+	vm_gpa_release(cookie);
+	vcpu->nested->st_vept[VST_H_RELEASE]++;
+}
+
+/*
+ * Parere #39 §4: con vept_scan_hold_keep=1 la passata 1 di B1 conserva il
+ * riferimento alla pagina di ogni tabella e la passata 2 lo riusa invece di
+ * rifare l'hold. Le passate restano DUE, complete e distinte, e la seconda
+ * RILEGGE le voci (atomic_load_64 sulla pagina): si risparmia solo l'hold. La
+ * pagina e' la stessa che darebbe un nuovo hold: il GPA della tabella (e->gpa)
+ * cambia solo nei walk dello stesso vCPU, che non girano durante il gestore, e
+ * il mapping GPA->HPA cambia solo con tutti i vCPU IDLE (generazione dei
+ * mapping). Tutti i riferimenti si rilasciano alla fine di OGNI tentativo,
+ * anche su corsa, budget o errore; un retry li riprende da capo. Se il buffer
+ * dei riferimenti non si alloca, il gestore lavora come con 0.
+ */
+static int vept_scan_hold_keep = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_scan_hold_keep, CTLFLAG_RWTUN,
+    &vept_scan_hold_keep, 0,
+    "nested: B1, la passata 2 riusa il riferimento della 1 (0 = no)");
+
+/* rilascia i riferimenti tenuti dalla passata 1 e non ancora consumati */
+static void
+vept_pk_release(struct vmx_vcpu *vcpu, struct vept_obs *o)
+{
+	int t;
+
+	for (t = 0; t < VEPT_OBS_HASH; t++) {
+		if (o->pk[t].cookie != NULL) {
+			vept_rel(vcpu, o->pk[t].cookie);
+			o->pk[t].cookie = NULL;
+			o->pk[t].page = NULL;
+		}
+	}
+	o->pk_live = 0;
+}
+
 static bool
 vept_leaf_present(uint64_t *tbl, uint64_t l2gpa)
 {
@@ -1081,6 +1203,7 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	void *cookie;
 	int fb = 0, nr = 0, nc = 0, t, j, c, m, ntr = 0;
 	int attempt = 0, retries, inj_t, inj_j;
+	bool keep_ref = false;		/* parere #39 §4 */
 
 	KASSERT(curthread->td_critnest == 0,
 	    ("%s: shadow modificata in sezione critica", __func__));
@@ -1115,6 +1238,13 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	 * riuscita. Oltre il budget di tempo, svuotamento.
 	 */
 	retries = MIN(MAX(vept_scan_retries, 0), VEPT_MAX_SCAN_RETRIES);
+	/* parere #39 §4: deciso una volta per gestore, uguale per ogni tentativo */
+	keep_ref = vept_scan_hold_keep != 0;
+	if (keep_ref && o->pk == NULL &&
+	    (o->pk = vept_diag_alloc(VEPT_OBS_HASH * sizeof(struct vept_pk))) == NULL)
+		keep_ref = false;
+	KASSERT(o->pk == NULL || o->pk_live == 0,
+	    ("%s: riferimenti EPT12 rimasti da un gestore precedente", __func__));
 	ts = sbinuptime();
 	for (attempt = 0;; attempt++) {
 		ta = sbinuptime();
@@ -1128,8 +1258,7 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 			e->chg_n = 0;
 			if (e->gpa == 0)
 				continue;
-			page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE,
-			    VM_PROT_READ, &cookie);
+			page = vept_hold(vcpu, e->gpa, &cookie, VST_H_SCAN1);
 			if (page == NULL) {
 				fb |= VEPT_FB_UNREAD;
 				break;
@@ -1164,23 +1293,40 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 				o->rng[nc].end = o->rng[nc].start + span;
 				nc++;
 			}
-			vm_gpa_release(cookie);
+			if (keep_ref) {
+				/* il riferimento passa alla passata 2 (o al rilascio) */
+				o->pk[t].page = page;
+				o->pk[t].cookie = cookie;
+				if (++o->pk_live > (int)n->st_vept_pk_peak)
+					n->st_vept_pk_peak = o->pk_live;
+			} else
+				vept_rel(vcpu, cookie);
 			e->chg_n = nc - e->chg_first;
 		}
-		if (fb != 0)
+		if (fb != 0) {
+			if (keep_ref)
+				vept_pk_release(vcpu, o);	/* niente passata 2 */
 			break;
+		}
 
 		/* prova del parere #29 §7: un "altro LP" scrive fra le passate */
 		if (inj_t >= 0)
 			vept_test_race_inject(vcpu, &o->ent[inj_t], inj_j);
 
-		/* 2. rilettura di tutte le tabelle */
+		/* 2. rilettura di tutte le tabelle (le voci si RILEGGONO sempre) */
 		for (t = 0; t < VEPT_OBS_HASH && fb == 0; t++) {
 			e = &o->ent[t];
 			if (e->gpa == 0)
 				continue;
-			page = vm_gpa_hold(vcpu->vcpu, e->gpa, PAGE_SIZE,
-			    VM_PROT_READ, &cookie);
+			if (keep_ref && o->pk[t].cookie != NULL) {
+				page = o->pk[t].page;
+				cookie = o->pk[t].cookie;
+				o->pk[t].page = NULL;
+				o->pk[t].cookie = NULL;
+				o->pk_live--;
+				n->st_vept[VST_H_SCAN2_REUSE]++;
+			} else
+				page = vept_hold(vcpu, e->gpa, &cookie, VST_H_SCAN2);
 			if (page == NULL) {
 				fb |= VEPT_FB_UNREAD;
 				break;
@@ -1196,8 +1342,12 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 					break;
 				}
 			}
-			vm_gpa_release(cookie);
+			vept_rel(vcpu, cookie);
 		}
+		/* fine del tentativo: i riferimenti non consumati (corsa a meta'
+		 * passata 2, tabella illeggibile) si rilasciano QUI, sempre */
+		if (keep_ref)
+			vept_pk_release(vcpu, o);
 		vept_time_note(attempt == 0 ? &vept_t_attempt0_ns :
 		    attempt == 1 ? &vept_t_attempt1_ns : &vept_t_attempt2_ns,
 		    NULL, ta);
@@ -1521,17 +1671,23 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 	tbl_gpa = EPT_ADDR(eptp12);
 	acc = EPT_RWX;
 	*perm = 0;
+	vcpu->nested->st_vept[VST_WALK]++;
 	for (level = 3; level >= 0; level--) {
 		idx = EPT_IDX(l2gpa, level);
-		page = vm_gpa_hold(vcpu->vcpu, tbl_gpa, PAGE_SIZE,
-		    VM_PROT_READ, &cookie);
+		page = vept_hold(vcpu, tbl_gpa, &cookie, VST_H_WALK3 + (3 - level));
 		if (page == NULL)
 			return (-1);
+		/* parere #39 §5: profondita' = tabelle lette, contata all'ultima */
+		if (level == 0)
+			vcpu->nested->st_vept[VST_WALK_D4]++;
 		/* una sola lettura: la memoria dell'L1 puo' cambiare sotto */
 		pte = atomic_load_64(&page[idx]);
 		vept_obs_note(obs, tbl_gpa, level, page, idx, pte, level >= 3 ?
 		    0 : l2gpa & ~((1ULL << (12 + 9 * (level + 1))) - 1));
-		vm_gpa_release(cookie);
+		vept_rel(vcpu, cookie);
+		if (level > 0 && ((pte & EPT_RWX) == 0 || (pte & 0x3) == 0x2 ||
+		    (pte & EPT_PG_PS) != 0))
+			vcpu->nested->st_vept[VST_WALK_D1 + (3 - level)]++;
 		if ((pte & EPT_RWX) == 0)
 			return (VEPT_VIOL);		/* non presente */
 		if ((pte & 0x3) == 0x2)
@@ -1573,7 +1729,8 @@ vept_install(struct vmx_nested *n, struct vept_kslot *k, uint64_t l2gpa,
 		k->leaves++;
 		if (vept_verify_hpa)
 			vept_vs_note(k, l2gpa);	/* candidati della verifica */
-	}
+	} else
+		n->st_vept[VST_F_REINSTALL]++;	/* parere #39 §5 */
 	tbl[idx] = (hpa & ~0xfffULL) | (perm & EPT_RWX) |
 	    EPT_PG_MEMORY_TYPE(mt) | EPT_PG_IGNORE_PAT;
 	return (0);
@@ -1614,6 +1771,7 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	 * si riparte in L2; VEPT_VIOL / VEPT_MISCONF da riflettere all'L1;
 	 * VEPT_MMIO l'L1 mappa l'L2 su un suo indirizzo che non e' RAM.
 	 */
+	n->st_vept[VST_FAULT]++;		/* parere #39 §5 */
 	if (c == NULL)
 		return (VEPT_VIOL);
 	eptp12 = vmcs12_read_field(c, VMCS_EPTP);
@@ -1648,10 +1806,14 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 			k->force_full = true;
 		}
 	}
-	if (r < 0)
+	if (r < 0) {
+		n->st_vept[VST_F_UNREAD]++;
 		return (VEPT_VIOL);		/* tabella dell'L1 illeggibile */
-	if (r != VEPT_OK)
+	}
+	if (r != VEPT_OK) {
+		n->st_vept[r == VEPT_MISCONF ? VST_F_MISCONF : VST_F_VIOL_MISSING]++;
 		return (r);
+	}
 	/*
 	 * Tipo d'accesso (qualificazione: bit 0 R, 1 W, 2 X, stessi bit dei
 	 * permessi EPT) contro i permessi dell'L1. Prima non si confrontava: si
@@ -1659,19 +1821,21 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	 * l'hardware rifaceva il fault e si girava a vuoto.
 	 */
 	access = qual & EPT_RWX;
-	if ((access & ~*perm) != 0)
+	if ((access & ~*perm) != 0) {
+		n->st_vept[VST_F_VIOL_PERM]++;
 		return (VEPT_VIOL);
+	}
 	/*
 	 * Pagina host dell'L1-GPA: vm_gpa_hold la porta in memoria se serve
 	 * (prima pmap_extract sull'EPT01 falliva per una pagina mai toccata
 	 * dall'L1). La memoria del guest e' wired: non si sposta dopo il
 	 * rilascio.
 	 */
-	p = vm_gpa_hold(vcpu->vcpu, *l1gpa & ~(uint64_t)PAGE_MASK, PAGE_SIZE,
-	    VM_PROT_READ, &ck);
+	p = vept_hold(vcpu, *l1gpa & ~(uint64_t)PAGE_MASK, &ck, VST_H_L1PAGE);
 	if (p != NULL) {
 		hpa = DMAP_TO_PHYS((vm_offset_t)p);
-		vm_gpa_release(ck);
+		vept_rel(vcpu, ck);
+		n->st_vept[VST_F_RAM]++;
 		/* B1: si conservano solo foglie di RAM wired (GPA -> HPA fisso
 		 * finche' il mapping esiste: generazione dei mapping) */
 		if (n->vept_keep && !vm_mem_wired(vcpu->vmx->vm,
@@ -1685,9 +1849,11 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	hpa = pmap_extract(vcpu->vmx->pmap, *l1gpa);
 	if (hpa != 0) {
 		k->nokeep = true;		/* B1: MMIO mai conservata */
+		n->st_vept[VST_F_MMIO]++;
 		vept_install(n, k, l2gpa, hpa, *perm, 0);	/* MMIO: UC */
 		return (VEPT_OK);
 	}
+	n->st_vept[VST_F_EMUL]++;
 	return (VEPT_MMIO);			/* dispositivo emulato dell'L1 */
 }
 

@@ -244,6 +244,7 @@ nested_stats_flush(struct vmx_vcpu *vcpu)
 	if (n->st_l1_tsc != 0)
 		atomic_add_long(&nested_l1_tsc, n->st_l1_tsc);
 	n->st_l2_entries = n->st_l2_tsc = n->st_l1_tsc = 0;
+	vept_stats_flush(n);
 }
 VMM_STAT_INTEL(VMX_NESTED_VMFAIL, "VMfailValid restituiti all'L1");
 VMM_STAT_INTEL(VMX_NESTED_VMFAIL_INVALID, "VMfailInvalid restituiti all'L1");
