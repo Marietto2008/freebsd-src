@@ -98,6 +98,9 @@ extern uint64_t cr0_ones_mask, cr0_zeros_mask, cr4_ones_mask, cr4_zeros_mask;
 int	nested_compose_vmcs02(struct vmx_vcpu *vcpu);
 int	nested_vmcs02_check(struct vmx_vcpu *vcpu);
 bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
+/* shadow VMCS (pareri #43/#44), da vmx_run: interrupt spenti, VMCS01 corrente */
+void	vmx_shvmcs_enter_l1(struct vmx_vcpu *vcpu);
+void	vmx_shvmcs_run_end(struct vmx_vcpu *vcpu);
 /* esiti di vmx_vept_fault */
 #define	VEPT_OK		0	/* shadow installata */
 #define	VEPT_VIOL	1	/* EPT violation da riflettere all'L1 */
@@ -257,6 +260,14 @@ struct vmcs12_cache {
 	 * (che fa critical_enter) e lette anche dal percorso veloce */
 	struct nested_msr_list ml_st, ml_ld, ml_en;
 	bool		ml_en_bad;	/* lista d'ingresso non mappabile */
+	/*
+	 * Shadow VMCS (pareri #43/#44): true finche' l'L1 puo' aver scritto in
+	 * hardware i campi RW dello shadow dopo l'ultima copia di ritorno. In
+	 * quello stato L0 non deve leggere ne' scrivere quei campi qui:
+	 * vmcs12_read_field/vmcs12_write_field lo controllano (fail-closed).
+	 */
+	bool		sh_rw_owned;
+	bool		sh_guard_hit;	/* la guardia e' scattata: si ferma la VM */
 };
 
 /*
@@ -300,6 +311,23 @@ struct vmx_nested {
 	uint64_t	vmx_msr[VMX_NESTED_NMSR];  /* MSR VMX 0x480..0x491 (T1.4) */
 	uint64_t	feature_control;	/* IA32_FEATURE_CONTROL (T1.4) */
 	char		*msr_bitmap;	/* pagina MSR bitmap fusa L0|L1 (T6.3) */
+	/*
+	 * Shadow VMCS hardware per le VMREAD/VMWRITE dell'L1 (pareri #43/#44),
+	 * invisibile all'L1. sh_on si fissa alla creazione del vCPU nested.
+	 * Proprieta' dei campi: RO (informazioni d'uscita, AR di CS/SS) sempre
+	 * del VMCS12, lo shadow ne e' una copia; RW (INTERRUPTIBILITY, RFLAGS,
+	 * RIP) dello shadow da quando l'L1 ci entra (cache->sh_rw_owned) fino
+	 * alla copia di ritorno. sh_push: campi che L0 ha cambiato nel VMCS12 e
+	 * che vanno ricopiati nello shadow prima del prossimo ingresso in L1
+	 * (MAI una copia completa sopra RW non recuperati).
+	 */
+	bool		sh_on;
+	bool		sh_live;	/* lo shadow rispecchia sh_cache */
+	bool		sh_active;	/* referenziato da un ingresso in questo vmx_run */
+	bool		sh_fault;	/* errore: la VM si ferma (fail-closed) */
+	uint32_t	sh_push;	/* maschera dei campi da ricopiare */
+	struct vmcs	*sh_vmcs;	/* pagina dello shadow VMCS */
+	struct vmcs12_cache *sh_cache;	/* slot rispecchiato */
 	int		evict_next;	/* prossimo slot da sfrattare (giro) */
 	/*
 	 * Immediate exit (parere #24 di Astra): VMX preemption timer a 0 nel

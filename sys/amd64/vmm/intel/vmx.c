@@ -3620,6 +3620,15 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		vmx_inject_interrupts(vcpu, vlapic, rip);
 		if (vcpu->nested != NULL && vcpu->nested->in_l2)
 			nested_preempt_refresh(vcpu);
+		/*
+		 * Shadow VMCS (pareri #43/#44): prima di entrare nell'L1, copia nello
+		 * shadow i campi marcati e allinea controllo, bitmap e link pointer
+		 * del VMCS01. PRIMA del controllo di sospensione: un errore ferma la
+		 * VM (fail-closed) e il controllo qui sotto esce senza entrare.
+		 */
+		if (vcpu->nested != NULL && !vcpu->nested->in_l2 &&
+		    vcpu->nested->sh_on)
+			vmx_shvmcs_enter_l1(vcpu);
 
 		/*
 		 * Check for vcpu suspension after injecting events because
@@ -3917,6 +3926,10 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	VMX_CTR1(vcpu, "returning from vmx_run: exitcode %d",
 	    vmexit->exitcode);
 
+	/* shadow VMCS: chiuso qui, sulla CPU dell'ultimo ingresso, prima che il
+	 * thread possa migrare (parere #44 §5; siamo ancora in sezione critica) */
+	if (vcpu->nested != NULL)
+		vmx_shvmcs_run_end(vcpu);
 	/* Il VMCS CORRENTE: col nested puo' non essere piu' quello caricato
 	 * all'inizio di vmx_run (riflessione L2 -> L1 lo cambia). */
 	VMCLEAR(vcpu->vmcs);

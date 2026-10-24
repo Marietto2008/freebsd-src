@@ -66,9 +66,15 @@ static uint32_t	nested_msr_list_entry(struct vmx_vcpu *vcpu,
 		    struct vmcs12_cache *c);
 static void	nested_reflect_to_l1(struct vmx_vcpu *vcpu,
 		    struct vm_exit *vmexit);
-/* S0 (pareri #43/#44): definiti piu' sotto */
+/* S0 e shadow VMCS (pareri #43/#44): definiti piu' sotto */
 static struct sx nested_field_tab_sx;
+static int	nested_shadow_vmcs;
 static void	nested_field_tab_build(void);
+static int	shv_global_init(void);
+static void	shvmcs_pull(struct vmx_vcpu *vcpu);
+static void	shvmcs_set_current(struct vmx_nested *n, struct vmcs12_cache *c);
+static void	shvmcs_mark(struct vmx_nested *n, struct vmcs12_cache *c,
+		    uint32_t enc);
 
 /*
  * Probe SDT del nested. Non si sparano ancora (lo faranno T1.7+); definirle
@@ -398,6 +404,36 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	    PINBASED_PREMPTION_TIMER) != 0;
 	/* B1: la modalita' della shadow EPT resta quella della creazione */
 	n->vept_keep = vmx_vept_keep_enabled();
+	/* shadow VMCS (pareri #43/#44): fissato qui, per la vita del vCPU */
+	if (nested_shadow_vmcs != 0) {
+		if (((rdmsr(MSR_VMX_PROCBASED_CTLS2) >> 32) &
+		    PROCBASED2_VMCS_SHADOWING) == 0 ||
+		    (rdmsr(IA32_VMX_MISC) & (1ULL << 29)) == 0) {
+			printf("nested shadow VMCS: l'hardware non ha VMCS "
+			    "shadowing o VMWRITE su ogni campo: resta spento\n");
+		} else {
+			int err;
+
+			sx_xlock(&nested_field_tab_sx);
+			shv_global_init();
+			sx_xunlock(&nested_field_tab_sx);
+			n->sh_vmcs = malloc_aligned(PAGE_SIZE, PAGE_SIZE,
+			    M_VMX_NESTED, M_WAITOK | M_ZERO);
+			n->sh_vmcs->identifier = vmx_revision() |
+			    VMX_VMCS_SHADOW_BIT;
+			critical_enter();
+			err = vmclear(n->sh_vmcs);	/* SDM 25.11.3 */
+			critical_exit();
+			if (err == 0)
+				n->sh_on = true;
+			else {
+				free(n->sh_vmcs, M_VMX_NESTED);
+				n->sh_vmcs = NULL;
+				printf("nested shadow VMCS: VMCLEAR iniziale "
+				    "fallito: resta spento\n");
+			}
+		}
+	}
 	vcpu->nested = n;
 	return (0);
 }
@@ -426,6 +462,9 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 		vpid_free(n->vpid2);
 	if (n->msr_bitmap != NULL)
 		free(n->msr_bitmap, M_VMX_NESTED);
+	/* lo shadow non e' attivo da nessuna parte: vmx_run lo chiude sempre */
+	if (n->sh_vmcs != NULL)
+		free(n->sh_vmcs, M_VMX_NESTED);
 	if (n->diag_simp_ck != NULL)
 		vm_gpa_release(n->diag_simp_ck);
 	free(n, M_VMX_NESTED);
@@ -908,6 +947,9 @@ vmcs12_slot_reset(struct vmcs12_cache *c, uint64_t gpa)
 	c->ml_en_bad = false;
 	c->host_dirty = true;
 	c->control_dirty = true;
+	/* shadow VMCS: si arriva qui solo da VMPTRLD dopo la copia di ritorno */
+	KASSERT(!c->sh_rw_owned, ("vmcs12_slot_reset: RW dello shadow non recuperati"));
+	c->sh_guard_hit = false;
 }
 
 /*
@@ -963,6 +1005,7 @@ nested_vmxoff(struct vmx_vcpu *vcpu)
 
 	n->vmxon = false;
 	n->current_vmcs12 = VMCS12_GPA_NONE;
+	shvmcs_set_current(n, NULL);	/* RW gia' recuperati in vmx_nested_exit */
 	/* i VMCS12 ancora nella cache vanno nella loro regione, col loro
 	 * launch state (VMXOFF non e' un VMCLEAR); se una regione non e'
 	 * scrivibile lo slot resta, unica copia */
@@ -1000,8 +1043,10 @@ nested_vmclear(struct vmx_vcpu *vcpu)
 		nested_vmx_result(vcpu, VMXERR_VMCLEAR_VMXON_POINTER);
 		goto done;
 	}
-	if (vmcs12 == n->current_vmcs12)
+	if (vmcs12 == n->current_vmcs12) {
 		n->current_vmcs12 = VMCS12_GPA_NONE;
+		shvmcs_set_current(n, NULL);	/* RW gia' recuperati */
+	}
 	/*
 	 * SDM 24.11.3: VMCLEAR scrive i dati del VMCS nella sua regione e ne
 	 * porta il launch state a clear, SENZA cancellarne i campi; un VMPTRLD
@@ -1118,6 +1163,7 @@ nested_vmptrld(struct vmx_vcpu *vcpu)
 		}
 	}
 	n->current_vmcs12 = vmcs12;
+	shvmcs_set_current(n, nested_current_cache(n));	/* tutto da copiare */
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
 	nested_advance_rip(vcpu);
@@ -1161,11 +1207,15 @@ nested_current_cache(struct vmx_nested *n)
 	return (NULL);
 }
 
+static void	shv_guard(struct vmcs12_cache *c, uint32_t enc);
+
 uint64_t
 vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc)
 {
 	int i;
 
+	if (__predict_false(c->sh_rw_owned))	/* shadow VMCS, parere #44 §3 */
+		shv_guard(c, enc);
 	for (i = 0; i < c->nfields; i++)
 		if (c->fields[i].enc == enc)
 			return (c->fields[i].val);
@@ -1177,6 +1227,8 @@ vmcs12_write_field(struct vmcs12_cache *c, uint32_t enc, uint64_t val)
 {
 	int i;
 
+	if (__predict_false(c->sh_rw_owned))	/* shadow VMCS, parere #44 §3 */
+		shv_guard(c, enc);
 	for (i = 0; i < c->nfields; i++)
 		if (c->fields[i].enc == enc) {
 			c->fields[i].val = val;
@@ -1394,6 +1446,355 @@ SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_ffv_selftest, CTLFLAG_RD,
     &nested_ffv_selftest, 0,
     "nested S0: disaccordi dell'ultimo autotest (~0 = mai eseguito)");
 
+/*
+ * ===== Shadow VMCS hardware (pareri #43 e #44 di Astra) =====
+ * Le VMREAD/VMWRITE dell'L1 sui campi qui sotto non escono piu': l'hardware le
+ * serve sullo shadow VMCS a cui punta il link pointer del VMCS01. Invisibile
+ * all'L1 (MSR VMX, CPUID, VMPTRLD dell'L1 invariati; VMCS02 senza shadowing).
+ * Il VMCS12 (cache + copia persistente) resta la rappresentazione canonica ai
+ * confini di sincronizzazione. Regole di proprieta' (parere #44 §3):
+ *  - campi RO (informazioni d'uscita, AR di CS/SS): la VMWRITE dell'L1 esce;
+ *    li scrive solo L0, nel VMCS12; lo shadow ne e' una copia, aggiornata
+ *    campo per campo (sh_push) prima del prossimo ingresso in L1;
+ *  - campi RW (INTERRUPTIBILITY, RFLAGS, RIP): da quando l'L1 entra con lo
+ *    shadow (cache->sh_rw_owned) il valore vero e' nello shadow; L0 lo
+ *    riprende (shvmcs_pull) all'inizio di ogni gestore che consuma il VMCS12
+ *    (VMPTRLD, VMCLEAR, VMLAUNCH/VMRESUME, VMXOFF) e solo dopo puo' leggerli o
+ *    scriverli; la riflessione L2->L1 avviene col vCPU fuori dall'L1, dopo la
+ *    copia di ritorno del VMRESUME;
+ *  - la copia verso lo shadow e' SOLO dei campi in sh_push, e se un RW e' in
+ *    sh_push mentre sh_rw_owned e' ancora vero e' un errore (il caso del
+ *    parere #44 §3): fail-closed.
+ * Fail-closed (parere #44 §7): ogni errore VMX o discrepanza registra campo e
+ * motivo, scrive sul log del kernel e ferma la VM (VM_SUSPEND_POWEROFF); niente
+ * ripiego automatico.
+ * hw.vmm.vmx.nested_shadow_vmcs (tunable): letto alla creazione del vCPU nested.
+ * hw.vmm.vmx.nested_shadow_verify: dopo ogni copia rilegge lo shadow e confronta.
+ */
+static int nested_shadow_vmcs = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_shadow_vmcs, CTLFLAG_RWTUN,
+    &nested_shadow_vmcs, 0,
+    "nested: shadow VMCS hardware per le VMREAD/VMWRITE dell'L1 (letto alla "
+    "creazione del vCPU nested; 0 = spento)");
+static int nested_shadow_verify = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_shadow_verify, CTLFLAG_RWTUN,
+    &nested_shadow_verify, 0,
+    "nested: shadow VMCS, rilettura e confronto dopo ogni copia (diagnostica)");
+NESTED_CTR(nested_sh_push, "nested shadow: copie VMCS12 -> shadow");
+NESTED_CTR(nested_sh_push_fields, "nested shadow: campi copiati verso lo shadow");
+NESTED_CTR(nested_sh_push_tsc, "nested shadow: cicli TSC delle copie verso lo shadow");
+NESTED_CTR(nested_sh_pull, "nested shadow: copie di ritorno shadow -> VMCS12");
+NESTED_CTR(nested_sh_pull_tsc, "nested shadow: cicli TSC delle copie di ritorno");
+NESTED_CTR(nested_sh_pull_changed,
+    "nested shadow: campi RW trovati cambiati dall'L1 alla copia di ritorno");
+NESTED_CTR(nested_sh_clear, "nested shadow: VMCLEAR dello shadow a fine vmx_run");
+NESTED_CTR(nested_sh_ctl, "nested shadow: riscritture di controllo/bitmap/link nel VMCS01");
+NESTED_CTR(nested_sh_verify, "nested shadow: confronti della modalita' di verifica");
+NESTED_CTR(nested_sh_ar_norm,
+    "nested shadow: AR di CS/SS normalizzati dall'hardware (solo bit riservati)");
+NESTED_CTR(nested_sh_faults, "nested shadow: errori (VM fermata)");
+static u_long nested_sh_first_fault = 0;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_sh_first_fault, CTLFLAG_RD,
+    &nested_sh_first_fault, 0,
+    "nested shadow: primo errore, (motivo << 32) | encoding");
+
+#define	SHV_RW		0x1
+static const struct { uint32_t enc; uint32_t fl; } shv_fields[] = {
+	{ VMCS_GUEST_INTERRUPTIBILITY, SHV_RW },
+	{ VMCS_GUEST_RFLAGS, SHV_RW },
+	{ VMCS_GUEST_RIP, SHV_RW },
+	{ VMCS_GUEST_CS_ACCESS_RIGHTS, 0 },	/* RO: parere #44 §2.1 */
+	{ VMCS_GUEST_SS_ACCESS_RIGHTS, 0 },
+	{ VMCS_EXIT_REASON, 0 },
+	{ VMCS_EXIT_QUALIFICATION, 0 },
+	{ VMCS_EXIT_INSTRUCTION_LENGTH, 0 },
+	{ VMCS_EXIT_INTR_INFO, 0 },
+	{ VMCS_EXIT_INTR_ERRCODE, 0 },
+	{ VMCS_IDT_VECTORING_INFO, 0 },
+	{ VMCS_IDT_VECTORING_ERROR, 0 },
+	{ VMCS_EXIT_INSTRUCTION_INFO, 0 },
+	{ VMCS_GUEST_LINEAR_ADDRESS, 0 },
+	{ VMCS_GUEST_PHYSICAL_ADDRESS, 0 },	/* 64 bit: anche HIGH nella bitmap */
+};
+#define	SHV_N		nitems(shv_fields)
+#define	SHV_ALL		((1U << SHV_N) - 1)
+CTASSERT(SHV_N <= 32);
+static uint32_t shv_rw_mask;		/* bit dei campi RW in shv_fields */
+static uint8_t *shv_rbm, *shv_wbm;	/* bitmap VMREAD/VMWRITE: 1 = esce */
+/* motivi di errore (alti 32 bit di nested_sh_first_fault) */
+#define	SHF_VMX		1	/* VMPTRLD/VMREAD/VMWRITE/VMCLEAR sullo shadow fallita */
+#define	SHF_GUARD	2	/* L0 ha toccato un RW nel VMCS12 mentre era dello shadow */
+#define	SHF_CLOBBER	3	/* copia verso lo shadow di un RW non recuperato */
+#define	SHF_VERIFY	4	/* rilettura dello shadow diversa dal VMCS12 */
+
+static int
+shv_idx(uint32_t enc)
+{
+	u_int i;
+
+	for (i = 0; i < SHV_N; i++)
+		if (shv_fields[i].enc == enc)
+			return (i);
+	return (-1);
+}
+
+/* Le bitmap si costruiscono una volta (sotto nested_field_tab_sx). */
+static int
+shv_global_init(void)
+{
+	uint32_t e;
+	u_int i;
+
+	sx_assert(&nested_field_tab_sx, SA_XLOCKED);
+	if (shv_rbm != NULL)
+		return (0);
+	shv_rbm = malloc_aligned(PAGE_SIZE, PAGE_SIZE, M_VMX_NESTED, M_WAITOK);
+	shv_wbm = malloc_aligned(PAGE_SIZE, PAGE_SIZE, M_VMX_NESTED, M_WAITOK);
+	memset(shv_rbm, 0xff, PAGE_SIZE);
+	memset(shv_wbm, 0xff, PAGE_SIZE);
+	for (i = 0; i < SHV_N; i++) {
+		e = shv_fields[i].enc;
+		shv_rbm[e >> 3] &= ~(1 << (e & 7));
+		if (((e >> 13) & 3) == 1)	/* 64 bit: anche l'accesso HIGH */
+			shv_rbm[(e | 1) >> 3] &= ~(1 << ((e | 1) & 7));
+		if (shv_fields[i].fl & SHV_RW) {
+			shv_wbm[e >> 3] &= ~(1 << (e & 7));
+			shv_rw_mask |= 1U << i;
+		}
+	}
+	return (0);
+}
+
+/* Fail-closed: registra, avvisa, ferma la VM. */
+static void
+shv_fault(struct vmx_vcpu *vcpu, int why, uint32_t enc)
+{
+	struct vmx_nested *n = vcpu->nested;
+
+	atomic_add_long(&nested_sh_faults, 1);
+	atomic_cmpset_long(&nested_sh_first_fault, 0,
+	    ((u_long)why << 32) | enc);
+	if (!n->sh_fault)
+		printf("nested shadow VMCS: vcpu%d errore %d sul campo %#x: "
+		    "VM fermata (parere #44 §7)\n", vcpu->vcpuid, why, enc);
+	n->sh_fault = true;
+	vm_suspend(vcpu->vmx->vm, VM_SUSPEND_POWEROFF);
+}
+
+/*
+ * Guardia di vmcs12_read_field/vmcs12_write_field: un RW dello slot rispecchiato
+ * toccato da L0 senza copia di ritorno. Lo slot non conosce il suo vCPU: si
+ * registra qui e lo shadow del vCPU si ferma al prossimo ingresso in L1.
+ */
+static void
+shv_guard(struct vmcs12_cache *c, uint32_t enc)
+{
+	int i = shv_idx(enc);
+
+	if (i < 0 || (shv_fields[i].fl & SHV_RW) == 0)
+		return;
+	atomic_add_long(&nested_sh_faults, 1);
+	atomic_cmpset_long(&nested_sh_first_fault, 0,
+	    ((u_long)SHF_GUARD << 32) | enc);
+	c->sh_rw_owned = false;		/* una volta sola; la VM si ferma */
+	c->sh_guard_hit = true;
+}
+
+/*
+ * shadow -> VMCS12 dei campi RW. Slow path: vCPU FROZEN, nessun VMCS corrente
+ * (vmx_run fa VMCLEAR del VMCS01 e dello shadow prima di tornare), su qualunque
+ * CPU. Da chiamare all'inizio di ogni gestore che consuma il VMCS12.
+ */
+static void
+shvmcs_pull(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c = n->sh_cache;
+	uint64_t v[SHV_N], t0;
+	int err = 0;
+	u_int i;
+
+	if (!n->sh_on || !n->sh_live || c == NULL || !c->sh_rw_owned)
+		return;
+	t0 = rdtsc();
+	critical_enter();
+	err = vmptrld(n->sh_vmcs);
+	for (i = 0; i < SHV_N && err == 0; i++)
+		if ((shv_rw_mask & (1U << i)) != 0 || nested_shadow_verify)
+			err = vmread(shv_fields[i].enc, &v[i]);
+	err |= vmclear(n->sh_vmcs);
+	critical_exit();
+	if (err != 0) {
+		shv_fault(vcpu, SHF_VMX, 0);
+		return;
+	}
+	c->sh_rw_owned = false;
+	for (i = 0; i < SHV_N; i++) {
+		uint32_t e = shv_fields[i].enc;
+		uint64_t old = vmcs12_read_field(c, e);
+
+		if ((shv_rw_mask & (1U << i)) != 0) {
+			if (v[i] != old) {
+				atomic_add_long(&nested_sh_pull_changed, 1);
+				vmcs12_write_field(c, e, v[i]);
+			}
+		} else if (nested_shadow_verify && (n->sh_push & (1U << i)) == 0) {
+			/* RO non scritto da L0 dopo l'ultima copia: deve coincidere */
+			atomic_add_long(&nested_sh_verify, 1);
+			if (v[i] != old)
+				shv_fault(vcpu, SHF_VERIFY, e);
+		}
+	}
+	atomic_add_long(&nested_sh_pull, 1);
+	atomic_add_long(&nested_sh_pull_tsc, rdtsc() - t0);
+}
+
+/* Il VMCS12 rispecchiato cambia (VMPTRLD) o sparisce (VMCLEAR, VMXOFF). */
+static void
+shvmcs_set_current(struct vmx_nested *n, struct vmcs12_cache *c)
+{
+	if (!n->sh_on)
+		return;
+	KASSERT(n->sh_cache == NULL || !n->sh_cache->sh_rw_owned,
+	    ("shvmcs_set_current: RW non recuperati"));
+	n->sh_cache = c;
+	n->sh_live = c != NULL;
+	n->sh_push = c != NULL ? SHV_ALL : 0;	/* lo shadow e' tutto da riempire */
+}
+
+/* L0 ha scritto il campo enc del VMCS12 c: va ricopiato nello shadow. */
+static void
+shvmcs_mark(struct vmx_nested *n, struct vmcs12_cache *c, uint32_t enc)
+{
+	int i;
+
+	if (!n->sh_on || !n->sh_live || c != n->sh_cache)
+		return;
+	if (enc == ~0U) {
+		n->sh_push = SHV_ALL;
+		return;
+	}
+	if ((i = shv_idx(enc)) >= 0)
+		n->sh_push |= 1U << i;
+}
+
+/*
+ * Prima di ogni ingresso in L1 (vmx_run, interrupt spenti, VMCS01 corrente,
+ * PRIMA dei controlli di sospensione: un errore ferma la VM e il controllo
+ * successivo esce senza entrare). Ricopia i campi marcati, poi rende il VMCS01
+ * coerente con lo stato virtuale: shadowing e bitmap accesi fra VMXON e VMXOFF,
+ * link pointer sullo shadow se c'e' un VMCS12 corrente, ~0 altrimenti. Rilegge
+ * sempre i valori veri del VMCS01: bhyve riscrive i controlli secondari da
+ * cap.proc_ctls2 in altri punti (x2APIC, capability).
+ */
+void
+vmx_shvmcs_enter_l1(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c = n->sh_cache;
+	uint64_t t0, link, want_link, proc2, rb;
+	bool want_ctl;
+	int err = 0;
+	u_int i, k = 0;
+
+	if (n->sh_fault) {
+		vm_suspend(vcpu->vmx->vm, VM_SUSPEND_POWEROFF);
+		return;
+	}
+	if (n->sh_live && c != NULL && c->sh_guard_hit) {
+		shv_fault(vcpu, SHF_GUARD, 0);
+		return;
+	}
+	if (n->sh_live && c != NULL && n->sh_push != 0) {
+		if (c->sh_rw_owned && (n->sh_push & shv_rw_mask) != 0) {
+			shv_fault(vcpu, SHF_CLOBBER, 0);	/* parere #44 §3 */
+			return;
+		}
+		t0 = rdtsc();
+		err = vmptrld(n->sh_vmcs);
+		for (i = 0; i < SHV_N && err == 0; i++) {
+			if ((n->sh_push & (1U << i)) == 0)
+				continue;
+			err = vmwrite(shv_fields[i].enc,
+			    vmcs12_read_field(c, shv_fields[i].enc));
+			k++;
+			if (err == 0 && nested_shadow_verify) {
+				uint64_t want = vmcs12_read_field(c,
+				    shv_fields[i].enc);
+
+				err = vmread(shv_fields[i].enc, &rb);
+				atomic_add_long(&nested_sh_verify, 1);
+				if (err == 0 && rb != want) {
+					/* AR: l'hardware puo' scartare i bit
+					 * riservati (parere #44 §2.1) */
+					if (i == 3 || i == 4) {
+						if (((rb ^ want) & ~0xfffe0f00ULL) == 0) {
+							atomic_add_long(
+							    &nested_sh_ar_norm, 1);
+							continue;
+						}
+					}
+					(void)vmclear(n->sh_vmcs);
+					(void)vmptrld(vcpu->vmcs01);
+					shv_fault(vcpu, SHF_VERIFY,
+					    shv_fields[i].enc);
+					return;
+				}
+			}
+		}
+		err |= vmclear(n->sh_vmcs);
+		err |= vmptrld(vcpu->vmcs01);	/* torna corrente; resta launched */
+		if (err != 0) {
+			shv_fault(vcpu, SHF_VMX, 0);
+			return;
+		}
+		n->sh_push = 0;
+		atomic_add_long(&nested_sh_push, 1);
+		atomic_add_long(&nested_sh_push_fields, k);
+		atomic_add_long(&nested_sh_push_tsc, rdtsc() - t0);
+	}
+	want_ctl = n->vmxon;
+	want_link = (want_ctl && n->sh_live) ? vtophys(n->sh_vmcs) : ~0UL;
+	proc2 = vmcs_read(VMCS_SEC_PROC_BASED_CTLS);
+	if (((proc2 & PROCBASED2_VMCS_SHADOWING) != 0) != want_ctl) {
+		if (want_ctl) {
+			vmcs_write(VMCS_VMREAD_BITMAP, vtophys(shv_rbm));
+			vmcs_write(VMCS_VMWRITE_BITMAP, vtophys(shv_wbm));
+			proc2 |= PROCBASED2_VMCS_SHADOWING;
+		} else
+			proc2 &= ~PROCBASED2_VMCS_SHADOWING;
+		vmcs_write(VMCS_SEC_PROC_BASED_CTLS, proc2);
+		atomic_add_long(&nested_sh_ctl, 1);
+	}
+	link = vmcs_read(VMCS_LINK_POINTER);
+	if (link != want_link) {
+		vmcs_write(VMCS_LINK_POINTER, want_link);
+		atomic_add_long(&nested_sh_ctl, 1);
+	}
+	if (want_link != ~0UL) {
+		n->sh_active = true;	/* VMCLEAR a fine vmx_run (parere #44 §5) */
+		c->sh_rw_owned = true;	/* da qui i RW sono dello shadow */
+	}
+}
+
+/*
+ * Fine di vmx_run, ancora in sezione critica sulla CPU dell'ultimo ingresso:
+ * lo shadow referenziato dal link pointer e' diventato attivo all'ingresso
+ * (SDM 24.11.1) e va chiuso QUI, prima che il thread possa migrare.
+ */
+void
+vmx_shvmcs_run_end(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+
+	if (!n->sh_active)
+		return;
+	n->sh_active = false;
+	if (vmclear(n->sh_vmcs) != 0)
+		shv_fault(vcpu, SHF_VMX, 1);
+	atomic_add_long(&nested_sh_clear, 1);
+}
+
 /* Larghezza del campo (bit 14:13): 0=16, 1=64, 2=32, 3=naturale. */
 #define	NESTED_FIELD_WIDTH(f)	(((f) >> 13) & 3)
 /* Accesso HIGH (bit 0) di un campo a 64 bit = meta' alta dello stesso campo. */
@@ -1499,6 +1900,7 @@ nested_vmwrite(struct vmx_vcpu *vcpu)
 		nested_vmx_result(vcpu, VMXERR_UNSUPPORTED_VMCS_COMPONENT);
 		goto done;
 	}
+	shvmcs_mark(n, c, field);	/* campo RO dello shadow: va ricopiato */
 	c->control_dirty = true;
 	c->host_dirty = true;
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
@@ -2460,6 +2862,9 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		nested_probe_dump("REFLECT-VMCS01");
 		vm_suspend(vcpu->vmx->vm, VM_SUSPEND_POWEROFF);
 	}
+	/* shadow VMCS: uscita e stato di L2 nuovi nel VMCS12, tutti da ricopiare
+	 * (i RW erano stati recuperati al VMLAUNCH/VMRESUME: niente perdite) */
+	shvmcs_mark(n, c, ~0U);
 	SDT_PROBE1(vmm, vmx, nested, reflect, vcpu);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_REFLECTIONS, 1);
 }
@@ -3726,6 +4131,23 @@ vmx_nested_exit(void *vcpui)
 		return (nested_ept_slow(vcpu));
 	}
 
+	/*
+	 * Shadow VMCS (parere #44 §3-4): i gestori che consumano il VMCS12 ne
+	 * riprendono prima i campi RW che l'L1 puo' aver scritto in hardware.
+	 * VMREAD/VMWRITE emulate toccano solo campi non RW (i RW non escono).
+	 */
+	switch (reason) {
+	case EXIT_REASON_VMXOFF:
+	case EXIT_REASON_VMCLEAR:
+	case EXIT_REASON_VMPTRLD:
+	case EXIT_REASON_VMLAUNCH:
+	case EXIT_REASON_VMRESUME:
+		if (vcpu->nested != NULL)
+			shvmcs_pull(vcpu);
+		break;
+	default:
+		break;
+	}
 	switch (reason) {
 	case EXIT_REASON_VMXON:		return (nested_vmxon(vcpu));
 	case EXIT_REASON_VMXOFF:	return (nested_vmxoff(vcpu));
