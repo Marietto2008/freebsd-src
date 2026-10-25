@@ -1502,6 +1502,18 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_shadow_verify, CTLFLAG_RWTUN,
  * su una CPU diversa da lastcpu, dove lastcpu = curcpu dichiara coerente un
  * VPID01 mai invalidato su quella CPU (D3).
  */
+/*
+ * D1 (parere #48): tutti i VPID12 dell'L1 condividono il VPID02, quindi un
+ * VPID12 diverso dal precedente vuole un contesto TLB nuovo: con
+ * nested_vpid12_flush=1 si chiede un INVVPID(VPID02), eseguito da vmx_run
+ * sulla CPU del prossimo ingresso in L2 (anche al primo ingresso: il VPID02
+ * non e' mai stato invalidato). Invalida soltanto di piu'. kvm-unit-tests
+ * vmx_pf_vpid_test fallisce senza.
+ */
+static int nested_vpid12_flush = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid12_flush, CTLFLAG_RWTUN,
+    &nested_vpid12_flush, 0,
+    "nested: invalida il VPID02 condiviso quando cambia il VPID12 (0 = spento)");
 NESTED_CTR(vpid02_vpid12_change,
     "VPID: ingressi in L2 con VPID12 cambiato (VPID02 condiviso non invalidato)");
 NESTED_CTR(vpid02_invvpid_l1insn,
@@ -2541,6 +2553,9 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 
 		if (n->last_vpid12_ok && v12 != n->last_vpid12)
 			atomic_add_long(&vpid02_vpid12_change, 1);
+		if (nested_vpid12_flush != 0 &&
+		    (!n->last_vpid12_ok || v12 != n->last_vpid12))
+			n->vpid02_flush_pending = true;
 		n->last_vpid12 = v12;
 		n->last_vpid12_ok = true;
 	}

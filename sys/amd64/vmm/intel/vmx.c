@@ -284,6 +284,8 @@ VPID_CTR(vmcs02_host_state_rewrites,
 VPID_CTR(vpid_flush_deferred, "richieste d'invalidazione differite del VPID01");
 VPID_CTR(vpid_flush_completed,
     "richieste differite del VPID01 eseguite da vmx_set_pcpu_defaults");
+VPID_CTR(vpid02_invvpid_pending,
+    "VPID02 invalidato da vmx_run per una richiesta pendente (VPID12 cambiato...)");
 
 /* Debug counters for trap 30 investigation */
 static int vmx_dbg_last_inject_vec = -1;
@@ -1436,6 +1438,21 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		vmm_stat_incr(vcpu->vcpu, VCPU_INVVPID_SAVED, 1);
 		atomic_add_long(&vpid_invvpid_saved_eptgen, 1);
 	}
+}
+
+/* INVVPID single-context del VPID02 sulla CPU corrente (parere #48) */
+static void
+vmx_invvpid_vpid02(struct vmx_vcpu *vcpu)
+{
+	struct invvpid_desc d;
+
+	KASSERT(curthread->td_critnest > 0, ("%s: vcpu %d fuori dalla sezione "
+	    "critica", __func__, vcpu->vcpuid));
+	bzero(&d, sizeof(d));
+	d.vpid = vcpu->nested->vpid2;
+	if (d.vpid != 0)
+		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
+	vcpu->nested->vpid02_flush_pending = false;
 }
 
 static void
@@ -3550,6 +3567,13 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	/* audit VPID: da qui al ritorno l'uscita L2->L1 avviene dentro vmx_run */
 	if (vcpu->nested != NULL)
 		vcpu->nested->in_run = true;
+	/* D1 (parere #48): il VPID02 condiviso, invalidato qui, sulla CPU
+	 * dell'ingresso in L2, in sezione critica */
+	if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+	    vcpu->nested->vpid02_flush_pending) {
+		vmx_invvpid_vpid02(vcpu);
+		atomic_add_long(&vpid02_invvpid_pending, 1);
+	}
 	/*
 	 * L2 con shadow EPT: invalida il TLB dell'EPTP shadow a ogni (ri)ingresso
 	 * via vm_run (INVEPT dell'L1, migrazione del vCPU, EPT12 cambiato). Le

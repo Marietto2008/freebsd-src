@@ -356,6 +356,7 @@ struct vmx_nested {
 	uint16_t	last_vpid12;
 	bool		last_vpid12_ok;
 	bool		in_run;
+	bool		vpid02_flush_pending;	/* INVVPID(VPID02) prima del prossimo ingresso in L2 */
 	bool		restart_only;	/* uscita L2 gia' riflessa: lo slow path
 					 * deve solo far ripartire vmx_run */
 	bool		synth;		/* uscita L2->L1 SINTETICA (nessuna uscita
