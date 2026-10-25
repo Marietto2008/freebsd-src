@@ -189,6 +189,7 @@ void	vept_stats_flush(struct vmx_nested *n);	/* da nested_stats_flush */
 /* B1 */
 bool	vmx_vept_keep_enabled(void);		/* hw.vmm.vmx.vept_keep */
 void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
+int	vmx_vept_cur_slot(struct vmx_nested *n);	/* parere #53 §8: slot corrente o -1 */
 bool	vmx_vept_memgen_stale(struct vmx_vcpu *vcpu);	/* non dorme */
 void	vmx_vept_hw_flushed(struct vmx_vcpu *vcpu);	/* dopo l'INVEPT hw */
 void	vmx_vept_enter_check(struct vmx_vcpu *vcpu);	/* prima dell'ingresso */
@@ -507,6 +508,15 @@ struct vmx_nested {
 	uint64_t	st_vept[64];
 	uint64_t	st_vept_pk_peak;	/* massimo di riferimenti tenuti */
 	uint64_t	st_tmax[4];	/* parere #41 §6: massimi dei tratti, cicli */
+	/*
+	 * Strumentazione INVEPT (parere #53 §8), SOLO diagnostica, in coda per
+	 * non spostare gli offset DTrace precedenti. Classifica la causa di ogni
+	 * INVEPT shadow a ogni ingresso in L2; non cambia il comportamento.
+	 * vept_flush_cause: bit 1 = INVEPT di L1, bit 2 = voci EPT12 cambiate (B1).
+	 * vept_invept_cpu1[i]: CPU+1 dell'ultimo INVEPT per lo slot i (0 = mai).
+	 */
+	uint8_t		vept_flush_cause;
+	uint8_t		vept_invept_cpu1[VEPT_NROOTS];
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 

@@ -759,8 +759,10 @@ vept_walk_changed(struct vept_obs *o, struct vept_obs_ent *e, int idx,
 	st = e->base + (uint64_t)idx * span;
 	z = vept_zap_range(n->vept_slot[o->slot].root, 3, 0, st, st + span);
 	k->leaves -= z;
-	if (z != 0)
+	if (z != 0) {
 		n->vept_flush_pending = true;
+		n->vept_flush_cause |= 2;	/* voci EPT12 cambiate (B1) */
+	}
 	e->snap[idx] = val;
 	atomic_add_long(&vept_keep_walk_zaps, 1);
 	atomic_add_long(&vept_keep_invalidated_leaves, z);
@@ -1446,8 +1448,10 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 		inval += vept_zap_range(s->root, 3, 0, o->rng[j].start,
 		    o->rng[j].end);
 	k->leaves -= inval;
-	if (inval != 0)
+	if (inval != 0) {
 		n->vept_flush_pending = true;
+		n->vept_flush_cause |= 1;	/* INVEPT di L1 */
+	}
 
 	/* 4. fotografie: solo le voci cambiate, dopo le invalidazioni */
 	for (c = 0; c < nc; c++)
@@ -2002,6 +2006,21 @@ vmx_vept_memgen_stale(struct vmx_vcpu *vcpu)
 			return (n->vept_ks[i].memgen !=
 			    vm_memmap_generation(vcpu->vmx->vm));
 	return (false);
+}
+
+/* Slot della radice corrente, o -1 (parere #53 §8, strumentazione): come
+ * vept_cur_slot ma senza panic, per il percorso caldo di vmx_run. */
+int
+vmx_vept_cur_slot(struct vmx_nested *n)
+{
+	int i;
+
+	if (n->vept_root == NULL)
+		return (-1);
+	for (i = 0; i < VEPT_NROOTS; i++)
+		if (n->vept_slot[i].root == n->vept_root)
+			return (i);
+	return (-1);
 }
 
 /* vmx_run ha appena fatto INVEPT dell'EPTP shadow su questa CPU. */

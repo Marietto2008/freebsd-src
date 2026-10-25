@@ -302,6 +302,20 @@ VPID_CTR(nested_entry_hw_fail,
     "vpid_track: VM-entry hardware in L2 falliti (VMfail)");
 VPID_CTR(nested_entry_hw_fail_flushed,
     "vpid_track: VM-entry hardware falliti con un flush VPID02 gia' eseguito prima");
+/*
+ * Strumentazione INVEPT (parere #53 §8), SOLO diagnostica: classifica la causa
+ * dell'INVEPT shadow eseguito a ogni ingresso in L2. Non toglie nessun INVEPT.
+ * _unclassified sono i candidati all'elisione (stessa CPU, stessa radice,
+ * nessun flush dovuto).
+ */
+VPID_CTR(nested_invept_entry_total, "INVEPT shadow eseguiti prima degli ingressi in L2");
+VPID_CTR(nested_invept_l1_request, "INVEPT shadow dovuti a un INVEPT di L1");
+VPID_CTR(nested_invept_ept02_change, "INVEPT shadow dovuti a voci EPT12 cambiate (B1)");
+VPID_CTR(nested_invept_cpu_migration, "INVEPT shadow dovuti al cambio di CPU per quella radice");
+VPID_CTR(nested_invept_first_use, "INVEPT shadow al primo uso di una radice su una CPU");
+VPID_CTR(nested_invept_unclassified,
+    "INVEPT shadow senza causa nota: candidati all'elisione (stessa CPU, stessa radice, nessun flush)");
+VPID_CTR(nested_invept_tsc, "cicli TSC spesi negli INVEPT shadow a ogni ingresso");
 VPID_CTR(vpid02_req, "richieste d'invalidazione del VPID02 ricevute");
 VPID_CTR(vpid02_req_coalesced,
     "richieste del VPID02 accorpate a una gia' pendente");
@@ -3776,7 +3790,39 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 				    (u_long)cur, (u_long)ed.eptp, vcpu->vcpuid);
 			vmcs_write(VMCS_EPTP, ed.eptp);
 		}
-		invept(INVEPT_TYPE_SINGLE_CONTEXT, ed);
+		/*
+		 * Strumentazione INVEPT (parere #53 §8): classifica la causa
+		 * PRIMA di eseguire, misura il TSC, poi esegue. Nessun INVEPT
+		 * viene tolto. La causa del flush dovuto (L1 / EPT12 cambiata) e'
+		 * in vcpu->nested->vept_flush_cause; il cambio di CPU e il primo
+		 * uso si leggono da vept_invept_cpu1[] per lo slot corrente.
+		 */
+		{
+			struct vmx_nested *n = vcpu->nested;
+			uint8_t cause = n->vept_flush_cause;
+			int slot = vmx_vept_cur_slot(n);
+			uint8_t me = (uint8_t)(curcpu + 1);
+			uint64_t t0;
+
+			atomic_add_long(&nested_invept_entry_total, 1);
+			if (n->vept_flush_pending && cause != 0) {
+				if (cause & 1)
+					atomic_add_long(&nested_invept_l1_request, 1);
+				if (cause & 2)
+					atomic_add_long(&nested_invept_ept02_change, 1);
+			} else if (slot >= 0 && n->vept_invept_cpu1[slot] == 0)
+				atomic_add_long(&nested_invept_first_use, 1);
+			else if (slot >= 0 && n->vept_invept_cpu1[slot] != me)
+				atomic_add_long(&nested_invept_cpu_migration, 1);
+			else
+				atomic_add_long(&nested_invept_unclassified, 1);
+			n->vept_flush_cause = 0;
+			if (slot >= 0)
+				n->vept_invept_cpu1[slot] = me;
+			t0 = rdtsc();
+			invept(INVEPT_TYPE_SINGLE_CONTEXT, ed);
+			atomic_add_long(&nested_invept_tsc, rdtsc() - t0);
+		}
 		vmx_vept_hw_flushed(vcpu);	/* B1: conta i flush dovuti */
 	}
 	do {
