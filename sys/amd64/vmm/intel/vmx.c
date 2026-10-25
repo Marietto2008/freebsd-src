@@ -288,6 +288,15 @@ VPID_CTR(vpid02_invvpid_real_migration,
     "vpid_track: VPID02 invalidato perche' l'L2 entra su un'altra CPU");
 VPID_CTR(vpid02_invvpid_first,
     "vpid_track: VPID02 invalidato al primo ingresso in L2 del vCPU");
+VPID_CTR(vpid02_req, "richieste d'invalidazione del VPID02 ricevute");
+VPID_CTR(vpid02_req_coalesced,
+    "richieste del VPID02 accorpate a una gia' pendente");
+VPID_CTR(vpid02_req_satisfied,
+    "richieste pendenti del VPID02 consumate da un INVVPID sulla CPU d'ingresso");
+VPID_CTR(vpid02_req_dropped,
+    "richieste del VPID02 pendenti alla distruzione dello stato nested");
+VPID_CTR(vpid_flush_coalesced,
+    "richieste differite del VPID01 arrivate con una gia' pendente");
 VPID_CTR(vpid02_invvpid_pending,
     "VPID02 invalidato da vmx_run per una richiesta pendente (VPID12 cambiato...)");
 
@@ -1401,14 +1410,17 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		 * This will invalidate TLB entries tagged with the vcpu's
 		 * vpid the next time it runs via vmx_set_pcpu_defaults().
 		 */
+		atomic_add_long(&vpid_flush_deferred, 1);
+		if (vmxstate->lastcpu == NOCPU &&
+		    vmxstate->nocpu_why == VMX_NOCPU_DEFERRED)
+			atomic_add_long(&vpid_flush_coalesced, 1);
 		vmxstate->lastcpu = NOCPU;
 		vmxstate->nocpu_why = VMX_NOCPU_DEFERRED;
-		atomic_add_long(&vpid_flush_deferred, 1);
 		/* vpid_track (D4): in L2 il VMCS corrente e' il VMCS02, e la
 		 * richiesta riguarda anche il VPID02 */
 		if (vcpu->nested != NULL && vcpu->nested->vpid_track &&
 		    vcpu->nested->in_l2)
-			vcpu->nested->vpid02_flush_pending = true;
+			nested_vpid02_request(vcpu->nested);
 		return;
 	}
 
@@ -1457,11 +1469,26 @@ vmx_invvpid_vpid02(struct vmx_vcpu *vcpu)
 
 	KASSERT(curthread->td_critnest > 0, ("%s: vcpu %d fuori dalla sezione "
 	    "critica", __func__, vcpu->vcpuid));
+	if (vcpu->nested->vpid02_flush_pending)
+		atomic_add_long(&vpid02_req_satisfied, 1);
+	vcpu->nested->vpid02_flush_pending = false;
+	/* VMCS02 senza VPID (vpid02_off): l'L2 usa il contesto VPID 0, che
+	 * l'hardware invalida a ogni ingresso e uscita; niente da fare */
+	if (vcpu->nested->vpid02_off)
+		return;
 	bzero(&d, sizeof(d));
 	d.vpid = vcpu->nested->vpid2;
 	if (d.vpid != 0)
 		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
-	vcpu->nested->vpid02_flush_pending = false;
+}
+
+/* Un VPID e' di un solo vCPU se viene dall'allocatore (non 0, non dallo
+ * spazio di riserva [1, vm_maxcpu] condiviso fra le VM) */
+bool
+vmx_vpid_is_unique(uint16_t vpid)
+{
+
+	return (vpid > vm_maxcpu);
 }
 
 static void

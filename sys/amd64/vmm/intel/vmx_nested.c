@@ -71,6 +71,8 @@ static struct sx nested_field_tab_sx;
 static int	nested_fast_field_validate;
 static int	nested_shadow_vmcs;
 static int	nested_vpid_track;
+static int	nested_vpid_test_off;
+static u_long	vpid02_off_vcpus;
 static void	nested_field_tab_build(void);
 static int	shv_global_init(void);
 static int	shvmcs_pull(struct vmx_vcpu *vcpu);
@@ -408,9 +410,20 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	    PINBASED_PREMPTION_TIMER) != 0;
 	/* B1: la modalita' della shadow EPT resta quella della creazione */
 	n->vept_keep = vmx_vept_keep_enabled();
-	/* tracciamento VPID (parere #48 §5): fissato qui, per la vita del vCPU */
-	n->vpid_track = nested_vpid_track != 0 && n->vpid2 != 0 &&
-	    n->vpid2 != vcpu->state.vpid;
+	/*
+	 * Tracciamento VPID (pareri #48 §5 e #49 §5): fissato qui, per la vita
+	 * del vCPU. Se il VPID02 non e' unico (0, uguale al VPID01, dallo
+	 * spazio di riserva condiviso fra le VM, o la prova lo chiede) l'L2 non
+	 * ha un tag TLB suo: il VMCS02 si compone SENZA VPID e l'hardware
+	 * invalida il contesto dell'L2 a ogni ingresso e uscita. Sicuro per
+	 * costruzione, al prezzo di quei flush.
+	 */
+	n->vpid_track = nested_vpid_track != 0;
+	if (n->vpid_track && (n->vpid2 == 0 || n->vpid2 == vcpu->state.vpid ||
+	    !vmx_vpid_is_unique(n->vpid2) || nested_vpid_test_off != 0)) {
+		n->vpid02_off = true;
+		atomic_add_long(&vpid02_off_vcpus, 1);
+	}
 	/* shadow VMCS (pareri #43/#44): fissato qui, per la vita del vCPU */
 	if (nested_shadow_vmcs != 0) {
 		if (((rdmsr(MSR_VMX_PROCBASED_CTLS2) >> 32) &
@@ -465,6 +478,8 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 			free(n->cache[i].vmcs02, M_VMX_NESTED);
 	}
 	vmx_vept_flush(n);
+	if (n->vpid02_flush_pending)
+		atomic_add_long(&vpid02_req_dropped, 1);
 	if (n->vpid2 != 0)
 		vpid_free(n->vpid2);
 	if (n->msr_bitmap != NULL)
@@ -812,6 +827,15 @@ nested_vmxon(struct vmx_vcpu *vcpu)
 	}
 	n->vmxon_ptr = ptr;
 	n->vmxon = true;
+	/*
+	 * Nuovo ciclo VMX (parere #49 §4.1): il VPID02 e' lo stesso del ciclo
+	 * precedente e puo' avere traduzioni di allora. Si dimentica l'identita'
+	 * del VPID12 e, col tracciamento, si chiede l'invalidazione prima del
+	 * primo ingresso in L2 (KVM fa lo stesso al primo uso, giugno 2026).
+	 */
+	n->last_vpid12_ok = false;
+	if (n->vpid_track)
+		nested_vpid02_request(n);
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
 	nested_advance_rip(vcpu);
@@ -1531,6 +1555,18 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid12_flush, CTLFLAG_RWTUN,
  * (D4); dallo slow path non si dichiara piu' coerente il VPID01 (D3).
  * Spento se il VPID02 e' 0 o coincide col VPID01 (allocazione di riserva, D5).
  */
+/*
+ * Prova del ripiego (parere #49 §5): con nested_vpid_test_off=1 i vCPU nested
+ * creati da qui in poi si comportano come se l'allocatore avesse esaurito i
+ * VPID (VPID02 non unico): VMCS02 senza VPID. Solo diagnostica.
+ */
+static int nested_vpid_test_off = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid_test_off, CTLFLAG_RWTUN,
+    &nested_vpid_test_off, 0,
+    "nested, prova: vpid_track col VPID02 trattato come non unico (VMCS02 "
+    "senza VPID)");
+NESTED_CTR(vpid02_off_vcpus,
+    "vpid_track: vCPU nested col VPID02 non unico, VMCS02 senza VPID");
 static int nested_vpid_track = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid_track, CTLFLAG_RWTUN,
     &nested_vpid_track, 0,
@@ -2580,17 +2616,30 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		if (vcpu->state.lastcpu != NOCPU)
 			vcpu->state.nocpu_why = VMX_NOCPU_NESTED_ENTRY;
 		vcpu->state.lastcpu = NOCPU;
-		n->vpid02_flush_pending = true;
+		nested_vpid02_request(n);
 	}
-	/* audit VPID (D1): cambio di VPID12 sul VPID02 condiviso */
-	if (vmcs12_proc2(c) & PROCBASED2_ENABLE_VPID) {
-		uint16_t v12 = vmcs12_read_field(c, VMCS_VPID) & 0xffff;
+	/*
+	 * Identita' del contesto TLB virtuale dell'L2 (D1, parere #49 §4.2):
+	 * il VPID12 se il VMCS12 lo abilita, 0 altrimenti (con VPID abilitato
+	 * il VPID12 non puo' essere 0: lo rifiutano i controlli d'ingresso).
+	 * Un'identita' diversa dalla precedente vuole un contesto nuovo; anche
+	 * A -> disabilitato -> A, perche' il tratto senza VPID ha usato lo
+	 * stesso VPID02. Il VMCS12 in se' non conta: due VMCS12 con lo stesso
+	 * VPID12 sono, per l'architettura, lo stesso contesto. L'identita' si
+	 * aggiorna qui, dopo tutti i controlli software dell'ingresso; un
+	 * ingresso che fallisce in hardware trova l'INVVPID gia' eseguito da
+	 * vmx_run prima di entrare, quindi non lo perde (il caso corretto in
+	 * KVM a luglio 2026).
+	 */
+	{
+		uint16_t v12 = (vmcs12_proc2(c) & PROCBASED2_ENABLE_VPID) ?
+		    (vmcs12_read_field(c, VMCS_VPID) & 0xffff) : 0;
 
 		if (n->last_vpid12_ok && v12 != n->last_vpid12)
 			atomic_add_long(&vpid02_vpid12_change, 1);
 		if ((nested_vpid12_flush != 0 || n->vpid_track) &&
 		    (!n->last_vpid12_ok || v12 != n->last_vpid12))
-			n->vpid02_flush_pending = true;
+			nested_vpid02_request(n);
 		n->last_vpid12 = v12;
 		n->last_vpid12_ok = true;
 	}
@@ -2877,9 +2926,10 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* [v2] IA-32e mode guest degli entry controls di VMCS12 = EFER.LMA di L2 */
 	efer = vmcs_read(VMCS_GUEST_IA32_EFER);
 
-	/* 3. se VMCS12 non usa VPID, flush del VPID02 (§6.6) */
+	/* 3. se VMCS12 non usa VPID, flush del VPID02 (§6.6); col VMCS02 senza
+	 * VPID (vpid02_off) lo fa gia' l'hardware all'uscita */
 	if ((vmcs12_proc2(c) &
-	    PROCBASED2_ENABLE_VPID) == 0) {
+	    PROCBASED2_ENABLE_VPID) == 0 && !n->vpid02_off) {
 		struct invvpid_desc d;
 		bzero(&d, sizeof(d));
 		d.vpid = n->vpid2;
@@ -4088,12 +4138,14 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 	 * e' soddisfatto (per eccesso) da un flush single-context di vpid2 */
 	bzero(&d, sizeof(d));
 	d.vpid = n->vpid2;
-	invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
-	atomic_add_long(&vpid02_invvpid_l1insn, 1);
+	if (!n->vpid02_off) {	/* senza VPID nel VMCS02 non c'e' nulla da invalidare */
+		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
+		atomic_add_long(&vpid02_invvpid_l1insn, 1);
+	}
 	/* vpid_track (D2): questa e' la CPU dello slow path, non per forza quella
 	 * del prossimo ingresso in L2 */
 	if (n->vpid_track)
-		n->vpid02_flush_pending = true;
+		nested_vpid02_request(n);
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 	nested_advance_rip(vcpu);
 	return (0);
@@ -4547,6 +4599,8 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 		    (uint32_t)(n->vmx_msr[0x48b - 0x480] >> 32);
 	proc2 |= PROCBASED2_ENABLE_EPT | PROCBASED2_ENABLE_VPID;
 	proc2 = nested_adjust_ctl(proc2, MSR_VMX_PROCBASED_CTLS2);
+	if (n->vpid02_off)		/* ripiego sicuro (parere #49 §5) */
+		proc2 &= ~PROCBASED2_ENABLE_VPID;
 	proc2 &= ~(PROCBASED2_VMCS_SHADOWING |
 	    PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
 	    PROCBASED2_VIRTUALIZE_X2APIC_MODE |
@@ -4655,7 +4709,7 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	else
 		vmwrite(VMCS_EPTP, x->vmx->eptp);
 	/* VPID02 distinto per l2 (T2.8), per non aliasare la TLB con l1 */
-	vmwrite(VMCS_VPID, n->vpid2);
+	vmwrite(VMCS_VPID, n->vpid02_off ? 0 : n->vpid2);
 	/* HOST_RSP: nel VMCS01 lo scrive vmx_init UNA volta (&vcpu->ctx, lo
 	 * stack su cui vmx_exit_guest salva i registri del guest);
 	 * vmcs_init_host non lo tocca, quindi nel VMCS02 valeva 0 -> alla

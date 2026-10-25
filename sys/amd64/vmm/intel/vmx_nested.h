@@ -110,6 +110,18 @@ void	vmx_shvmcs_run_end(struct vmx_vcpu *vcpu);
 /* vpid_track (vmx.c): VPID01 e campi host del VMCS01 sulla CPU corrente,
  * dall'uscita L2->L1 dentro vmx_run */
 void	vmx_vpid01_resume(struct vmx_vcpu *vcpu);
+bool	vmx_vpid_is_unique(uint16_t vpid);
+/*
+ * Richieste d'invalidazione del VPID02 (parere #49 §6), semantica dei
+ * contatori: vpid02_req = richieste ricevute; vpid02_req_coalesced = arrivate
+ * con una gia' pendente (accorpate); vpid02_req_satisfied = richieste pendenti
+ * consumate da un INVVPID(VPID02) eseguito sulla CPU d'ingresso in L2, qualunque
+ * ne fosse la causa; vpid02_req_dropped = pendenti alla distruzione dello stato
+ * nested. Invariante: req = coalesced + satisfied + dropped + pendenti ora (0 o
+ * 1 per vCPU nested vivo).
+ */
+extern u_long vpid02_req, vpid02_req_coalesced, vpid02_req_satisfied,
+    vpid02_req_dropped;
 extern u_long nested_sh_entry_after_fault;
 /* esiti di vmx_vept_fault */
 #define	VEPT_OK		0	/* shadow installata */
@@ -365,6 +377,9 @@ struct vmx_nested {
 	/* vpid_track (parere #48 §5): campi host e TLB separati da lastcpu.
 	 * Le CPU sono memorizzate +1, 0 = nessuna. */
 	bool		vpid_track;	/* fissato alla creazione del vCPU nested */
+	bool		vpid02_off;	/* vpid_track con VPID02 non unico (VPID01,
+					 * spazio di riserva, 0): VMCS02 SENZA VPID,
+					 * l'hardware invalida a ogni ingresso/uscita */
 	int		vmcs01_host_cpu1;	/* CPU dei campi host del VMCS01 */
 	int		vpid02_lastcpu1;	/* CPU dove il TLB del VPID02 e' coerente */
 	bool		restart_only;	/* uscita L2 gia' riflessa: lo slow path
@@ -515,6 +530,16 @@ bool	nested_l0_owns_int_window(struct vmx_vcpu *vcpu);
 /* cattura lo stato al #UD in L2 (hw.vmm.vmx.diag_ud); sola lettura */
 void	nested_diag_ud_capture(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
 void	nested_diag_efer_trace(struct vmx_vcpu *vcpu, struct vmcs12_cache *c);
+/* richiesta d'invalidazione del VPID02 (semantica dei contatori sopra) */
+static __inline void
+nested_vpid02_request(struct vmx_nested *n)
+{
+
+	atomic_add_long(&vpid02_req, 1);
+	if (n->vpid02_flush_pending)
+		atomic_add_long(&vpid02_req_coalesced, 1);
+	n->vpid02_flush_pending = true;
+}
 #endif /* _KERNEL */
 
 #endif /* _VMX_NESTED_H_ */
