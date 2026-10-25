@@ -70,6 +70,7 @@ static void	nested_reflect_to_l1(struct vmx_vcpu *vcpu,
 static struct sx nested_field_tab_sx;
 static int	nested_fast_field_validate;
 static int	nested_shadow_vmcs;
+static int	nested_vpid_track;
 static void	nested_field_tab_build(void);
 static int	shv_global_init(void);
 static int	shvmcs_pull(struct vmx_vcpu *vcpu);
@@ -407,6 +408,9 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	    PINBASED_PREMPTION_TIMER) != 0;
 	/* B1: la modalita' della shadow EPT resta quella della creazione */
 	n->vept_keep = vmx_vept_keep_enabled();
+	/* tracciamento VPID (parere #48 §5): fissato qui, per la vita del vCPU */
+	n->vpid_track = nested_vpid_track != 0 && n->vpid2 != 0 &&
+	    n->vpid2 != vcpu->state.vpid;
 	/* shadow VMCS (pareri #43/#44): fissato qui, per la vita del vCPU */
 	if (nested_shadow_vmcs != 0) {
 		if (((rdmsr(MSR_VMX_PROCBASED_CTLS2) >> 32) &
@@ -1514,6 +1518,24 @@ static int nested_vpid12_flush = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid12_flush, CTLFLAG_RWTUN,
     &nested_vpid12_flush, 0,
     "nested: invalida il VPID02 condiviso quando cambia il VPID12 (0 = spento)");
+/*
+ * Tracciamento VPID (parere #48 §5), letto alla creazione del vCPU nested.
+ * Separa i tre significati di lastcpu: i campi host per-CPU hanno una CPU per
+ * VMCS (host_cpu1 del VMCS01 e di ogni VMCS02); lastcpu resta SOLO del VPID01
+ * (CPU dove il suo TLB e' coerente, NOCPU = invalidazione in attesa) e il
+ * nested non lo scrive piu', salvo NOCPU dove l'SDM chiede un flush (VMCS12
+ * senza VPID); il VPID02 ha la sua lastcpu e la sua richiesta pendente.
+ * Effetto: niente INVVPID(VPID01) a ogni ingresso in L2 (falsa migrazione), e
+ * il VPID02 invalidato sulle migrazioni vere, al cambio di VPID12 (D1), dopo un
+ * INVVPID dell'L1 eseguito su un'altra CPU (D2) e per le richieste differite
+ * (D4); dallo slow path non si dichiara piu' coerente il VPID01 (D3).
+ * Spento se il VPID02 e' 0 o coincide col VPID01 (allocazione di riserva, D5).
+ */
+static int nested_vpid_track = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid_track, CTLFLAG_RWTUN,
+    &nested_vpid_track, 0,
+    "nested: VPID01/VPID02 e campi host tracciati separatamente (letto alla "
+    "creazione del vCPU nested; 0 = spento)");
 NESTED_CTR(vpid02_vpid12_change,
     "VPID: ingressi in L2 con VPID12 cambiato (VPID02 condiviso non invalidato)");
 NESTED_CTR(vpid02_invvpid_l1insn,
@@ -2468,6 +2490,7 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	vmwrite(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
 	vmwrite(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
 	vmwrite(VMCS_HOST_CR3, rcr3());
+	c->host_cpu1 = curcpu + 1;		/* vpid_track */
 
 	/* controllo di sicurezza OBBLIGATORIO (unico chiamante, §3/§6.3) */
 	error = nested_vmcs02_check(vcpu);
@@ -2544,16 +2567,28 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 * istantaneo della macchina (kvm-unit-tests F2a). lastcpu vale per
 	 * VMCS: NOCPU forza la riscrittura nel VMCS02 al prossimo vmx_run.
 	 */
-	if (vcpu->state.lastcpu != NOCPU)	/* non coprire una richiesta differita */
-		vcpu->state.nocpu_why = VMX_NOCPU_NESTED_ENTRY;
-	vcpu->state.lastcpu = NOCPU;
+	if (!n->vpid_track) {
+		if (vcpu->state.lastcpu != NOCPU)	/* non coprire una richiesta differita */
+			vcpu->state.nocpu_why = VMX_NOCPU_NESTED_ENTRY;
+		vcpu->state.lastcpu = NOCPU;
+	} else if ((vmcs12_proc2(c) & PROCBASED2_ENABLE_VPID) == 0) {
+		/*
+		 * VMCS12 senza VPID: ingresso e uscita invalidano il contesto
+		 * VPID 0 dell'L1, che nell'emulazione sono il VPID01 (prima che
+		 * l'L1 torni a girare) e il VPID02 (prima di entrare in L2).
+		 */
+		if (vcpu->state.lastcpu != NOCPU)
+			vcpu->state.nocpu_why = VMX_NOCPU_NESTED_ENTRY;
+		vcpu->state.lastcpu = NOCPU;
+		n->vpid02_flush_pending = true;
+	}
 	/* audit VPID (D1): cambio di VPID12 sul VPID02 condiviso */
 	if (vmcs12_proc2(c) & PROCBASED2_ENABLE_VPID) {
 		uint16_t v12 = vmcs12_read_field(c, VMCS_VPID) & 0xffff;
 
 		if (n->last_vpid12_ok && v12 != n->last_vpid12)
 			atomic_add_long(&vpid02_vpid12_change, 1);
-		if (nested_vpid12_flush != 0 &&
+		if ((nested_vpid12_flush != 0 || n->vpid_track) &&
 		    (!n->last_vpid12_ok || v12 != n->last_vpid12))
 			n->vpid02_flush_pending = true;
 		n->last_vpid12 = v12;
@@ -2862,6 +2897,20 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	VMCLEAR(vmcs02);
 	VMPTRLD(vcpu->vmcs01);
 	vcpu->vmcs = vcpu->vmcs01;
+	if (n->vpid_track) {
+		/*
+		 * Campi host del VMCS01 per QUESTA CPU, registrata. Il VPID01:
+		 * dentro vmx_run si allinea qui (stessa CPU e stessa sezione
+		 * critica del prossimo ingresso nell'L1); dallo slow path
+		 * decide il prossimo vmx_run, sulla CPU vera (D3).
+		 */
+		vmcs_write(VMCS_HOST_TR_BASE, vmm_get_host_trbase());
+		vmcs_write(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
+		vmcs_write(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
+		n->vmcs01_host_cpu1 = curcpu + 1;
+		if (n->in_run)
+			vmx_vpid01_resume(vcpu);
+	} else {
 	/* Il VMCS01 riparte su QUESTA CPU, ma il vCPU puo' essere migrato
 	 * mentre era in L2 (la riscrittura e' finita nel VMCS02): riscrivo i
 	 * campi host per-CPU qui, ora che il VMCS01 e' corrente. */
@@ -2871,6 +2920,7 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	if (!n->in_run && vcpu->state.lastcpu != curcpu)
 		atomic_add_long(&vpid01_slowpath_claim, 1);	/* audit VPID, D3 */
 	vcpu->state.lastcpu = curcpu;
+	}
 
 	/* 6. Loading Host State: host di VMCS12 -> guest di VMCS01 */
 	hcr0 = (vmcs12_read_field(c, VMCS_HOST_CR0) | cr0_ones_mask) &
@@ -4040,6 +4090,10 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 	d.vpid = n->vpid2;
 	invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
 	atomic_add_long(&vpid02_invvpid_l1insn, 1);
+	/* vpid_track (D2): questa e' la CPU dello slow path, non per forza quella
+	 * del prossimo ingresso in L2 */
+	if (n->vpid_track)
+		n->vpid02_flush_pending = true;
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 	nested_advance_rip(vcpu);
 	return (0);

@@ -107,6 +107,9 @@ bool	nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit);
  */
 bool	vmx_shvmcs_enter(struct vmx_vcpu *vcpu);
 void	vmx_shvmcs_run_end(struct vmx_vcpu *vcpu);
+/* vpid_track (vmx.c): VPID01 e campi host del VMCS01 sulla CPU corrente,
+ * dall'uscita L2->L1 dentro vmx_run */
+void	vmx_vpid01_resume(struct vmx_vcpu *vcpu);
 extern u_long nested_sh_entry_after_fault;
 /* esiti di vmx_vept_fault */
 #define	VEPT_OK		0	/* shadow installata */
@@ -250,6 +253,8 @@ struct vmcs12_cache {
 	void		*vmcs02;	/* pagina VMCS02, allocata pigramente (T1.8) */
 	int		ref_cnt;
 	int		launched;	/* launch state di questo VMCS02 */
+	int		host_cpu1;	/* vpid_track: CPU+1 dei campi host per-CPU
+					 * scritti in questo VMCS02 (0 = nessuna) */
 	bool		host_dirty;	/* host-state da ricomporre */
 	bool		control_dirty;	/* controlli da ricomporre */
 	struct vmcs12_field fields[VMCS12_NFIELDS];  /* store software (T1.8) */
@@ -357,6 +362,11 @@ struct vmx_nested {
 	bool		last_vpid12_ok;
 	bool		in_run;
 	bool		vpid02_flush_pending;	/* INVVPID(VPID02) prima del prossimo ingresso in L2 */
+	/* vpid_track (parere #48 §5): campi host e TLB separati da lastcpu.
+	 * Le CPU sono memorizzate +1, 0 = nessuna. */
+	bool		vpid_track;	/* fissato alla creazione del vCPU nested */
+	int		vmcs01_host_cpu1;	/* CPU dei campi host del VMCS01 */
+	int		vpid02_lastcpu1;	/* CPU dove il TLB del VPID02 e' coerente */
 	bool		restart_only;	/* uscita L2 gia' riflessa: lo slow path
 					 * deve solo far ripartire vmx_run */
 	bool		synth;		/* uscita L2->L1 SINTETICA (nessuna uscita

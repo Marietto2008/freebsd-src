@@ -284,6 +284,10 @@ VPID_CTR(vmcs02_host_state_rewrites,
 VPID_CTR(vpid_flush_deferred, "richieste d'invalidazione differite del VPID01");
 VPID_CTR(vpid_flush_completed,
     "richieste differite del VPID01 eseguite da vmx_set_pcpu_defaults");
+VPID_CTR(vpid02_invvpid_real_migration,
+    "vpid_track: VPID02 invalidato perche' l'L2 entra su un'altra CPU");
+VPID_CTR(vpid02_invvpid_first,
+    "vpid_track: VPID02 invalidato al primo ingresso in L2 del vCPU");
 VPID_CTR(vpid02_invvpid_pending,
     "VPID02 invalidato da vmx_run per una richiesta pendente (VPID12 cambiato...)");
 
@@ -1400,6 +1404,11 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		vmxstate->lastcpu = NOCPU;
 		vmxstate->nocpu_why = VMX_NOCPU_DEFERRED;
 		atomic_add_long(&vpid_flush_deferred, 1);
+		/* vpid_track (D4): in L2 il VMCS corrente e' il VMCS02, e la
+		 * richiesta riguarda anche il VPID02 */
+		if (vcpu->nested != NULL && vcpu->nested->vpid_track &&
+		    vcpu->nested->in_l2)
+			vcpu->nested->vpid02_flush_pending = true;
 		return;
 	}
 
@@ -1475,7 +1484,7 @@ vmx_set_pcpu_defaults(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap)
 	else
 		atomic_add_long(&vpid01_invvpid_other, 1);
 	vmxstate->nocpu_why = VMX_NOCPU_INIT;
-	if (vcpu->nested != NULL && vcpu->nested->in_l2)
+	if (vcpu->vmcs != vcpu->vmcs01)		/* il VMCS corrente e' un VMCS02 */
 		atomic_add_long(&vmcs02_host_state_rewrites, 1);
 
 	vmxstate->lastcpu = curcpu;
@@ -1486,6 +1495,72 @@ vmx_set_pcpu_defaults(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap)
 	vmcs_write(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
 	vmcs_write(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
 	vmx_invvpid(vmx, vcpu, pmap, 1);
+}
+
+/* Campi host per-CPU del VMCS corrente */
+static void
+vmx_write_host_pcpu(void)
+{
+
+	vmcs_write(VMCS_HOST_TR_BASE, vmm_get_host_trbase());
+	vmcs_write(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
+	vmcs_write(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
+}
+
+/*
+ * vpid_track (parere #48 §5): al posto di vmx_set_pcpu_defaults all'inizio di
+ * vmx_run. In L1: il VPID01 come a monte (lastcpu), e i campi host del VMCS01
+ * secondo la CPU in cui sono stati scritti, non secondo lastcpu. In L2: i
+ * campi host del VMCS02 secondo la sua CPU, nessun INVVPID del VPID01 (in L2
+ * non gira), e il VPID02 invalidato se l'L2 entra su un'altra CPU o se c'e'
+ * una richiesta pendente.
+ */
+static void
+vmx_set_pcpu_defaults_track(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	int me = curcpu + 1;
+
+	if (!n->in_l2) {
+		vmx_set_pcpu_defaults(vmx, vcpu, pmap);
+		if (n->vmcs01_host_cpu1 != me) {
+			vmx_write_host_pcpu();
+			n->vmcs01_host_cpu1 = me;
+		}
+		return;
+	}
+	c = nested_current_cache(n);
+	if (c == NULL || c->host_cpu1 != me) {
+		vmx_write_host_pcpu();
+		if (c != NULL)
+			c->host_cpu1 = me;
+		atomic_add_long(&vmcs02_host_state_rewrites, 1);
+	}
+	if (n->vpid02_lastcpu1 != me || n->vpid02_flush_pending) {
+		if (n->vpid02_lastcpu1 != 0 && n->vpid02_lastcpu1 != me)
+			atomic_add_long(&vpid02_invvpid_real_migration, 1);
+		else if (n->vpid02_flush_pending)
+			atomic_add_long(&vpid02_invvpid_pending, 1);
+		else
+			atomic_add_long(&vpid02_invvpid_first, 1);
+		vmx_invvpid_vpid02(vcpu);
+		n->vpid02_lastcpu1 = me;
+	}
+}
+
+/*
+ * vpid_track: uscita L2->L1 dentro vmx_run, col VMCS01 corrente. Allinea il
+ * VPID01 sulla CPU corrente come farebbe vmx_set_pcpu_defaults all'inizio di
+ * vmx_run (il risparmio su pm_eptgen resta valido: vmx_pmap_activate gira prima
+ * del prossimo ingresso, su questa CPU e in questa sezione critica).
+ */
+void
+vmx_vpid01_resume(struct vmx_vcpu *vcpu)
+{
+
+	vmx_set_pcpu_defaults(vcpu->vmx, vcpu, vcpu->ctx.pmap);
+	vcpu->nested->vmcs01_host_cpu1 = curcpu + 1;
 }
 
 /*
@@ -3563,7 +3638,10 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	vmcs_write(VMCS_HOST_CR3, rcr3());
 
 	vmcs_write(VMCS_GUEST_RIP, rip);
-	vmx_set_pcpu_defaults(vmx, vcpu, pmap);
+	if (vcpu->nested != NULL && vcpu->nested->vpid_track)
+		vmx_set_pcpu_defaults_track(vmx, vcpu, pmap);
+	else
+		vmx_set_pcpu_defaults(vmx, vcpu, pmap);
 	/* audit VPID: da qui al ritorno l'uscita L2->L1 avviene dentro vmx_run */
 	if (vcpu->nested != NULL)
 		vcpu->nested->in_run = true;
