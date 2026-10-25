@@ -1,0 +1,9 @@
+# VPID/TLB dell'L2 (parere #48 §6): test di kvm-unit-tests che cambiano le traduzioni dell'L2 sugli
+# stessi indirizzi lineari (ac_test_run) e verificano che l'L0 non usi traduzioni stantie. Mai
+# eseguiti prima del 25/10/2026. Gli args e i qemu_params seguono x86/unittests.cfg (-pku).
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+vmx_pf_exception_test                       | vmx.flat | vmx_pf_exception_test                       | -cpu max,-pku | 1 | 1024 | 1800
+vmx_pf_no_vpid_test                         | vmx.flat | vmx_pf_no_vpid_test                         | -cpu max,-pku | 1 | 1024 | 1800
+vmx_pf_invvpid_test                         | vmx.flat | vmx_pf_invvpid_test                         | -cpu max,-pku | 1 | 1024 | 1800
+vmx_pf_vpid_test                            | vmx.flat | vmx_pf_vpid_test                            | -cpu max,-pku | 1 | 1024 | 1800
+invvpid_test                                | vmx.flat | invvpid_test                                | -cpu max | 1 | 1024 | 120

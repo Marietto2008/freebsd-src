@@ -1,0 +1,6 @@
+# Controllo per il parere #48: access_test SENZA nested (solo L1, VPID01). Sotto migrazione forzata
+# deve passare grazie alla regola lastcpu di vmx_set_pcpu_defaults; se fallisce, il difetto non e'
+# del nested. Due ripetizioni: l'ordine dei casi e' lo stesso, il punto delle migrazioni no.
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+access_1                                    | access_test.flat |  | -cpu max,-pku,host-phys-bits | 1 | 1024 | 1800
+access_2                                    | access_test.flat |  | -cpu max,-pku,host-phys-bits | 1 | 1024 | 1800
