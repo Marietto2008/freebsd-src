@@ -83,9 +83,13 @@ while IFS='|' read -r name file args qparams smp mem tmo; do
 	eval "$cmd" < /dev/null > "$ser.raw" 2> "$err"
 	rc=$?
 	awk -v keep="$KUT_FAIL_KEEP" '
-		/FAIL/ { nf++; if (nf <= keep) print; next }
-		{ print }
-		END { if (nf > keep) printf "[... %d righe FAIL ulteriori non stampate (limite %d) ...]\n", nf-keep, keep }
+		# Oltre il limite si tace il blocco d_errore (riga FAIL e il suo
+		# dump "Dump mapping" / "----L..."), contandolo; tutto il resto
+		# passa (SUMMARY, PASS, righe di avanzamento).
+		/FAIL/ { nf++; if (nf <= keep) { print; q=0 } else q=1; next }
+		q && (/^Dump mapping/ || /^-+L/ || /^-+[0-9]/ || /^$/) { next }
+		{ q=0; print }
+		END { if (nf > keep) printf "[... %d blocchi FAIL ulteriori non stampati (limite %d) ...]\n", nf-keep, keep }
 	' "$ser.raw" > "$ser"
 	: >| "$ser.raw"
 	set -e

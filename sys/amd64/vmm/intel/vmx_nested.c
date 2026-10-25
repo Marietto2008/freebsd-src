@@ -3943,6 +3943,22 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* un'uscita normale da L2 = l'ingresso e' riuscito: VMCS12 launched */
 	if ((vmcs_read(VMCS_EXIT_REASON) & 0x80000000) == 0)
 		vcpu->nested->launching = false;
+	/*
+	 * D4 (parere #51 §7): aggancio di prova, SPENTO per default. Qui il
+	 * vCPU e' in L2 (n->in_l2 vero) e siamo in sezione critica: si
+	 * registrano solo i flag (vmx_vpid_defer_request non esegue INVVPID).
+	 * Una volta ogni N uscite da L2 si inietta una richiesta differita come
+	 * se l'L1 avesse scritto CR3 col vCPU fermo; con migratore.sh la
+	 * richiesta nasce su una CPU e sara' soddisfatta su quella del prossimo
+	 * ingresso.
+	 */
+	if (__predict_false(nested_vpid_d4_arm != 0)) {
+		static u_int d4_n;
+		if ((++d4_n % (u_int)nested_vpid_d4_arm) == 0) {
+			vmx_vpid_defer_request(vcpu);
+			atomic_add_long(&nested_vpid_d4_injected, 1);
+		}
+	}
 
 	switch (reason) {
 	case EXIT_REASON_EXT_INTR:
@@ -4365,16 +4381,6 @@ vmx_nested_exit(void *vcpui)
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
 	if (vcpu->nested != NULL)
 		nested_stats_flush(vcpu);
-
-	/* D4 (parere #51 §7): aggancio di prova, vCPU frozen qui */
-	if (__predict_false(nested_vpid_d4_arm != 0) && vcpu->nested != NULL &&
-	    vcpu->nested->in_l2) {
-		static u_int d4_n;
-		if ((++d4_n % (u_int)nested_vpid_d4_arm) == 0) {
-			vmx_vpid_defer_request(vcpu);
-			atomic_add_long(&nested_vpid_d4_injected, 1);
-		}
-	}
 
 	/*
 	 * B1: generazione dei mapping di L0 cambiata -> tutte le radici shadow
