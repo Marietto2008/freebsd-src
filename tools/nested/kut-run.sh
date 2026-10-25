@@ -71,16 +71,32 @@ while IFS='|' read -r name file args qparams smp mem tmo; do
 	set +e
 	# </dev/null: con -serial stdio QEMU leggerebbe dalla lista stessa (lo
 	# stdin del ciclo), mangiando l'inizio della riga successiva.
-	eval "$cmd" < /dev/null > "$ser" 2> "$err"
+	# Limite diagnostico (parere #51 §10): un test gia' noto come FAIL puo'
+	# stampare centinaia di migliaia di righe (vmx_pf_vpid_test sul modulo
+	# difettoso: 79 MB, timeout). L'awk tiene per intero le prime
+	# KUT_FAIL_KEEP righe "FAIL", poi conta le altre senza stamparle; le righe
+	# non-FAIL passano tutte. Il log resta piccolo e il verdetto non cambia.
+	: "${KUT_FAIL_KEEP:=200}"
+	# /bin/sh non ha PIPESTATUS: QEMU scrive in un file grezzo, cosi' si
+	# cattura il SUO codice d'uscita; poi l'awk filtra nel log definitivo e
+	# il grezzo viene SVUOTATO (non cancellato: niente rm, regola dell'utente).
+	eval "$cmd" < /dev/null > "$ser.raw" 2> "$err"
 	rc=$?
+	awk -v keep="$KUT_FAIL_KEEP" '
+		/FAIL/ { nf++; if (nf <= keep) print; next }
+		{ print }
+		END { if (nf > keep) printf "[... %d righe FAIL ulteriori non stampate (limite %d) ...]\n", nf-keep, keep }
+	' "$ser.raw" > "$ser"
+	: >| "$ser.raw"
 	set -e
 	summary=$(grep '^SUMMARY:' "$ser" 2>/dev/null | tail -1 || true)
-	# rc=1 e' anche il codice di QEMU che fallisce PRIMA di avviare il guest
-	# (es. BIOS non trovato): PASS solo se il guest ha stampato il SUMMARY.
+	nfail=$(grep -c 'FAIL' "$ser" 2>/dev/null || echo 0)
+	# FAIL di CORRETTEZZA (traduzione errata) distinto dal TIMEOUT DIAGNOSTICO
+	# (raccolta non finita in tempo), anche quando coincidono (parere #51 §10).
 	case "$rc" in
 	1) if [ -n "$summary" ]; then verdict=PASS; else verdict="ERR(qemu,no-summary)"; fi;;
 	3) verdict=FAIL;;
-	124) verdict=TIMEOUT;;
+	124) if echo "$summary$nfail" | grep -q '[1-9]'; then verdict="FAIL(timeout-diag)"; else verdict=TIMEOUT; fi;;
 	*) verdict="ERR($rc)";;
 	esac
 	printf '  %-28s %s  %s\n' "$name" "$verdict" "$summary"

@@ -73,6 +73,8 @@ static int	nested_shadow_vmcs;
 static int	nested_vpid_track;
 static int	nested_vpid_test_off;
 static u_long	vpid02_off_vcpus;
+static int	nested_vpid_d4_arm;
+static u_long	nested_vpid_d4_injected;
 static void	nested_field_tab_build(void);
 static int	shv_global_init(void);
 static int	shvmcs_pull(struct vmx_vcpu *vcpu);
@@ -1568,6 +1570,22 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid_test_off, CTLFLAG_RWTUN,
     "senza VPID)");
 NESTED_CTR(vpid02_off_vcpus,
     "vpid_track: vCPU nested col VPID02 non unico, VMCS02 senza VPID");
+/*
+ * D4 (parere #51 §7), aggancio di prova, SPENTO per default: con
+ * nested_vpid_d4_arm = N, una entrata su N nello slow path nested (vCPU in L2,
+ * frozen) inietta una richiesta d'invalidazione differita del VPID02, come se
+ * l'L1 avesse scritto CR3 col vCPU fermo. Con migratore.sh che sposta il thread
+ * fra le CPU, la richiesta nasce su una CPU e deve essere soddisfatta sulla CPU
+ * del prossimo ingresso in L2: se il meccanismo fosse rotto, i test di
+ * contenuto (vmx_pf_vpid_test, vmx_vpid_ctx_test) vedrebbero traduzioni stantie.
+ */
+static int nested_vpid_d4_arm = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid_d4_arm, CTLFLAG_RWTUN,
+    &nested_vpid_d4_arm, 0,
+    "nested, prova D4: 1 richiesta differita del VPID02 ogni N entrate nello "
+    "slow path in L2 (0 = spento)");
+NESTED_CTR(nested_vpid_d4_injected,
+    "prova D4: richieste differite del VPID02 iniettate dall'aggancio");
 static int nested_vpid_track = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid_track, CTLFLAG_RWTUN,
     &nested_vpid_track, 0,
@@ -2527,6 +2545,8 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	vmwrite(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
 	vmwrite(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
 	vmwrite(VMCS_HOST_CR3, rcr3());
+	if (n->vpid_track && c->host_cpu1 != curcpu + 1)
+		atomic_add_long(&vmcs02_host_write_compose, 1);
 	c->host_cpu1 = curcpu + 1;		/* vpid_track */
 
 	/* controllo di sicurezza OBBLIGATORIO (unico chiamante, §3/§6.3) */
@@ -4345,6 +4365,16 @@ vmx_nested_exit(void *vcpui)
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
 	if (vcpu->nested != NULL)
 		nested_stats_flush(vcpu);
+
+	/* D4 (parere #51 §7): aggancio di prova, vCPU frozen qui */
+	if (__predict_false(nested_vpid_d4_arm != 0) && vcpu->nested != NULL &&
+	    vcpu->nested->in_l2) {
+		static u_int d4_n;
+		if ((++d4_n % (u_int)nested_vpid_d4_arm) == 0) {
+			vmx_vpid_defer_request(vcpu);
+			atomic_add_long(&nested_vpid_d4_injected, 1);
+		}
+	}
 
 	/*
 	 * B1: generazione dei mapping di L0 cambiata -> tutte le radici shadow

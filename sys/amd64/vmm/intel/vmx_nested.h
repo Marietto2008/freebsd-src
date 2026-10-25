@@ -110,6 +110,7 @@ void	vmx_shvmcs_run_end(struct vmx_vcpu *vcpu);
 /* vpid_track (vmx.c): VPID01 e campi host del VMCS01 sulla CPU corrente,
  * dall'uscita L2->L1 dentro vmx_run */
 void	vmx_vpid01_resume(struct vmx_vcpu *vcpu);
+void	vmx_vpid_defer_request(struct vmx_vcpu *vcpu);
 bool	vmx_vpid_is_unique(uint16_t vpid);
 /*
  * Richieste d'invalidazione del VPID02 (parere #49 §6), semantica dei
@@ -122,6 +123,7 @@ bool	vmx_vpid_is_unique(uint16_t vpid);
  */
 extern u_long vpid02_req, vpid02_req_coalesced, vpid02_req_satisfied,
     vpid02_req_dropped;
+extern u_long vmcs02_host_write_compose;
 extern u_long nested_sh_entry_after_fault;
 /* esiti di vmx_vept_fault */
 #define	VEPT_OK		0	/* shadow installata */

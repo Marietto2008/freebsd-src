@@ -288,6 +288,20 @@ VPID_CTR(vpid02_invvpid_real_migration,
     "vpid_track: VPID02 invalidato perche' l'L2 entra su un'altra CPU");
 VPID_CTR(vpid02_invvpid_first,
     "vpid_track: VPID02 invalidato al primo ingresso in L2 del vCPU");
+VPID_CTR(vmcs02_host_write_run,
+    "vpid_track: campi host del VMCS02 riscritti all'ingresso (vmx_run)");
+VPID_CTR(vmcs02_host_write_compose,
+    "vpid_track: campi host del VMCS02 scritti dal compose (nested_vmlaunch)");
+VPID_CTR(vpid02_off_vmcs_confirmed,
+    "ripiego: ingressi in L2 col bit Enable VPID letto a 0 nel VMCS02 hardware");
+VPID_CTR(vpid02_off_vmcs_bad,
+    "ripiego: ingressi in L2 col bit Enable VPID NON 0 nel VMCS02 (errore)");
+VPID_CTR(nested_entry_hw_attempt,
+    "vpid_track: tentativi di VM-entry hardware in L2");
+VPID_CTR(nested_entry_hw_fail,
+    "vpid_track: VM-entry hardware in L2 falliti (VMfail)");
+VPID_CTR(nested_entry_hw_fail_flushed,
+    "vpid_track: VM-entry hardware falliti con un flush VPID02 gia' eseguito prima");
 VPID_CTR(vpid02_req, "richieste d'invalidazione del VPID02 ricevute");
 VPID_CTR(vpid02_req_coalesced,
     "richieste del VPID02 accorpate a una gia' pendente");
@@ -1491,6 +1505,29 @@ vmx_vpid_is_unique(uint16_t vpid)
 	return (vpid > vm_maxcpu);
 }
 
+/*
+ * D4 (parere #51 §7): registra una richiesta d'invalidazione DIFFERITA, la
+ * stessa semantica del ramo running=0 di vmx_invvpid (CR3 scritto a vCPU
+ * fermo). Chiamabile dall'aggancio di prova nello slow path nested, col vCPU
+ * frozen: non esegue nessun INVVPID adesso, lo fara' vmx_run sulla CPU del
+ * prossimo ingresso. Non tocca i campi host.
+ */
+void
+vmx_vpid_defer_request(struct vmx_vcpu *vcpu)
+{
+	struct vmxstate *vmxstate = &vcpu->state;
+
+	atomic_add_long(&vpid_flush_deferred, 1);
+	if (vmxstate->lastcpu == NOCPU &&
+	    vmxstate->nocpu_why == VMX_NOCPU_DEFERRED)
+		atomic_add_long(&vpid_flush_coalesced, 1);
+	vmxstate->lastcpu = NOCPU;
+	vmxstate->nocpu_why = VMX_NOCPU_DEFERRED;
+	if (vcpu->nested != NULL && vcpu->nested->vpid_track &&
+	    vcpu->nested->in_l2)
+		nested_vpid02_request(vcpu->nested);
+}
+
 static void
 vmx_set_pcpu_defaults(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap)
 {
@@ -1563,14 +1600,23 @@ vmx_set_pcpu_defaults_track(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap)
 		if (c != NULL)
 			c->host_cpu1 = me;
 		atomic_add_long(&vmcs02_host_state_rewrites, 1);
+		atomic_add_long(&vmcs02_host_write_run, 1);
 	}
 	if (n->vpid02_lastcpu1 != me || n->vpid02_flush_pending) {
-		if (n->vpid02_lastcpu1 != 0 && n->vpid02_lastcpu1 != me)
-			atomic_add_long(&vpid02_invvpid_real_migration, 1);
-		else if (n->vpid02_flush_pending)
-			atomic_add_long(&vpid02_invvpid_pending, 1);
-		else
+		/*
+		 * Causa, per precedenza (parere #51 §4.1): primo uso del VPID02
+		 * (mai girato su una CPU), poi migrazione fisica vera (CPU
+		 * precedente valida e diversa), poi richiesta pendente sulla
+		 * stessa CPU. first_use e' distinto da real_migration anche se a
+		 * ogni VMXON/ingresso c'e' gia' una richiesta pendente: cosi' le
+		 * vere migrazioni non comprendono i primi usi.
+		 */
+		if (n->vpid02_lastcpu1 == 0)
 			atomic_add_long(&vpid02_invvpid_first, 1);
+		else if (n->vpid02_lastcpu1 != me)
+			atomic_add_long(&vpid02_invvpid_real_migration, 1);
+		else
+			atomic_add_long(&vpid02_invvpid_pending, 1);
 		vmx_invvpid_vpid02(vcpu);
 		n->vpid02_lastcpu1 = me;
 	}
@@ -3680,6 +3726,21 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		atomic_add_long(&vpid02_invvpid_pending, 1);
 	}
 	/*
+	 * Ripiego VPID02 (parere #51 §6): col VMCS02 corrente, si LEGGE dal
+	 * VMCS hardware il bit Enable VPID dei controlli secondari e si
+	 * conferma che sia 0. Letto dal VMCS vero, non dalla variabile
+	 * software. Una sola lettura per vmx_run, fuori dal loop d'ingresso.
+	 */
+	if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+	    vcpu->nested->vpid02_off) {
+		uint64_t p2 = vmcs_read(VMCS_SEC_PROC_BASED_CTLS);
+
+		if ((p2 & PROCBASED2_ENABLE_VPID) == 0)
+			atomic_add_long(&vpid02_off_vmcs_confirmed, 1);
+		else
+			atomic_add_long(&vpid02_off_vmcs_bad, 1);
+	}
+	/*
 	 * L2 con shadow EPT: invalida il TLB dell'EPTP shadow a ogni (ri)ingresso
 	 * via vm_run (INVEPT dell'L1, migrazione del vCPU, EPT12 cambiato). Le
 	 * voci shadow nuove non lo richiedono (una EPT violation invalida gia'
@@ -3993,7 +4054,22 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		}
 		if (vcpu->nested != NULL && __predict_false(vcpu->nested->sh_fault))
 			atomic_add_long(&nested_sh_entry_after_fault, 1);
+		if (vcpu->nested != NULL && vcpu->nested->in_l2)
+			atomic_add_long(&nested_entry_hw_attempt, 1);
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
+		/*
+		 * VM-entry hardware fallito in L2 (parere #51 §9, caso B): rc
+		 * diverso da VMX_GUEST_VMEXIT. Il flush del VPID02 lo fa
+		 * vmx_set_pcpu_defaults_track PRIMA del loop, quindi qui, se una
+		 * richiesta era pendente, e' gia' stato eseguito: lo si registra.
+		 * Non si marca nulla come soddisfatto adesso.
+		 */
+		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+		    rc != VMX_GUEST_VMEXIT) {
+			atomic_add_long(&nested_entry_hw_fail, 1);
+			if (vcpu->nested->vpid02_lastcpu1 == curcpu + 1)
+				atomic_add_long(&nested_entry_hw_fail_flushed, 1);
+		}
 		/* nested: TSC al momento dell'uscita, per IA32_TSC nella lista
 		 * "store all'uscita" (SDM: valore all'uscita, non alla
 		 * riflessione; rdtsc_vmexit_diff_test tollera 750 cicli) */
