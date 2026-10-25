@@ -97,7 +97,13 @@ struct vmxstate {
 	uint64_t nextrip;	/* next instruction to be executed by guest */
 	int	lastcpu;	/* host cpu that this 'vcpu' last ran on */
 	uint16_t vpid;
+	uint8_t	nocpu_why;	/* perche' lastcpu e' NOCPU (VMX_NOCPU_*), solo contatori */
 };
+
+/* Origine di lastcpu = NOCPU (parere #48 §5.3: ogni INVVPID del VPID01 contato per causa) */
+#define	VMX_NOCPU_INIT		0	/* vCPU nuovo */
+#define	VMX_NOCPU_DEFERRED	1	/* vmx_invvpid(running=0): invalidazione differita */
+#define	VMX_NOCPU_NESTED_ENTRY	2	/* nested_vmlaunch: riscrittura dei campi host del VMCS02 */
 
 struct apic_page {
 	uint32_t reg[PAGE_SIZE / 4];

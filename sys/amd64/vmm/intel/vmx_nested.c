@@ -1493,6 +1493,25 @@ static int nested_shadow_verify = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_shadow_verify, CTLFLAG_RWTUN,
     &nested_shadow_verify, 0,
     "nested: shadow VMCS, rilettura e confronto dopo ogni copia (diagnostica)");
+/*
+ * Audit VPID (parere #48 §5.3), solo contatori: il comportamento non cambia.
+ * vpid02_vpid12_change: ingressi in L2 con un VPID12 diverso dal precedente,
+ * oggi SENZA invalidazione del VPID02 condiviso (difetto D1); vpid02_invvpid_*:
+ * le due invalidazioni del VPID02 che esistono oggi, entrambe sulla sola CPU
+ * corrente (D2); vpid01_slowpath_claim: uscite L2->L1 riflesse dallo slow path
+ * su una CPU diversa da lastcpu, dove lastcpu = curcpu dichiara coerente un
+ * VPID01 mai invalidato su quella CPU (D3).
+ */
+NESTED_CTR(vpid02_vpid12_change,
+    "VPID: ingressi in L2 con VPID12 cambiato (VPID02 condiviso non invalidato)");
+NESTED_CTR(vpid02_invvpid_l1insn,
+    "VPID: INVVPID(VPID02) per un INVVPID dell'L1 (solo sulla CPU corrente)");
+NESTED_CTR(vpid02_invvpid_novpid12,
+    "VPID: INVVPID(VPID02) all'uscita da un VMCS12 senza VPID (CPU corrente)");
+NESTED_CTR(vpid02_invvpid_novpid12_slow,
+    "VPID: di cui con l'uscita riflessa dallo slow path");
+NESTED_CTR(vpid01_slowpath_claim,
+    "VPID: uscite L2->L1 dallo slow path con lastcpu != curcpu (VPID01 non invalidato)");
 NESTED_CTR(nested_sh_push, "nested shadow: copie VMCS12 -> shadow");
 NESTED_CTR(nested_sh_push_fields, "nested shadow: campi copiati verso lo shadow");
 NESTED_CTR(nested_sh_push_tsc, "nested shadow: cicli TSC delle copie verso lo shadow");
@@ -2513,7 +2532,18 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	 * istantaneo della macchina (kvm-unit-tests F2a). lastcpu vale per
 	 * VMCS: NOCPU forza la riscrittura nel VMCS02 al prossimo vmx_run.
 	 */
+	if (vcpu->state.lastcpu != NOCPU)	/* non coprire una richiesta differita */
+		vcpu->state.nocpu_why = VMX_NOCPU_NESTED_ENTRY;
 	vcpu->state.lastcpu = NOCPU;
+	/* audit VPID (D1): cambio di VPID12 sul VPID02 condiviso */
+	if (vmcs12_proc2(c) & PROCBASED2_ENABLE_VPID) {
+		uint16_t v12 = vmcs12_read_field(c, VMCS_VPID) & 0xffff;
+
+		if (n->last_vpid12_ok && v12 != n->last_vpid12)
+			atomic_add_long(&vpid02_vpid12_change, 1);
+		n->last_vpid12 = v12;
+		n->last_vpid12_ok = true;
+	}
 	n->in_l2 = true;
 	/* launched solo se l'ingresso RIESCE (SDM): un VM-entry fallito lascia
 	 * il VMCS clear. Si segna ora e si annulla nella riflessione se il
@@ -2804,6 +2834,9 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		bzero(&d, sizeof(d));
 		d.vpid = n->vpid2;
 		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
+		atomic_add_long(&vpid02_invvpid_novpid12, 1);
+		if (!n->in_run)
+			atomic_add_long(&vpid02_invvpid_novpid12_slow, 1);
 	}
 	/* Lista "salva all'uscita": MSR dell'L2, col VMCS02 ancora corrente
 	 * (EFER, SYSENTER...). Non su un VM-entry fallito (SDM 27.8). */
@@ -2820,6 +2853,8 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmcs_write(VMCS_HOST_TR_BASE, vmm_get_host_trbase());
 	vmcs_write(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
 	vmcs_write(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
+	if (!n->in_run && vcpu->state.lastcpu != curcpu)
+		atomic_add_long(&vpid01_slowpath_claim, 1);	/* audit VPID, D3 */
 	vcpu->state.lastcpu = curcpu;
 
 	/* 6. Loading Host State: host di VMCS12 -> guest di VMCS01 */
@@ -3989,6 +4024,7 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 	bzero(&d, sizeof(d));
 	d.vpid = n->vpid2;
 	invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
+	atomic_add_long(&vpid02_invvpid_l1insn, 1);
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 	nested_advance_rip(vcpu);
 	return (0);

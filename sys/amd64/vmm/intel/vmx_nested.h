@@ -350,6 +350,12 @@ struct vmx_nested {
 	uint64_t	*vept_root;	/* radice shadow EPT (T2.7), NULL se assente */
 	uint64_t	vept_eptp12;	/* EPTP12 che la shadow rispecchia */
 	uint16_t	vpid2;		/* VPID distinto per L2 (T2.8) */
+	/* audit VPID (parere #48): ultimo VPID12 entrato, e se l'uscita L2->L1
+	 * avviene dentro vmx_run (sezione critica sulla CPU del prossimo
+	 * ingresso) o nello slow path */
+	uint16_t	last_vpid12;
+	bool		last_vpid12_ok;
+	bool		in_run;
 	bool		restart_only;	/* uscita L2 gia' riflessa: lo slow path
 					 * deve solo far ripartire vmx_run */
 	bool		synth;		/* uscita L2->L1 SINTETICA (nessuna uscita

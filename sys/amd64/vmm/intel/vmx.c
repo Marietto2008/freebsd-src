@@ -262,6 +262,29 @@ static u_int vpid_alloc_failed;
 SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, vpid_alloc_failed, CTLFLAG_RD,
 	    &vpid_alloc_failed, 0, NULL);
 
+/*
+ * Audit VPID (parere #48 §5.3): ogni invalidazione del VPID01 decisa da
+ * vmx_set_pcpu_defaults, contata per causa. Solo contatori: il comportamento
+ * resta quello di prima. I contatori del VPID02 sono in vmx_nested.c.
+ */
+#define	VPID_CTR(name, descr)						\
+	u_long name;							\
+	SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, name, CTLFLAG_RD, &name, 0, descr)
+VPID_CTR(vpid01_invvpid_real_migration,
+    "VPID01 invalidato perche' il vCPU ha cambiato CPU davvero");
+VPID_CTR(vpid01_invvpid_pending,
+    "VPID01 invalidato per una richiesta differita (vmx_invvpid running=0)");
+VPID_CTR(vpid01_invvpid_nested_entry,
+    "VPID01 invalidato per il NOCPU di nested_vmlaunch (falsa migrazione)");
+VPID_CTR(vpid01_invvpid_other, "VPID01 invalidato al primo vmx_run del vCPU");
+VPID_CTR(vpid_invvpid_saved_eptgen,
+    "INVVPID risparmiati perche' segue un INVEPT (pm_eptgen cambiato)");
+VPID_CTR(vmcs02_host_state_rewrites,
+    "campi host per-CPU riscritti da vmx_set_pcpu_defaults nel VMCS02");
+VPID_CTR(vpid_flush_deferred, "richieste d'invalidazione differite del VPID01");
+VPID_CTR(vpid_flush_completed,
+    "richieste differite del VPID01 eseguite da vmx_set_pcpu_defaults");
+
 /* Debug counters for trap 30 investigation */
 static int vmx_dbg_last_inject_vec = -1;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, dbg_last_inject_vec, CTLFLAG_RD,
@@ -1373,6 +1396,8 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		 * vpid the next time it runs via vmx_set_pcpu_defaults().
 		 */
 		vmxstate->lastcpu = NOCPU;
+		vmxstate->nocpu_why = VMX_NOCPU_DEFERRED;
+		atomic_add_long(&vpid_flush_deferred, 1);
 		return;
 	}
 
@@ -1409,6 +1434,7 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		 * 'vmx->eptp' for all vpids.
 		 */
 		vmm_stat_incr(vcpu->vcpu, VCPU_INVVPID_SAVED, 1);
+		atomic_add_long(&vpid_invvpid_saved_eptgen, 1);
 	}
 }
 
@@ -1420,6 +1446,20 @@ vmx_set_pcpu_defaults(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap)
 	vmxstate = &vcpu->state;
 	if (vmxstate->lastcpu == curcpu)
 		return;
+
+	/* Audit VPID (parere #48): la causa di questa invalidazione del VPID01 */
+	if (vmxstate->lastcpu != NOCPU)
+		atomic_add_long(&vpid01_invvpid_real_migration, 1);
+	else if (vmxstate->nocpu_why == VMX_NOCPU_DEFERRED) {
+		atomic_add_long(&vpid01_invvpid_pending, 1);
+		atomic_add_long(&vpid_flush_completed, 1);
+	} else if (vmxstate->nocpu_why == VMX_NOCPU_NESTED_ENTRY)
+		atomic_add_long(&vpid01_invvpid_nested_entry, 1);
+	else
+		atomic_add_long(&vpid01_invvpid_other, 1);
+	vmxstate->nocpu_why = VMX_NOCPU_INIT;
+	if (vcpu->nested != NULL && vcpu->nested->in_l2)
+		atomic_add_long(&vmcs02_host_state_rewrites, 1);
 
 	vmxstate->lastcpu = curcpu;
 
@@ -3507,6 +3547,9 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 
 	vmcs_write(VMCS_GUEST_RIP, rip);
 	vmx_set_pcpu_defaults(vmx, vcpu, pmap);
+	/* audit VPID: da qui al ritorno l'uscita L2->L1 avviene dentro vmx_run */
+	if (vcpu->nested != NULL)
+		vcpu->nested->in_run = true;
 	/*
 	 * L2 con shadow EPT: invalida il TLB dell'EPTP shadow a ogni (ri)ingresso
 	 * via vm_run (INVEPT dell'L1, migrazione del vCPU, EPT12 cambiato). Le
@@ -3940,6 +3983,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	/* Il VMCS CORRENTE: col nested puo' non essere piu' quello caricato
 	 * all'inizio di vmx_run (riflessione L2 -> L1 lo cambia). */
 	VMCLEAR(vcpu->vmcs);
+	if (vcpu->nested != NULL)
+		vcpu->nested->in_run = false;
 	vmx_msr_guest_exit(vcpu);
 
 	return (0);
