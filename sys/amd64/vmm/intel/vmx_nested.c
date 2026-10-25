@@ -1553,7 +1553,8 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid12_flush, CTLFLAG_RWTUN,
  * il VPID02 invalidato sulle migrazioni vere, al cambio di VPID12 (D1), dopo un
  * INVVPID dell'L1 eseguito su un'altra CPU (D2) e per le richieste differite
  * (D4); dallo slow path non si dichiara piu' coerente il VPID01 (D3).
- * Spento se il VPID02 e' 0 o coincide col VPID01 (allocazione di riserva, D5).
+ * Con un VPID02 non unico (D5) il VMCS02 si compone senza VPID (vpid02_off,
+ * parere #49 §5): vedi vmx_nested_init.
  */
 /*
  * Prova del ripiego (parere #49 §5): con nested_vpid_test_off=1 i vCPU nested
