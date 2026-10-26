@@ -463,8 +463,26 @@ struct nested_diag58_rec {
 	uint64_t	gpa;		/* GUEST_PHYSICAL_ADDRESS (valido per EPT viol/misconf) */
 	uint64_t	gla;		/* GUEST_LINEAR_ADDRESS */
 	uint64_t	ept02_leaf;	/* foglia EPT02 per gpa, dalla radice del VMCS02 */
+	uint64_t	prim_ctls;	/* parere #60 §8: primary proc-based ctls */
+	uint64_t	ept02_probe;	/* foglia EPT02 per la GPA fissa nested_diag58_gpa */
 };
 SDT_PROBE_DEFINE1(vmm, vmx, nested, diag58, "struct nested_diag58_rec *");
+
+/* Parere #60 §8: fotografia al VM-ENTRY (prima di vmx_enter_guest), con lo
+ * stesso ID progressivo dell'uscita e dell'INVEPT fisico. Chiude l'ambiguita'
+ * "foglia letta in istanti diversi": qui la si legge all'ingresso. */
+struct nested_diag58_ent {
+	uint32_t	seq;
+	uint16_t	cpu;
+	uint16_t	vcpu;
+	uint64_t	prim_ctls;	/* bit 31 = activate secondary */
+	uint64_t	sec_ctls;
+	uint64_t	eptp;
+	uint64_t	vpid;
+	uint64_t	grip;
+	uint64_t	ept02_probe;	/* foglia EPT02 per nested_diag58_gpa all'ingresso */
+};
+SDT_PROBE_DEFINE1(vmm, vmx, nested, diag58ent, "struct nested_diag58_ent *");
 
 /* Record minimale dell'INVEPT fisico (prologo di vmx_run). L'esito non serve
  * come campo: invept() panica in caso di fallimento, quindi un INVEPT che
@@ -484,6 +502,12 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag58, CTLFLAG_RWTUN,
     "diag58 (parere #58): traccia SOLO lettura degli exit L2 e dell'INVEPT "
     "fisico via sonde SDT. 0 = spento (nessun costo). Nessun cambio di "
     "comportamento del nested.");
+
+static u_long nested_diag58_gpa = 0;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_diag58_gpa, CTLFLAG_RWTUN,
+    &nested_diag58_gpa, 0,
+    "diag58 (parere #60 §8): GPA L2 fissa di cui fotografare la foglia EPT02 "
+    "all'ingresso e all'uscita (0 = non fotografata).");
 
 /*
  * Use the last page below 4GB as the APIC access address. This address is
@@ -3876,7 +3900,7 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			if (__predict_false(nested_diag58)) {
 				struct nested_diag58_inv iv;
 
-				iv.seq = ++n->diag58_seq;
+				iv.seq = n->diag58_seq;	/* stesso ID dell'ingresso */
 				iv.cpu = (uint16_t)curcpu;
 				iv.vcpu = (uint16_t)vcpu->vcpuid;
 				iv.ep4ta = ed.eptp;
@@ -4163,6 +4187,29 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			atomic_add_long(&nested_sh_entry_after_fault, 1);
 		if (vcpu->nested != NULL && vcpu->nested->in_l2)
 			atomic_add_long(&nested_entry_hw_attempt, 1);
+		/*
+		 * Parere #60 §8: fotografia al VM-ENTRY, PRIMA di entrare in L2.
+		 * Stesso ID progressivo che poi comparira' su exit e INVEPT. Legge
+		 * i primary controls (bit 31 = activate secondary) e la foglia EPT02
+		 * della GPA fissa all'ingresso. SOLO lettura.
+		 */
+		if (__predict_false(nested_diag58) && vcpu->nested != NULL &&
+		    vcpu->nested->in_l2) {
+			struct nested_diag58_ent e;
+
+			e.seq = ++vcpu->nested->diag58_seq;
+			e.cpu = (uint16_t)curcpu;
+			e.vcpu = (uint16_t)vcpu->vcpuid;
+			e.prim_ctls = vmcs_read(VMCS_PRI_PROC_BASED_CTLS);
+			e.sec_ctls = vmcs_read(VMCS_SEC_PROC_BASED_CTLS);
+			e.eptp = vmcs_read(VMCS_EPTP);
+			e.vpid = vmcs_read(VMCS_VPID);
+			e.grip = vmcs_read(VMCS_GUEST_RIP);
+			e.ept02_probe = (nested_diag58_gpa != 0 &&
+			    vcpu->nested->vept_root != NULL) ?
+			    vmx_vept_shadow_entry(vcpu, nested_diag58_gpa) : 0;
+			SDT_PROBE1(vmm, vmx, nested, diag58ent, &e);
+		}
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
 		/*
 		 * VM-entry hardware fallito in L2 (parere #51 §9, caso B): rc
@@ -4216,7 +4263,7 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		if (__predict_false(nested_diag58) && vcpu->nested != NULL) {
 			struct nested_diag58_rec r;
 
-			r.seq = ++vcpu->nested->diag58_seq;
+			r.seq = vcpu->nested->diag58_seq;	/* stesso ID dell'ingresso */
 			r.cpu = (uint16_t)curcpu;
 			r.vcpu = (uint16_t)vcpu->vcpuid;
 			r.reason = exit_reason & 0xffff;
@@ -4237,6 +4284,10 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			r.ept02_leaf = (vcpu->nested->in_l2 &&
 			    vcpu->nested->vept_root != NULL) ?
 			    vmx_vept_shadow_entry(vcpu, r.gpa) : 0;
+			r.prim_ctls = vmcs_read(VMCS_PRI_PROC_BASED_CTLS);
+			r.ept02_probe = (nested_diag58_gpa != 0 &&
+			    vcpu->nested->in_l2 && vcpu->nested->vept_root != NULL) ?
+			    vmx_vept_shadow_entry(vcpu, nested_diag58_gpa) : 0;
 			SDT_PROBE1(vmm, vmx, nested, diag58, &r);
 		}
 
