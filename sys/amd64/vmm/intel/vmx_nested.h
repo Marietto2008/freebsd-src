@@ -190,6 +190,8 @@ void	vept_stats_flush(struct vmx_nested *n);	/* da nested_stats_flush */
 bool	vmx_vept_keep_enabled(void);		/* hw.vmm.vmx.vept_keep */
 void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
 int	vmx_vept_cur_slot(struct vmx_nested *n);	/* parere #53 §8: slot corrente o -1 */
+void	vmx_vept_root_touch(struct vmx_nested *n, int i);	/* parere #55: epoch++ */
+void	vmx_vept_root_new_identity(struct vmx_nested *n, int i);
 bool	vmx_vept_memgen_stale(struct vmx_vcpu *vcpu);	/* non dorme */
 void	vmx_vept_hw_flushed(struct vmx_vcpu *vcpu);	/* dopo l'INVEPT hw */
 void	vmx_vept_enter_check(struct vmx_vcpu *vcpu);	/* prima dell'ingresso */
@@ -517,6 +519,22 @@ struct vmx_nested {
 	 */
 	uint8_t		vept_flush_cause;
 	uint8_t		vept_invept_cpu1[VEPT_NROOTS];
+	/*
+	 * Progetto elisione INVEPT (parere #55), SOLO metadati + simulazione
+	 * (nested_invept_opt=1); l'INVEPT hardware resta incondizionato. In coda
+	 * per non spostare gli offset precedenti.
+	 *  identity: contatore UNICO del vCPU, assegnato a ogni nuova istanza di
+	 *    radice (prima allocazione e svuotamento); 0 = slot mai composto.
+	 *  vept_identity[i]/vept_epoch[i]: per slot. vept_epoch avanza a ogni
+	 *    riduzione in posto (vept_root_touch); lo svuotamento da' nuova identity.
+	 *  ept_cpu_id/epoch[cpu]: ultima radice resa coerente su quella CPU (una
+	 *    sola ricordata per CPU, parere #55 §4); id 0 = CPU mai valida.
+	 */
+	uint64_t	next_root_identity;
+	uint64_t	vept_identity[VEPT_NROOTS];
+	uint64_t	vept_epoch[VEPT_NROOTS];
+	uint64_t	ept_cpu_id[MAXCPU];
+	uint64_t	ept_cpu_epoch[MAXCPU];
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 

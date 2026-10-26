@@ -165,6 +165,7 @@ VEPT_CTR(vept_invept_all, "nested: INVEPT all-context dell'L1");
 VEPT_CTR(vept_invept_roots_matched, "nested: radici colpite da un INVEPT");
 VEPT_CTR(vept_invept_roots_kept, "nested: radici colpite e conservate (B1)");
 VEPT_CTR(vept_invept_roots_fallback, "nested: radici colpite e svuotate");
+extern u_long nested_invept_root_reused, nested_invept_epoch_advanced;	/* def in vmx.c (sysctl) */
 VEPT_CTR(vept_invept_roots_unmatched, "nested: radici esistenti non colpite");
 VEPT_CTR(vept_shadow_pages_high, "nested: massimo di vept_shadow_pages");
 
@@ -762,6 +763,7 @@ vept_walk_changed(struct vept_obs *o, struct vept_obs_ent *e, int idx,
 	if (z != 0) {
 		n->vept_flush_pending = true;
 		n->vept_flush_cause |= 2;	/* voci EPT12 cambiate (B1) */
+		vmx_vept_root_touch(n, o->slot);
 	}
 	e->snap[idx] = val;
 	atomic_add_long(&vept_keep_walk_zaps, 1);
@@ -1451,6 +1453,7 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	if (inval != 0) {
 		n->vept_flush_pending = true;
 		n->vept_flush_cause |= 1;	/* INVEPT di L1 */
+		vmx_vept_root_touch(n, i);
 	}
 
 	/* 4. fotografie: solo le voci cambiate, dopo le invalidazioni */
@@ -1547,9 +1550,10 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 			if (pick == NULL || s->used < pick->used)
 				pick = s;
 		}
-		if (pick->root == NULL)
+		if (pick->root == NULL) {
 			pick->root = vept_page_alloc();
-		else {
+			vmx_vept_root_new_identity(n, pick - n->vept_slot);
+		} else {
 			atomic_add_long(&vept_leaves_zapped_lru,
 			    n->vept_ks[pick - n->vept_slot].leaves);
 			vept_root_wipe(n, pick - n->vept_slot);
@@ -1611,6 +1615,7 @@ vept_root_wipe(struct vmx_nested *n, int i)
 	n->vept_ks[i].wipe_now = false;
 	n->vept_ks[i].vs_n = 0;		/* reservoir della verifica */
 	n->vept_ks[i].vs_start = 0;
+	vmx_vept_root_new_identity(n, i);	/* parere #55: istanza nuova */
 }
 
 /*
@@ -2021,6 +2026,25 @@ vmx_vept_cur_slot(struct vmx_nested *n)
 		if (n->vept_slot[i].root == n->vept_root)
 			return (i);
 	return (-1);
+}
+
+/* parere #55: nuova identita' di radice (prima allocazione o svuotamento),
+ * da un contatore UNICO del vCPU; 0 non viene mai assegnato (sentinella). */
+void
+vmx_vept_root_new_identity(struct vmx_nested *n, int i)
+{
+	n->vept_identity[i] = ++n->next_root_identity;
+	n->vept_epoch[i] = 0;
+	atomic_add_long(&nested_invept_root_reused, 1);
+}
+
+/* parere #55: la radice i e' stata ridotta in posto -> avanza l'epoch, cosi'
+ * ogni CPU la invalida al prossimo ingresso. */
+void
+vmx_vept_root_touch(struct vmx_nested *n, int i)
+{
+	n->vept_epoch[i]++;
+	atomic_add_long(&nested_invept_epoch_advanced, 1);
 }
 
 /* vmx_run ha appena fatto INVEPT dell'EPTP shadow su questa CPU. */

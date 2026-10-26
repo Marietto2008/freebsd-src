@@ -316,6 +316,43 @@ VPID_CTR(nested_invept_first_use, "INVEPT shadow al primo uso di una radice su u
 VPID_CTR(nested_invept_unclassified,
     "INVEPT shadow senza causa nota: candidati all'elisione (stessa CPU, stessa radice, nessun flush)");
 VPID_CTR(nested_invept_tsc, "cicli TSC spesi negli INVEPT shadow a ogni ingresso");
+/* Progetto elisione INVEPT (parere #55), modo 1 (simulazione): la funzione
+ * decisionale e' UNA e verra' usata anche dal modo 2. Qui l'INVEPT hardware
+ * resta incondizionato; questi contano cosa l'elisione DECIDEREBBE. */
+VPID_CTR(nested_invept_would_flush, "elisione (sim): INVEPT che sarebbero stati eseguiti");
+VPID_CTR(nested_invept_would_skip, "elisione (sim): INVEPT che sarebbero stati SALTATI");
+VPID_CTR(nested_invept_reason_first_use, "sim: flush per prima radice vista dalla CPU");
+VPID_CTR(nested_invept_reason_identity, "sim: flush per identita' di radice diversa");
+VPID_CTR(nested_invept_reason_epoch, "sim: flush per epoch della radice avanzato");
+VPID_CTR(nested_invept_reason_conservative, "sim: flush conservativo (radice con foglia nokeep)");
+VPID_CTR(nested_invept_root_reused, "parere #55: nuove identita' di radice assegnate");
+VPID_CTR(nested_invept_epoch_advanced, "parere #55: epoch di radice avanzati (riduzioni in posto)");
+
+static int nested_invept_opt = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_invept_opt, CTLFLAG_RWTUN,
+    &nested_invept_opt, 0,
+    "nested: elisione INVEPT shadow. 0 = incondizionato (oggi); 1 = simula la "
+    "decisione ma esegue COMUNQUE l'INVEPT (diagnostica). Il modo 2 (elisione "
+    "reale) non e' implementato.");
+
+/*
+ * Funzione decisionale UNICA dell'elisione INVEPT (parere #55): true se la
+ * radice dello slot va invalidata su questa CPU. La usa il modo 1
+ * (simulazione) e la usera' il modo 2 (elisione reale). reason: 1 primo uso,
+ * 2 identita' diversa, 3 epoch avanzato, 4 conservativo (radice con nokeep),
+ * 0 nessuna radice corrente.
+ */
+static bool
+nested_invept_need_flush(struct vmx_nested *n, int slot, int cpu, int *reason)
+{
+	if (slot < 0) { *reason = 0; return (true); }
+	if (n->ept_cpu_id[cpu] == 0) { *reason = 1; return (true); }
+	if (n->ept_cpu_id[cpu] != n->vept_identity[slot]) { *reason = 2; return (true); }
+	if (n->ept_cpu_epoch[cpu] != n->vept_epoch[slot]) { *reason = 3; return (true); }
+	if (n->vept_ks[slot].nokeep) { *reason = 4; return (true); }
+	*reason = -1;
+	return (false);
+}
 VPID_CTR(vpid02_req, "richieste d'invalidazione del VPID02 ricevute");
 VPID_CTR(vpid02_req_coalesced,
     "richieste del VPID02 accorpate a una gia' pendente");
@@ -3819,6 +3856,32 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			n->vept_flush_cause = 0;
 			if (slot >= 0)
 				n->vept_invept_cpu1[slot] = me;
+			/*
+			 * Progetto elisione (parere #55), modo 1: calcola la
+			 * decisione VERA (la stessa funzione del futuro modo 2) e
+			 * conta cosa l'elisione farebbe, ma esegue COMUNQUE
+			 * l'INVEPT. Lo stato per-CPU evolve come nel modo 2.
+			 */
+			if (nested_invept_opt == 1) {
+				int reason;
+				bool wf = nested_invept_need_flush(n, slot,
+				    curcpu, &reason);
+
+				if (wf) {
+					atomic_add_long(&nested_invept_would_flush, 1);
+					switch (reason) {
+					case 1: atomic_add_long(&nested_invept_reason_first_use, 1); break;
+					case 2: atomic_add_long(&nested_invept_reason_identity, 1); break;
+					case 3: atomic_add_long(&nested_invept_reason_epoch, 1); break;
+					case 4: atomic_add_long(&nested_invept_reason_conservative, 1); break;
+					}
+					if (slot >= 0) {
+						n->ept_cpu_id[curcpu] = n->vept_identity[slot];
+						n->ept_cpu_epoch[curcpu] = n->vept_epoch[slot];
+					}
+				} else
+					atomic_add_long(&nested_invept_would_skip, 1);
+			}
 			t0 = rdtsc();
 			invept(INVEPT_TYPE_SINGLE_CONTEXT, ed);
 			atomic_add_long(&nested_invept_tsc, rdtsc() - t0);
