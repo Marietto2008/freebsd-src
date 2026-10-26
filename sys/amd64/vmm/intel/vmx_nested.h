@@ -517,6 +517,12 @@ struct vmx_nested {
 	 */
 	uint8_t		vept_flush_cause;
 	uint8_t		vept_invept_cpu1[VEPT_NROOTS];
+	/*
+	 * Parere #58 §4: gancio diagnostico SOLO lettura, in coda per non
+	 * spostare gli offset DTrace precedenti. Progressivo per-vCPU degli
+	 * eventi diag58 (exit L2 e INVEPT fisico). Non cambia il comportamento.
+	 */
+	uint32_t	diag58_seq;
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 

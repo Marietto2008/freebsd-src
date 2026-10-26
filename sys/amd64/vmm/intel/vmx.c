@@ -437,6 +437,55 @@ SDT_PROBE_DEFINE4(vmm, vmx, exit, return,
     "struct vmx *", "int", "struct vm_exit *", "int");
 
 /*
+ * Parere #58 §4: gancio diagnostico SOLO lettura. Fotografa, subito dopo il
+ * ritorno hardware di vmx_enter_guest e prima del dispatch, i campi del VMCS02
+ * effettivamente caricato e la foglia EPT02 della GPA dell'uscita. Nessun
+ * cambiamento di comportamento: nessun INVEPT/flush, nessuna modifica di
+ * EPT/VPID/controls, nessuna dereferenza arbitraria (vmx_vept_shadow_entry
+ * cammina solo la radice shadow del vCPU corrente, non liberabile qui). Spento
+ * di default (nested_diag58=0); i dati escono via sonda SDT, non via printf.
+ */
+struct nested_diag58_rec {
+	uint32_t	seq;		/* progressivo per-vCPU */
+	uint16_t	cpu;		/* CPU fisica */
+	uint16_t	vcpu;		/* identificativo vCPU */
+	uint32_t	reason;		/* exit reason grezzo (basic) */
+	uint32_t	in_l2;		/* 1 se l'uscita e' da L2 */
+	uint64_t	eptp;		/* VMCS02.EPT_POINTER effettivo */
+	uint64_t	sec_ctls;	/* secondary exec controls (EPT attivo?) */
+	uint64_t	vpid;		/* VPID fisico attivo */
+	uint64_t	gcr3;
+	uint64_t	gcr0;
+	uint64_t	gcr4;
+	uint64_t	gefer;
+	uint64_t	grip;
+	uint64_t	qual;		/* exit qualification */
+	uint64_t	gpa;		/* GUEST_PHYSICAL_ADDRESS (valido per EPT viol/misconf) */
+	uint64_t	gla;		/* GUEST_LINEAR_ADDRESS */
+	uint64_t	ept02_leaf;	/* foglia EPT02 per gpa, dalla radice del VMCS02 */
+};
+SDT_PROBE_DEFINE1(vmm, vmx, nested, diag58, "struct nested_diag58_rec *");
+
+/* Record minimale dell'INVEPT fisico (prologo di vmx_run). L'esito non serve
+ * come campo: invept() panica in caso di fallimento, quindi un INVEPT che
+ * ritorna e' per costruzione riuscito. */
+struct nested_diag58_inv {
+	uint32_t	seq;
+	uint16_t	cpu;
+	uint16_t	vcpu;
+	uint64_t	ep4ta;		/* operando EPTP dell'INVEPT */
+	uint64_t	type;		/* tipo INVEPT (single-context) */
+};
+SDT_PROBE_DEFINE1(vmm, vmx, nested, diag58inv, "struct nested_diag58_inv *");
+
+static int nested_diag58 = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag58, CTLFLAG_RWTUN,
+    &nested_diag58, 0,
+    "diag58 (parere #58): traccia SOLO lettura degli exit L2 e dell'INVEPT "
+    "fisico via sonde SDT. 0 = spento (nessun costo). Nessun cambio di "
+    "comportamento del nested.");
+
+/*
  * Use the last page below 4GB as the APIC access address. This address is
  * occupied by the boot firmware so it is guaranteed that it will not conflict
  * with a page in system memory.
@@ -3822,6 +3871,18 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			t0 = rdtsc();
 			invept(INVEPT_TYPE_SINGLE_CONTEXT, ed);
 			atomic_add_long(&nested_invept_tsc, rdtsc() - t0);
+			/* Parere #58 §4: record dell'INVEPT fisico (riuscito, se
+			 * fosse fallito invept() avrebbe panicato). */
+			if (__predict_false(nested_diag58)) {
+				struct nested_diag58_inv iv;
+
+				iv.seq = ++n->diag58_seq;
+				iv.cpu = (uint16_t)curcpu;
+				iv.vcpu = (uint16_t)vcpu->vcpuid;
+				iv.ep4ta = ed.eptp;
+				iv.type = INVEPT_TYPE_SINGLE_CONTEXT;
+				SDT_PROBE1(vmm, vmx, nested, diag58inv, &iv);
+			}
 		}
 		vmx_vept_hw_flushed(vcpu);	/* B1: conta i flush dovuti */
 	}
@@ -4145,6 +4206,39 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		vmexit->inst_length = vmexit_instruction_length();
 		vmexit->u.vmx.exit_reason = exit_reason = vmcs_exit_reason();
 		vmexit->u.vmx.exit_qualification = vmcs_exit_qualification();
+
+		/*
+		 * Parere #58 §4: gancio diagnostico SOLO lettura. Qui il VMCS02
+		 * e' ancora caricato e corrente; fotografa i suoi campi e la
+		 * foglia EPT02 della GPA dell'uscita, PRIMA di qualunque
+		 * dispatch. Zero costo se nested_diag58 == 0.
+		 */
+		if (__predict_false(nested_diag58) && vcpu->nested != NULL) {
+			struct nested_diag58_rec r;
+
+			r.seq = ++vcpu->nested->diag58_seq;
+			r.cpu = (uint16_t)curcpu;
+			r.vcpu = (uint16_t)vcpu->vcpuid;
+			r.reason = exit_reason & 0xffff;
+			r.in_l2 = vcpu->nested->in_l2 ? 1 : 0;
+			r.eptp = vmcs_read(VMCS_EPTP);
+			r.sec_ctls = vmcs_read(VMCS_SEC_PROC_BASED_CTLS);
+			r.vpid = vmcs_read(VMCS_VPID);
+			r.gcr3 = vmcs_read(VMCS_GUEST_CR3);
+			r.gcr0 = vmcs_read(VMCS_GUEST_CR0);
+			r.gcr4 = vmcs_read(VMCS_GUEST_CR4);
+			r.gefer = vmcs_read(VMCS_GUEST_IA32_EFER);
+			r.grip = rip;
+			r.qual = vmexit->u.vmx.exit_qualification;
+			r.gpa = vmcs_read(VMCS_GUEST_PHYSICAL_ADDRESS);
+			r.gla = vmcs_read(VMCS_GUEST_LINEAR_ADDRESS);
+			/* foglia EPT02 della GPA hardware, dalla radice del VMCS02
+			 * corrente (il vCPU e' nostro: la radice non e' liberabile) */
+			r.ept02_leaf = (vcpu->nested->in_l2 &&
+			    vcpu->nested->vept_root != NULL) ?
+			    vmx_vept_shadow_entry(vcpu, r.gpa) : 0;
+			SDT_PROBE1(vmm, vmx, nested, diag58, &r);
+		}
 
 		/*
 		 * Dump the first 5 VM exits after entering at intr_init_final.
