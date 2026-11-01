@@ -238,8 +238,16 @@ NESTED_CTR(nested_ept_mmio_emulated,
     "nested: EPT violation dell'L2 emulate come MMIO dell'L1");
 NESTED_CTR(nested_ept12_viol_reflected,
     "nested: EPT violation riflesse all'L1 (Hyper-V le vede)");
+NESTED_CTR(nested_ept12_viol_emul_reflected,
+    "nested: EPT violation trovate dall'emulatore (A/D senza W) riflesse");
+NESTED_CTR(nested_ept12_viol_emul_stale,
+    "nested: violazioni dell'emulatore trovate fuori da L2 (deve essere 0)");
+NESTED_CTR(nested_ept12_viol_emul_nocache,
+    "nested: violazioni dell'emulatore senza il loro VMCS12 (deve essere 0)");
 NESTED_CTR(nested_ept12_misconf_reflected,
     "nested: EPT misconfiguration riflesse all'L1");
+NESTED_CTR(nested_ept12_misconf_emul_reflected,
+    "nested: EPT misconfiguration trovate dall'emulatore riflesse (H2)");
 NESTED_CTR(nested_l2_entries, "nested: ingressi in L2");
 NESTED_CTR(nested_l2_tsc, "nested: cicli TSC di guest in L2");
 NESTED_CTR(nested_l1_tsc, "nested: cicli TSC di guest in L1 (vCPU nested)");
@@ -3109,6 +3117,8 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	n->msr_phase = 0;
 
 	n->in_l2 = false;
+	n->emu_viol = false;		/* una violazione dell'emulatore non
+					 * ancora consegnata decade con l'L2 */
 	vmexit->rip = hrip;
 	vmexit->inst_length = 0;
 	vm_exit_intinfo(vcpu->vcpu, 0);
@@ -4316,6 +4326,81 @@ nested_probe_walk(struct vmx_vcpu *vcpu, int r, uint64_t l1gpa, uint64_t perm)
 	}
 }
 
+/*
+ * Sessione 1d (parere di Astra sul caso H): EPT violation trovata
+ * dall'EMULATORE di L0 (vmx_vept_ptp_write: A/D in una tabella dell'L2 su una
+ * pagina che EPT12 non concede in scrittura), consegnata qui da vmx_run prima
+ * di rientrare in L2. L'istruzione dell'L2 non ha scritto nulla ed e' gia'
+ * ripartita (rip invariato nel VMCS02). Si riflette con il ramo SINTETICO di
+ * nested_reflect_to_l1: quello hardware copierebbe GPA e indirizzo lineare
+ * dall'ultima uscita del VMCS02, che per un movsq da MMIO e' il fault sulla
+ * SORGENTE; qui GPA e lineare sono quelli della voce di tabella e del walk.
+ */
+static int
+nested_ept_emul_reflect(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vm_exit *vmexit = vm_exitinfo(vcpu->vcpu);
+	struct vmcs12_cache *c;
+	uint64_t gpa = n->emu_viol_gpa, gla = n->emu_viol_gla;
+
+	/*
+	 * Chi chiama ha gia' verificato in_l2 (emu_viol => in_l2: nasce solo in
+	 * L2 e decade in nested_reflect_to_l1). GPA e lineare sono copiati qui,
+	 * la qualifica passa in synth_qual PRIMA della riflessione:
+	 * nested_reflect_to_l1 azzera emu_viol ma non ne tocca i dati.
+	 *
+	 * Parere #110 §3: il VMCS12 va verificato PRIMA di consumare la causa.
+	 * Con c == NULL nested_reflect_to_l1 esce senza riflettere, e il resto di
+	 * questa funzione darebbe all'L1 un RIP mai preparato. Irraggiungibile:
+	 * il VMCS12 corrente e le cache cambiano solo emulando VMXON/VMXOFF/
+	 * VMCLEAR/VMPTRLD dell'L1, mai fra la produzione (in L2, con c != NULL,
+	 * vmx_vept_ptp_write) e questo punto. Se capitasse: nessuna riflessione
+	 * parziale; la VM si spegne (come per un errore dello shadow VMCS),
+	 * l'host resta intatto, nessun panic.
+	 */
+	c = nested_current_cache(n);
+	if (c == NULL || n->current_vmcs12 != n->emu_viol_vmcs12) {
+		n->emu_viol = false;
+		atomic_add_long(&nested_ept12_viol_emul_nocache, 1);
+		vm_suspend(vcpu->vmx->vm, VM_SUSPEND_POWEROFF);
+		return (0);
+	}
+	n->emu_viol = false;		/* consumata: UNA sola riflessione */
+	VMPTRLD(vcpu->vmcs);			/* il VMCS02 */
+	/* H2: anche una misconfiguration (motivo 49, qualificazione 0) */
+	vmexit->u.vmx.exit_reason = n->emu_viol_reason;
+	n->synth = true;
+	n->synth_qual = n->emu_viol_qual;
+	n->synth_intr_info = 0;
+	n->slow_reflect = true;
+	nested_reflect_to_l1(vcpu, vmexit);
+	n->slow_reflect = false;
+	n->synth = false;
+	n->synth_qual = 0;
+	c = nested_current_cache(n);	/* invariato dalla riflessione */
+	if (c != NULL) {
+		/* dopo la riflessione, prima del prossimo ingresso in L1: la copia
+		 * verso lo shadow VMCS avviene all'ingresso e legge il VMCS12 in
+		 * quel momento; i due campi si segnano anche qui (parere #109 §2.D),
+		 * senza contare sul segno globale di nested_reflect_to_l1 */
+		vmcs12_write_field(c, VMCS_GUEST_PHYSICAL_ADDRESS, gpa);
+		shvmcs_mark(n, c, VMCS_GUEST_PHYSICAL_ADDRESS);
+		/* la misconfiguration non riporta l'indirizzo lineare (SDM) */
+		if (n->emu_viol_reason == EXIT_REASON_EPT_FAULT) {
+			vmcs12_write_field(c, VMCS_GUEST_LINEAR_ADDRESS, gla);
+			shvmcs_mark(n, c, VMCS_GUEST_LINEAR_ADDRESS);
+		}
+	}
+	VMCLEAR(vcpu->vmcs01);			/* niente VMCS attivo nello slow path */
+	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP, vmexit->rip);
+	/* #110 §3: conta la riflessione COSTRUITA, non il tentativo */
+	atomic_add_long(n->emu_viol_reason == EXIT_REASON_EPT_FAULT ?
+	    &nested_ept12_viol_emul_reflected :
+	    &nested_ept12_misconf_emul_reflected, 1);
+	return (0);
+}
+
 static int
 nested_ept_slow(struct vmx_vcpu *vcpu)
 {
@@ -4394,6 +4479,18 @@ vmx_nested_exit(void *vcpui)
 			vcpu->nested->vept_memgen_pending = false;
 			return (0);
 		}
+	}
+
+	/* Sessione 1d: violazione EPT12 trovata dall'emulatore, consegnata da
+	 * vmx_run prima di rientrare in L2. Fuori da L2 (invariante violato:
+	 * emu_viol nasce solo in L2 e decade con l'uscita verso l'L1) la si
+	 * scarta e si prosegue con gli altri pending, senza ritornare: un
+	 * return qui salterebbe restart_only ed ept_pending (parere #109 §2.B) */
+	if (vcpu->nested != NULL && vcpu->nested->emu_viol) {
+		if (vcpu->nested->in_l2)
+			return (nested_ept_emul_reflect(vcpu));
+		vcpu->nested->emu_viol = false;
+		atomic_add_long(&nested_ept12_viol_emul_stale, 1);
 	}
 
 	/* Uscita di L2 gia' riflessa all'L1 in vmx_exit_process: qui va solo

@@ -145,7 +145,9 @@ DEFINE_VMMOPS_IFUNC(int, getcap, (void *vcpui, int num, int *retval))
 DEFINE_VMMOPS_IFUNC(int, setcap, (void *vcpui, int num, int val))
 DEFINE_VMMOPS_IFUNC(int, nested_exit, (void *vcpui))
 DEFINE_VMMOPS_IFUNC(int, nested_gpa, (void *vcpui, uint64_t gpa, int prot,
-    uint64_t *l1gpa))
+    uint64_t gla, int flags, uint64_t *l1gpa))
+DEFINE_VMMOPS_IFUNC(int, nested_ptp_write, (void *vcpui, uint64_t ptegpa,
+    uint64_t l1held, uint64_t gla, bool *denied))
 DEFINE_VMMOPS_IFUNC(struct vmspace *, vmspace_alloc, (vm_offset_t min,
     vm_offset_t max))
 DEFINE_VMMOPS_IFUNC(void, vmspace_free, (struct vmspace *vmspace))
@@ -691,9 +693,18 @@ vm_reset_pptdev(struct vm *vm, int bus, int slot, int func)
 }
 
 int
-vm_nested_gpa(struct vcpu *vcpu, uint64_t gpa, int prot, uint64_t *l1gpa)
+vm_nested_gpa(struct vcpu *vcpu, uint64_t gpa, int prot, uint64_t gla,
+    int flags, uint64_t *l1gpa)
 {
-	return (vmmops_nested_gpa(vcpu->cookie, gpa, prot, l1gpa));
+	return (vmmops_nested_gpa(vcpu->cookie, gpa, prot, gla, flags, l1gpa));
+}
+
+int
+vm_nested_ptp_write(struct vcpu *vcpu, uint64_t ptegpa, uint64_t l1held,
+    uint64_t gla, bool *denied)
+{
+	return (vmmops_nested_ptp_write(vcpu->cookie, ptegpa, l1held, gla,
+	    denied));
 }
 
 int

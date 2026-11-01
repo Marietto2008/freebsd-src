@@ -129,6 +129,20 @@ VEPT_CTR(vept_keep_verify_checked, "B1: foglie riverificate");
 VEPT_CTR(vept_keep_verify_mismatch, "B1: foglie riverificate DISCORDANTI");
 VEPT_CTR(vept_memgen_changes_detected,
     "B1: generazioni dei mapping cambiate viste da un vCPU");
+VEPT_CTR(vept_ptp_write_retry_xlate,
+    "H1: walk ripartiti, EPT12 della tabella non piu' valida (parere #110)");
+VEPT_CTR(vept_ptp_write_retry_remap,
+    "H1: walk ripartiti, tabella rimappata su un'altra pagina dell'L1");
+VEPT_CTR(vept_h2_viol_final,
+    "H2: EPT violation dell'emulatore sull'indirizzo finale (registrate)");
+VEPT_CTR(vept_h2_viol_ptp,
+    "H2: EPT violation dell'emulatore su una tabella dell'L2 (registrate)");
+VEPT_CTR(vept_h2_misconf,
+    "H2: EPT misconfiguration trovate dall'emulatore (registrate)");
+VEPT_CTR(vept_h2_unread,
+    "H2: tabella di EPT12 illeggibile nell'emulatore (registrata come violation)");
+VEPT_CTR(vept_h2_already,
+    "H2: violazione gia' registrata e non consegnata (deve essere 0)");
 VEPT_CTR(vept_memgen_roots_invalidated,
     "B1: radici svuotate per generazione cambiata");
 VEPT_CTR(vept_stale_root_enters,
@@ -1935,6 +1949,180 @@ vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot, uint64_t *out)
 	if (ept12_translate(vcpu, vmcs12_read_field(c, VMCS_EPTP), gpa, out,
 	    &perm, NULL) != VEPT_OK || (prot & ~perm & EPT_RWX) != 0)
 		return (EFAULT);
+	return (0);
+}
+
+/*
+ * vmmops nested_gpa per l'emulatore (ptp_hold, traduzione finale di
+ * _vm_gla2gpa). H2 (AUDIT-PTP-HOLD, parere #119): prima un EFAULT qui
+ * diventava un errore di vm_run e uccideva la VM, scatenabile dall'L2 con una
+ * PTE verso un suo GPA che l'L1 non mappa. Il walk hardware avrebbe dato
+ * all'L1 una EPT violation (o misconfiguration): con VM_NGPA_RECORD la si
+ * registra in emu_viol, come vmx_vept_ptp_write per H1, e si ritorna
+ * EJUSTRETURN; la consegna e' la stessa (vmx_run -> slow path ->
+ * nested_ept_emul_reflect), prima di qualunque nuovo ingresso in L2.
+ * Semantica identica al percorso hardware (vmx_vept_fault): tabella
+ * dell'L1 illeggibile = violation; voce malformata = misconfiguration
+ * (motivo 49, qualificazione 0). Qualificazione della violation (SDM, Exit
+ * Qualification for EPT Violations): bit 0-2 tipo d'accesso (fetch = solo
+ * bit 2; una voce di tabella dell'L2 si LEGGE: bit 0, con EPTP12[6]=0 gli A/D
+ * di EPT non sono esposti), bit 3-5 permessi dell'L1 (0 se non presente), bit
+ * 7 indirizzo lineare valido, bit 8 = 1 solo per l'indirizzo finale, e solo
+ * allora i bit 9-11 (informazioni avanzate, capacita' passata all'L1 da
+ * nested_msrs_init). Senza VM_NGPA_RECORD (vm_gla2gpa_nofault) resta EFAULT.
+ */
+/*
+ * Permessi EPT che l'accesso richiede davvero (puro: il banco userland lo
+ * estrae dal sorgente). Un fetch (vmm_fetch_instruction chiede READ|EXECUTE)
+ * vuole solo X, come il walk hardware: chiedere anche R darebbe all'L1 una
+ * violation FALSA su una pagina eseguibile senza R, e un ciclo (l'hardware
+ * esegue, l'emulatore nega). Un dato vuole R e/o W come chiesto; la voce di
+ * una tabella dell'L2 si legge.
+ */
+static uint64_t
+vept_emul_need(int prot, int flags)
+{
+	if ((flags & VM_NGPA_FINAL) == 0)
+		return (EPT_PG_READ);
+	if (prot & VM_PROT_EXECUTE)
+		return (EPT_PG_EXECUTE);
+	return (((prot & VM_PROT_READ) ? EPT_PG_READ : 0) |
+	    ((prot & VM_PROT_WRITE) ? EPT_PG_WRITE : 0));
+}
+
+/* Qualificazione della violation dell'emulatore (vedi sotto); pura: il banco
+ * userland la estrae dal sorgente. Bit 0-2 = l'accesso richiesto. */
+static uint64_t
+vept_emul_qual(int prot, int flags, uint64_t perm)
+{
+	uint64_t need, qual;
+
+	need = vept_emul_need(prot, flags);
+	qual = ((need & EPT_PG_READ) ? EPT_VIOLATION_DATA_READ : 0) |
+	    ((need & EPT_PG_WRITE) ? EPT_VIOLATION_DATA_WRITE : 0) |
+	    ((need & EPT_PG_EXECUTE) ? EPT_VIOLATION_INST_FETCH : 0);
+	qual |= ((perm & EPT_RWX) << 3) | EPT_VIOLATION_GLA_VALID;
+	if (flags & VM_NGPA_FINAL) {
+		qual |= EPT_VIOLATION_XLAT_VALID;
+		if (flags & VM_NGPA_LA_US)
+			qual |= 1UL << 9;
+		if (flags & VM_NGPA_LA_RW)
+			qual |= 1UL << 10;
+		if (flags & VM_NGPA_LA_XD)
+			qual |= 1UL << 11;
+	}
+	return (qual);
+}
+
+int
+vmx_vept_l1gpa_emul(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
+    uint64_t gla, int flags, uint64_t *out)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	uint64_t perm;
+	int r;
+
+	*out = gpa;
+	if (n == NULL || !n->in_l2 || (c = nested_current_cache(n)) == NULL ||
+	    (vmcs12_proc2(c) & PROCBASED2_ENABLE_EPT) == 0)
+		return (0);
+	r = ept12_translate(vcpu, vmcs12_read_field(c, VMCS_EPTP), gpa, out,
+	    &perm, NULL);
+	if (r == VEPT_OK && (vept_emul_need(prot, flags) & ~perm) == 0)
+		return (0);
+	if ((flags & VM_NGPA_RECORD) == 0)
+		return (EFAULT);
+	/* una sola causa: la prima in ordine di programma (il chiamante si
+	 * ferma al primo fault, quindi qui non si arriva con una pendente) */
+	if (n->emu_viol) {
+		atomic_add_long(&vept_h2_already, 1);
+		return (EJUSTRETURN);
+	}
+	n->emu_viol_gpa = gpa;
+	n->emu_viol_gla = gla;
+	n->emu_viol_vmcs12 = n->current_vmcs12;
+	if (r == VEPT_MISCONF) {
+		n->emu_viol_reason = EXIT_REASON_EPT_MISCONFIG;
+		n->emu_viol_qual = 0;
+		atomic_add_long(&vept_h2_misconf, 1);
+	} else {
+		if (r < 0) {
+			atomic_add_long(&vept_h2_unread, 1);
+			perm = 0;
+		} else if (r != VEPT_OK)
+			perm = 0;		/* non presente: permessi 0 */
+		atomic_add_long((flags & VM_NGPA_FINAL) ? &vept_h2_viol_final :
+		    &vept_h2_viol_ptp, 1);
+		n->emu_viol_reason = EXIT_REASON_EPT_FAULT;
+		n->emu_viol_qual = vept_emul_qual(prot, flags, perm);
+	}
+	n->emu_viol = true;
+	return (EJUSTRETURN);
+}
+
+/*
+ * vmmops nested_ptp_write (sessione 1d, parere di Astra sul caso H): prima che
+ * l'emulatore di L0 scriva A/D nella voce di tabella dell'L2 al GPA 'ptegpa'.
+ * Il walk hardware fa lo stesso aggiornamento come accesso in SCRITTURA alla
+ * pagina di tabelle (con EPTP12[6]=0 gli A/D di EPT non c'entrano): se l'EPT
+ * dell'L1 non concede W, l'L1 vede una EPT violation (casi H/H_D della 1d,
+ * qualificazione RD|WR|permessi|GLA valido, bit 8 = 0, GPA = la voce). Qui la
+ * si registra soltanto: la riflette lo slow path (nested_ept_emul_reflect),
+ * prima di qualunque nuovo ingresso in L2. Fuori da un L2 con EPT (anche
+ * quando L0 emula un'istruzione dell'L1) non c'e' nulla da controllare.
+ */
+int
+vmx_vept_ptp_write(struct vmx_vcpu *vcpu, uint64_t ptegpa, uint64_t l1held,
+    uint64_t gla, bool *denied)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	uint64_t l1gpa, perm;
+
+	*denied = false;
+	if (n == NULL || !n->in_l2 || (c = nested_current_cache(n)) == NULL ||
+	    (vmcs12_proc2(c) & PROCBASED2_ENABLE_EPT) == 0)
+		return (0);
+	/*
+	 * La pagina e' appena stata letta con R (ptp_hold). VEPT_VIOL (non
+	 * presente), VEPT_MISCONF o tabella dell'L1 illeggibile (<0) qui vogliono
+	 * dire che l'L1 ha cambiato EPT12 nel frattempo: il walk riparte dalla
+	 * radice (EAGAIN). Nessuna di queste diventa una violazione qui (parere
+	 * #109 §3: solo "W negato con traduzione valida"), e nessuna diventa un
+	 * errore fatale nuovo (§4): al giro dopo decide ptp_hold, come prima.
+	 */
+	if (ept12_translate(vcpu, vmcs12_read_field(c, VMCS_EPTP), ptegpa,
+	    &l1gpa, &perm, NULL) != VEPT_OK) {
+		atomic_add_long(&vept_ptp_write_retry_xlate, 1);
+		return (EAGAIN);
+	}
+	/*
+	 * Parere #110 §2: il permesso vale per la pagina in cui si scrive. Il
+	 * cmpset scrivera' nella pagina tenuta da ptp_hold (L1-GPA 'l1held');
+	 * se ora EPT12 manda la stessa GPA dell'L2 su un'altra pagina dell'L1,
+	 * ne' il permesso vecchio ne' quello nuovo autorizzano a scrivere nella
+	 * pagina tenuta: niente scrittura, niente violazione, il walk riparte.
+	 * Basta l'L1-GPA: la memoria dell'L1 cambia mappa (L1-GPA -> HPA) solo
+	 * con tutti i vCPU IDLE (vmx_vept_memgen_sync), mai con questo vCPU
+	 * FROZEN nell'emulazione; quindi stesso L1-GPA = stessa pagina host.
+	 * EPTP12 e' lo stesso di ptp_hold: lo cambia solo l'L1 con VMWRITE e
+	 * VMRESUME su questo vCPU, che durante l'emulazione non gira.
+	 */
+	if ((l1gpa & ~(uint64_t)PAGE_MASK) != (l1held & ~(uint64_t)PAGE_MASK)) {
+		atomic_add_long(&vept_ptp_write_retry_remap, 1);
+		return (EAGAIN);
+	}
+	if ((perm & EPT_PG_WRITE) != 0)
+		return (0);
+	*denied = true;
+	n->emu_viol = true;
+	n->emu_viol_reason = EXIT_REASON_EPT_FAULT;
+	n->emu_viol_gpa = ptegpa;
+	n->emu_viol_gla = gla;
+	n->emu_viol_vmcs12 = n->current_vmcs12;
+	n->emu_viol_qual = EPT_VIOLATION_DATA_READ | EPT_VIOLATION_DATA_WRITE |
+	    ((perm & EPT_RWX) << 3) | EPT_VIOLATION_GLA_VALID;
 	return (0);
 }
 
