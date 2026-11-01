@@ -1,0 +1,2 @@
+# a freddo: sonda toccata solo a stage1
+ept12_remap_cold | vmxc.flat | ept12_remap_cold | -cpu max | 1 | 1024 | 120

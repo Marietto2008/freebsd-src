@@ -1,0 +1,2 @@
+# Parere #73 §5: UNA sola corsa, ept12_remap_rax col test corretto (kut fe6d8bce)
+ept12_remap_rax | vmxc-skiprip.flat | ept12_remap_rax | -cpu max | 1 | 1024 | 120

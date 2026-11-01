@@ -1,0 +1,1032 @@
+#!/bin/sh
+# test-ptpad.sh -- Claude 27/10/2026, parere #101 §8.5: collaudo OFFLINE dell'oracolo ptpad_an.py.
+# Nessuna VM, nessun kernel. Costruisce log COMBINATI sintetici (serie di L1 + fotografie del
+# contatore host + stato terminale) per OGNI verdetto e per i casi limite, e verifica che il
+# classificatore dia esattamente il verdetto atteso. Verifica anche i bit della qualifica EPT.
+# Uso: test-ptpad.sh <cartella di lavoro>
+W=/mnt/linuxulator2/vm/nested-work
+AN=$W/ptpad_an.py
+O=${1:?cartella}
+mkdir -p "$O" || exit 1
+nf=0
+# #134 §7: nessuna VM finta di QUESTA suite sopravvive, nemmeno se la suite viene interrotta
+trap 'pkill -KILL -f "ptpad-finta-vm.py $O/" 2>/dev/null' EXIT INT TERM HUP
+# qual: bit1 WR, bit7 LADDR_VLD, bit8 PADDR. T (struttura) = WR|LADDR = 0x82; D (dato) = WR|PADDR = 0x102
+QT=0x82; QD=0x102
+# pte: bit5 = A, bit6 = D. "pulita" 0x27 (presente), con A 0x47, con A+D 0x67
+P0=0x27; PA=0x47; PAD=0x67
+caso() {	# caso <nome> <ctr0> <ctr1> <riga L1 o -> <term> [fbt "mmio ptp"]
+	printf 'CASE %s\nCTR before=%s\n' "$1" "$2" >> "$LOG"
+	[ "$4" != '-' ] && printf '%s\n' "$4" >> "$LOG"
+	[ -n "$6" ] && printf 'FBT mmio=%s ptp=%s\n' $6 >> "$LOG"
+	printf 'CTR after=%s\n' "$3" >> "$LOG"
+	printf 'TERM %s\n' "$5" >> "$LOG"
+}
+L1() {	# L1 <viol> <reason> <qual> <pte0> <pte1> <dwr> <ripadv> [paddr]
+	printf 'L1 viol=%s reason=%s qual=%s gpa=0x5000 paddr=%s pte0=%s pte1=%s dwr=%s ripadv=%s' \
+		"$1" "$2" "$3" "${8:-0}" "$4" "$5" "$6" "$7"
+}
+att() {	# att <file> <caso> <verdetto atteso>
+	v=$(/usr/local/bin/python3 $AN "$1" 2>/dev/null | awk -v c="$2" '$1==c{print $2}')
+	if [ "$v" = "$3" ]; then echo "  ok      $2 -> $3"; else echo "  ERRATO  $2: atteso $3, ottenuto ${v:-NIENTE}"; nf=$((nf+1)); fi
+}
+
+echo "P1: tutti i verdetti, un caso per log"
+# B controllo positivo: emula (ctr+1), nessuna violazione, A/D scritti, D scritto, rip avanza
+LOG=$O/b.txt; : > $LOG; caso B 100 101 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+att $LOG B PATH_COVERED_ARCH_PASS
+# C controllo negativo: emula, A/D gia' 1, nessuna violazione, nessuna scrittura A/D, D scritto
+LOG=$O/c.txt; : > $LOG; caso C 200 201 "$(L1 0 0 0x0 $PAD $PAD 1 1)" alive
+att $LOG C PATH_COVERED_ARCH_PASS
+# A architetturale corretto: emula, violazione di scrittura su T, PTE invariata, D non scritto
+LOG=$O/a_ok.txt; : > $LOG; caso A 300 301 "$(L1 1 48 $QT $P0 $P0 0 0)" alive
+att $LOG A PATH_COVERED_ARCH_PASS
+# A con H1: emula, nessuna violazione, A acceso su T R-only
+LOG=$O/a_h1.txt; : > $LOG; caso A 300 301 "$(L1 0 0 0x0 $P0 $PA 0 0)" alive
+att $LOG A PATH_COVERED_H1_REPRODUCED
+# A_D con H1 su PG_M: A gia' 1, D acceso
+LOG=$O/ad_h1.txt; : > $LOG; caso A_D 300 301 "$(L1 0 0 0x0 $PA $PAD 0 0)" alive
+att $LOG A_D PATH_COVERED_H1_REPRODUCED
+# D_DATA architetturale: emula, violazione sul dato D (bit8), VM viva
+# parere #119 §3.2: la forma LARGA (nessun bit7, nessuna XINFO/RFE/H2F) non basta piu' (forma esatta in P17)
+LOG=$O/ddata_ok.txt; : > $LOG; caso D_DATA 400 401 "$(L1 1 48 $QD $P0 $P0 0 0 1)" alive
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+# D_DATA con H2: bhyve morto, nessuna riga L1
+LOG=$O/ddata_h2.txt; : > $LOG; caso D_DATA 400 401 "-" bhyve_died "1 1"
+att $LOG D_DATA PATH_COVERED_H2_REPRODUCED
+# morte SENZA prova di percorso (parere #103 §5): PATH_UNPROVEN, non H2
+LOG=$O/ddata_np.txt; : > $LOG; caso D_DATA 400 401 "-" bhyve_died
+att $LOG D_DATA INCONCLUSIVE_PATH_UNPROVEN
+# D_PTP con H2
+LOG=$O/dptp_h2.txt; : > $LOG; caso D_PTP 400 401 "-" bhyve_died "1 0"
+att $LOG D_PTP PATH_COVERED_H2_REPRODUCED
+
+echo "P2: inconclusivi"
+# HW_PREEMPTED: nessuna emulazione (ctr invariato) ma L1 ha visto una violazione
+LOG=$O/hw.txt; : > $LOG; caso A 300 300 "$(L1 1 48 $QT $P0 $P0 0 0)" alive
+att $LOG A INCONCLUSIVE_HW_PREEMPTED
+# PATH_NOT_COVERED: nessuna emulazione e nessuna violazione
+LOG=$O/nc.txt; : > $LOG; caso A 300 300 "$(L1 0 0 0x0 $P0 $P0 0 0)" alive
+att $LOG A INCONCLUSIVE_PATH_NOT_COVERED
+# TEST_SETUP: B non emula come atteso (nessun A/D, nessun D scritto) pur con emulazione
+LOG=$O/setup.txt; : > $LOG; caso B 100 101 "$(L1 0 0 0x0 $P0 $P0 0 0)" alive
+att $LOG B INCONCLUSIVE_TEST_SETUP
+# C contaminato: violazione con A/D gia' 1
+LOG=$O/cbad.txt; : > $LOG; caso C 200 201 "$(L1 1 48 $QT $PAD $PAD 0 0)" alive
+att $LOG C INCONCLUSIVE_TEST_SETUP
+# A: violazione presente ma NON di scrittura a struttura (bit8=1, dato) -> non la forma attesa
+LOG=$O/awrong.txt; : > $LOG; caso A 300 301 "$(L1 1 48 $QD $P0 $P0 0 0 1)" alive
+att $LOG A INCONCLUSIVE_TEST_SETUP
+# D_DATA viva ma violazione malformata (nessun bit8)
+LOG=$O/dwrong.txt; : > $LOG; caso D_DATA 400 401 "$(L1 1 48 $QT $P0 $P0 0 0)" alive
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+
+echo "P3: errori di test (fail-closed)"
+# contatore a ritroso
+LOG=$O/back.txt; : > $LOG; caso A 300 299 "$(L1 0 0 0x0 $P0 $PA 0 0)" alive
+att $LOG A TEST_ERROR
+# fotografia mancante
+LOG=$O/miss.txt; : > $LOG; printf 'CASE A\nCTR before=300\n%s\nTERM alive\n' "$(L1 0 0 0x0 $P0 $PA 0 0)" >> $LOG
+att $LOG A TEST_ERROR
+# riga L1 malformata (campo mancante)
+LOG=$O/mal.txt; : > $LOG; caso A 300 301 "L1 viol=0 reason=0 qual=0x0 gpa=0x5000 pte0=$P0 pte1=$PA dwr=0" alive
+att $LOG A TEST_ERROR
+# caso non-D con bhyve morto
+LOG=$O/adie.txt; : > $LOG; caso A 300 301 "-" bhyve_died
+att $LOG A TEST_ERROR
+# caso D senza morte e senza L1
+LOG=$O/dnone.txt; : > $LOG; caso D_PTP 400 401 "-" alive
+att $LOG D_PTP TEST_ERROR
+# caso duplicato
+LOG=$O/dup.txt; : > $LOG; caso A 300 301 "$(L1 1 48 $QT $P0 $P0 0 0)" alive; caso A 302 303 "$(L1 1 48 $QT $P0 $P0 0 0)" alive
+att $LOG A TEST_ERROR
+# drop segnalato
+LOG=$O/drop.txt; : > $LOG; echo 'RUNNER: dtrace drop' >> $LOG; caso B 100 101 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+v=$(/usr/local/bin/python3 $AN $LOG 2>/dev/null | awk '/\(globale\)/{print $2}')
+[ "$v" = TEST_ERROR ] && echo "  ok      drop -> TEST_ERROR globale" || { echo "  ERRATO  drop non intercettato"; nf=$((nf+1)); }
+# caso assente: un log con solo B deve dare TEST_ERROR su A,C,...
+LOG=$O/solo.txt; : > $LOG; caso B 100 101 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+att $LOG D_PTP TEST_ERROR
+
+echo "P4: la riproduzione completa (B,C,A,A_D,D_DATA,D_PTP) classifica tutti e segnala H1/H2"
+LOG=$O/full.txt; : > $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+caso C 11 12 "$(L1 0 0 0x0 $PAD $PAD 1 1)" alive
+caso A 12 13 "$(L1 0 0 0x0 $P0 $PA 0 0)" alive
+caso A_D 13 14 "$(L1 0 0 0x0 $PA $PAD 0 0)" alive
+caso D_DATA 14 15 "-" bhyve_died "1 1"
+/usr/local/bin/python3 $AN $LOG | grep -E 'H1=SI|H2=' >/dev/null
+/usr/local/bin/python3 $AN $LOG 2>/dev/null | grep -q 'H1=SI H2=SI' && echo "  ok      log completo: H1 e H2 segnalati" || { echo "  ERRATO  H1/H2 non segnalati nel log completo"; nf=$((nf+1)); }
+
+echo "P5: assemblaggio del runner con contatore FINTO (ptpad-assembla.sh)"
+. $(cd "$(dirname "$0")" && pwd)/ptpad-assembla.sh
+# contatore finto: avanza di 1 a ogni lettura dopo la prima di ogni coppia (simula l'emulazione)
+PTPAD_FAKE=$O/ctr; echo 1000 > $PTPAD_FAKE
+ctr_leggi() { v=$(cat $PTPAD_FAKE); echo $v; }
+# serial con A corretto (violazione) e B positivo: delta 0 per A (il mock non incrementa) ->
+# per isolare, incrementiamo a mano il finto fra before e after via la serie stessa
+cat > $O/serial.txt <<'SER'
+PTPAD CASE B
+PTPAD L1 viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=0x27 pte1=0x67 dwr=1 ripadv=1
+PTPAD CASE A
+PTPAD L1 viol=1 reason=48 qual=0x82 gpa=0x9000 paddr=0 pte0=0x27 pte1=0x27 dwr=0 ripadv=0
+SER
+# per dare delta 1 ai casi, il finto incrementa a ogni lettura
+ctr_leggi() { v=$(cat $PTPAD_FAKE); echo $((v+1)) > $PTPAD_FAKE; echo $v; }
+ptpad_assembla $O/serial.txt alive $O/asm.txt
+# B: before=1000 after=1001 delta 1, no viol, A/D scritti, D scritto, rip -> ARCH_PASS
+# A: before=1002 after=1003 delta 1, violazione scrittura T -> ARCH_PASS
+att $O/asm.txt B PATH_COVERED_ARCH_PASS
+att $O/asm.txt A PATH_COVERED_ARCH_PASS
+# caso D con morte: serial apre D_DATA e non risponde; stato bhyve_died
+cat > $O/serd.txt <<'SER'
+PTPAD CASE D_DATA
+SER
+ptpad_assembla $O/serd.txt bhyve_died $O/asmd.txt
+att $O/asmd.txt D_DATA INCONCLUSIVE_PATH_UNPROVEN
+grep -q 'TERM bhyve_died' $O/asmd.txt && echo "  ok      caso D aperto -> TERM bhyve_died" || { echo "  ERRATO  TERM mancante"; nf=$((nf+1)); }
+
+echo "P6: correzioni del parere #102"
+QTR=0x80	# violazione a struttura in LETTURA: bit7 LADDR, bit1=0, bit8=0 (caso D_PTP)
+# D_PTP vivo con violazione di LETTURA della PTE (bit1=0): ARCH_PASS, non piu' richiesto bit1
+# #119: senza bit0 (lettura), MAP, XINFO, RFE e H2P la forma larga non basta piu' (P17)
+LOG=$O/dptp_rd.txt; : > $LOG; caso D_PTP 500 501 "$(L1 1 48 $QTR $P0 $P0 0 0)" alive
+att $LOG D_PTP INCONCLUSIVE_TEST_SETUP
+# A con la STESSA violazione di sola lettura (bit1=0) NON basta: A vuole scrittura su T
+LOG=$O/a_rd.txt; : > $LOG; caso A 300 301 "$(L1 1 48 $QTR $P0 $P0 0 0)" alive
+att $LOG A INCONCLUSIVE_TEST_SETUP
+# delta>1 (non-D): non attribuibile
+LOG=$O/dg.txt; : > $LOG; caso B 100 103 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+att $LOG B INCONCLUSIVE_TEST_SETUP
+# delta>1 (D): non attribuibile
+LOG=$O/dgd.txt; : > $LOG; caso D_DATA 400 406 "$(L1 1 48 $QD $P0 $P0 0 0 1)" alive
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+# PLAN senza i casi D: D_DATA e D_PTP sono NOT_RUN, non TEST_ERROR
+LOG=$O/plan1.txt; : > $LOG; printf 'PLAN cases=B,C,A,A_D
+' >> $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+caso C 11 12 "$(L1 0 0 0x0 $PAD $PAD 1 1)" alive
+caso A 12 13 "$(L1 0 0 0x0 $P0 $PA 0 0)" alive
+caso A_D 13 14 "$(L1 0 0 0x0 $PA $PAD 0 0)" alive
+att $LOG D_DATA NOT_RUN
+att $LOG D_PTP NOT_RUN
+att $LOG A PATH_COVERED_H1_REPRODUCED
+# sessione 1: B,C,A,A_D + SOLO D_DATA (che uccide); D_PTP resta NOT_RUN per piano
+LOG=$O/sess1.txt; : > $LOG; printf 'PLAN cases=B,C,A,A_D,D_DATA
+' >> $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+caso C 11 12 "$(L1 0 0 0x0 $PAD $PAD 1 1)" alive
+caso A 12 13 "$(L1 1 48 $QT $P0 $P0 0 0)" alive
+caso A_D 13 14 "$(L1 1 48 $QT $PA $PA 0 0)" alive
+caso D_DATA 14 15 "-" bhyve_died "1 1"
+att $LOG D_DATA PATH_COVERED_H2_REPRODUCED
+att $LOG D_PTP NOT_RUN
+/usr/local/bin/python3 $AN $LOG > $O/sess1.out 2>/dev/null
+if grep -q 'TEST_ERROR' $O/sess1.out; then echo "  ERRATO  sessione 1 ha un TEST_ERROR"; nf=$((nf+1)); else echo "  ok      sessione 1: nessun TEST_ERROR, D_PTP NOT_RUN"; fi
+# cancello B: se B non passa, verdetto globale B_GATE_FALLITO
+LOG=$O/bgate.txt; : > $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $P0 0 0)" alive
+caso A 12 13 "$(L1 0 0 0x0 $P0 $PA 0 0)" alive
+v=$(/usr/local/bin/python3 $AN $LOG 2>/dev/null | awk '/\(globale\)/{print $2}')
+[ "$v" = B_GATE_FALLITO ] && echo "  ok      B non passa -> B_GATE_FALLITO globale" || { echo "  ERRATO  B gate: $v"; nf=$((nf+1)); }
+
+echo "P7: prova di percorso ed etichette di copertura (#103 §4/§5)"
+# etichette: delta=1 da' MMIO_PATH_COVERED; FBT ptp=1 da' PTP_HOLD_PATH_COVERED
+LOG=$O/lab.txt; : > $LOG; caso A 300 301 "$(L1 0 0 0x0 $P0 $PA 0 0)" alive "1 1"
+/usr/local/bin/python3 $AN $LOG > $O/lab.out 2>/dev/null
+grep -q 'PATH A .*MMIO_PATH_COVERED WALK_VISTO_NON_PROVA' $O/lab.out && echo "  ok      A: MMIO coperto, walk solo indizio (WALK_VISTO_NON_PROVA)" || { echo "  ERRATO  etichette di percorso"; nf=$((nf+1)); }
+grep -q 'PTP_HOLD_PATH_COVERED' $O/lab.out && { echo "  ERRATO  etichetta PTP_HOLD_PATH_COVERED ancora emessa"; nf=$((nf+1)); } || echo "  ok      PTP_HOLD_PATH_COVERED non piu' emessa (declassata)"
+att $O/lab.txt A PATH_COVERED_H1_REPRODUCED
+# H1 senza attestazione PTP: resta H1 (oracolo architetturale), ma PTP non coperto
+LOG=$O/h1noptp.txt; : > $LOG; caso A 300 301 "$(L1 0 0 0x0 $P0 $PA 0 0)" alive
+/usr/local/bin/python3 $AN $LOG > $O/h1noptp.out 2>/dev/null
+att $O/h1noptp.txt A PATH_COVERED_H1_REPRODUCED
+grep -q 'WALK_VISTO_NON_PROVA' $O/h1noptp.out && { echo "  ERRATO  walk visto senza FBT"; nf=$((nf+1)); } || echo "  ok      H1 senza FBT: nessun indizio di walk (solo MMIO da delta)"
+# morte con FBT mmio=0: percorso non attestato -> PATH_UNPROVEN
+LOG=$O/dnp2.txt; : > $LOG; caso D_PTP 400 401 "-" bhyve_died "0 0"
+att $LOG D_PTP INCONCLUSIVE_PATH_UNPROVEN
+# morte senza CTR before persistito -> TEST_ERROR
+LOG=$O/nobefore.txt; : > $LOG; printf 'CASE D_DATA\nFBT mmio=1 ptp=1\nTERM bhyve_died\n' >> $LOG
+att $LOG D_DATA TEST_ERROR
+
+echo "P8: piano (parere #106 D1): caso fuori piano ESEGUITO e caso del piano ASSENTE"
+# piano senza D ma il log contiene D_DATA: TEST_ERROR, non NOT_RUN (prima veniva nascosto)
+LOG=$O/fuoripiano.txt; : > $LOG; printf 'PLAN cases=B,C,A,A_D\n' >> $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+caso C 11 12 "$(L1 0 0 0x0 $PAD $PAD 1 1)" alive
+caso A 12 13 "$(L1 1 48 $QT $P0 $P0 0 0)" alive
+caso A_D 13 14 "$(L1 1 48 $QT $PA $PA 0 0)" alive
+caso D_DATA 14 15 "-" bhyve_died "1 1"
+att $LOG D_DATA TEST_ERROR
+att $LOG D_PTP NOT_RUN
+# caso del piano assente (L1 interrotto dopo C): A e A_D TEST_ERROR, non NOT_RUN
+LOG=$O/pianoassente.txt; : > $LOG; printf 'PLAN cases=B,C,A,A_D\n' >> $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+caso C 11 12 "$(L1 0 0 0x0 $PAD $PAD 1 1)" alive
+att $LOG A TEST_ERROR
+att $LOG A_D TEST_ERROR
+att $LOG D_DATA NOT_RUN
+
+echo "P9: driver ptpad-drive.py con L1 FINTO (nessuna VM)"
+DRV=$(cd "$(dirname "$0")" && pwd)/ptpad-drive.py
+FVM=$(cd "$(dirname "$0")" && pwd)/ptpad-finta-vm.py
+dr() {	# dr <nome> <piano> <modo> <uscita attesa> [timeout]
+	echo 1000 >| $O/ctr-$1
+	echo 5000 >| $O/ctr-$1.rfl
+	echo 7000 >| $O/ctr-$1.rfe
+	echo 0 >| $O/ctr-$1.est
+	echo 0 >| $O/ctr-$1.enc
+	echo 0 >| $O/ctr-$1.rtx
+	echo 0 >| $O/ctr-$1.rtr
+	# #119: contatori H2 SEMPRE da file (mai i sysctl veri dell'host); presenti solo con H2=1
+	mkdir -p $O/ctr-$1.h2
+	if [ -n "${H2:-}" ]; then for x in H2F H2P H2M H2U H2A MER CAP; do echo 0 >| $O/ctr-$1.h2/$x; done; fi
+	/usr/local/bin/python3 $DRV --piano "$2" --out $O/drv-$1 --timeout ${5:-20} --h2-dir $O/ctr-$1.h2 \
+	    --ctr-cmd "cat $O/ctr-$1" --rfl-cmd "cat $O/ctr-$1.rfl" --rfe-cmd "${RFE_CMD:-cat $O/ctr-$1.rfe}" \
+	    --est-cmd "${EST_CMD:-cat $O/ctr-$1.est}" --enc-cmd "${ENC_CMD:-cat $O/ctr-$1.enc}" \
+	    --rtx-cmd "cat $O/ctr-$1.rtx" --rtr-cmd "cat $O/ctr-$1.rtr" ${DRV_EXTRA:-} \
+	    -- /usr/local/bin/python3 $FVM $O/ctr-$1 $3 > $O/drv-$1.out 2>&1
+	u=$?
+	if [ $u = $4 ]; then echo "  ok      driver $1 -> uscita $u ($(cat $O/drv-$1.out))"; else echo "  ERRATO  driver $1: uscita $u, attesa $4 ($(cat $O/drv-$1.out))"; nf=$((nf+1)); fi
+}
+dr h1 B,C,A,A_D ok 0
+att $O/drv-h1/combinato.txt B PATH_COVERED_ARCH_PASS
+att $O/drv-h1/combinato.txt C PATH_COVERED_ARCH_PASS
+att $O/drv-h1/combinato.txt A PATH_COVERED_ARCH_PASS
+att $O/drv-h1/combinato.txt A_D PATH_COVERED_ARCH_PASS
+att $O/drv-h1/combinato.txt D_DATA NOT_RUN
+/usr/local/bin/python3 $AN $O/drv-h1/combinato.txt > $O/drv-h1.an 2>&1 && echo "  ok      sessione H1 dal driver: nessun TEST_ERROR" || { echo "  ERRATO  sessione H1 dal driver: TEST_ERROR"; nf=$((nf+1)); }
+dr d1 B,A,D_DATA muore_d 0
+att $O/drv-d1/combinato.txt B PATH_COVERED_ARCH_PASS
+att $O/drv-d1/combinato.txt D_DATA INCONCLUSIVE_PATH_UNPROVEN
+att $O/drv-d1/combinato.txt D_PTP NOT_RUN
+grep -q '^EVENT VMRUN_ERROR_QEMU caso=D_DATA' $O/drv-d1/combinato.txt && echo "  ok      errore di VM_RUN -> EVENT VMRUN_ERROR_QEMU nel caso D_DATA" || { echo "  ERRATO  EVENT VMRUN_ERROR_QEMU mancante"; nf=$((nf+1)); }
+grep -q '^EVENT QEMU_TERMINATED_BY_DRIVER segnale=TERM' $O/drv-d1/combinato.txt && echo "  ok      QEMU terminato dal driver (process group), evento registrato a parte" || { echo "  ERRATO  EVENT QEMU_TERMINATED_BY_DRIVER mancante"; nf=$((nf+1)); }
+pgrep -f "ptpad-finta-vm.py $O/ctr-d1" >/dev/null && { echo "  ERRATO  la VM finta e' ancora viva"; nf=$((nf+1)); } || echo "  ok      nessun processo del gruppo sopravvissuto"
+# #119: la VM finta 'ok' risponde a D_PTP nella forma LARGA (qual 80, senza XINFO): ora il cancello ferma
+dr d2 B,A,D_PTP ok 2
+att $O/drv-d2/combinato.txt D_PTP INCONCLUSIVE_TEST_SETUP
+dr eco B,C,A,A_D eco_sbagliata 2
+grep -q '^CASE' $O/drv-eco/combinato.txt && { echo "  ERRATO  eco sbagliata ma un caso e' partito"; nf=$((nf+1)); } || echo "  ok      eco del piano diversa: nessun caso"
+dr noack B,C noack 2
+dr mb B,C muore_b 2
+att $O/drv-mb/combinato.txt B TEST_ERROR
+dr sil B,C silenzio 3 4
+dr skip B,C senza_runner 2
+grep -q '^CASE' $O/drv-skip/combinato.txt && { echo "  ERRATO  senza piano un caso e' partito"; nf=$((nf+1)); } || echo "  ok      L1 senza piano: nessun caso"
+/usr/local/bin/python3 $DRV --piano B,D_DATA,D_PTP --out $O/drv-2d -- /usr/bin/true > /dev/null 2>&1
+[ $? = 2 ] && echo "  ok      piano con DUE casi D rifiutato dal driver" || { echo "  ERRATO  piano con due D accettato"; nf=$((nf+1)); }
+/usr/local/bin/python3 $DRV --piano A,B --out $O/drv-ab -- /usr/bin/true > /dev/null 2>&1
+[ $? = 2 ] && echo "  ok      piano senza B primo rifiutato" || { echo "  ERRATO  piano senza B primo accettato"; nf=$((nf+1)); }
+/usr/local/bin/python3 $DRV --piano B,D_DATA,A --out $O/drv-dmezzo -- /usr/bin/true > /dev/null 2>&1
+[ $? = 2 ] && echo "  ok      piano con D non ultimo rifiutato" || { echo "  ERRATO  D non ultimo accettato"; nf=$((nf+1)); }
+
+echo "P11: parere #107 -- cancello B OPERATIVO e stop al primo caso non pulito"
+dr bgate B,C,A,A_D b_errato 2
+grep -q "^C b'g'" $O/ctr-bgate.acks && { echo "  ERRATO  ACK inviato a C dopo B fallito"; nf=$((nf+1)); } || echo "  ok      B fallito: ZERO ACK per C ($(tr '\n' ' ' < $O/ctr-bgate.acks))"
+grep -q '^CASE C' $O/drv-bgate/combinato.txt && { echo "  ERRATO  C registrato come aperto"; nf=$((nf+1)); } || echo "  ok      C mai aperto nel log"
+v=$(/usr/local/bin/python3 $AN $O/drv-bgate/combinato.txt 2>/dev/null | awk '/\(globale\)/{print $2}' | sort | tr '\n' ' ')
+[ "$v" = "B_GATE_FALLITO SESSIONE_FERMATA " ] && echo "  ok      analisi: B_GATE_FALLITO + SESSIONE_FERMATA" || { echo "  ERRATO  globali: $v"; nf=$((nf+1)); }
+att $O/drv-bgate/combinato.txt C NOT_RUN_FERMATA
+att $O/drv-bgate/combinato.txt A NOT_RUN_FERMATA
+att $O/drv-bgate/combinato.txt D_DATA NOT_RUN
+dr d2a B,C,A,A_D delta2 2
+grep -q "^A_D b'g'" $O/ctr-d2a.acks && { echo "  ERRATO  ACK ad A_D dopo delta 2 in A"; nf=$((nf+1)); } || echo "  ok      delta 2 in A: nessun ACK ad A_D"
+att $O/drv-d2a/combinato.txt A INCONCLUSIVE_TEST_SETUP
+att $O/drv-d2a/combinato.txt A_D NOT_RUN_FERMATA
+dr seq B,C,A,A_D fuori_seq 2
+grep -q "^A b'g'" $O/ctr-seq.acks && { echo "  ERRATO  ACK a un CASE fuori sequenza"; nf=$((nf+1)); } || echo "  ok      CASE fuori sequenza: nessun ACK"
+v=$(/usr/local/bin/python3 $AN $O/drv-seq/combinato.txt 2>/dev/null | awk '/\(globale\)/{print $2}')
+[ "$v" = INCONCLUSIVE_PROTOCOL ] && echo "  ok      fuori sequenza -> INCONCLUSIVE_PROTOCOL" || { echo "  ERRATO  fuori sequenza: $v"; nf=$((nf+1)); }
+v=$(/usr/local/bin/python3 $AN $O/drv-eco/combinato.txt 2>/dev/null | awk '/\(globale\)/{print $2}')
+[ "$v" = INCONCLUSIVE_PROTOCOL ] && echo "  ok      eco divergente -> INCONCLUSIVE_PROTOCOL, esecuzione nulla" || { echo "  ERRATO  eco: $v"; nf=$((nf+1)); }
+[ -s $O/ctr-eco.acks ] && { echo "  ERRATO  eco divergente ma ACK inviati"; nf=$((nf+1)); } || echo "  ok      eco divergente: zero ACK"
+
+echo "P10: correlazione FBT per finestre di caso (marcatori nello stesso stream)"
+/usr/local/bin/python3 - $(cd "$(dirname "$0")" && pwd) > $O/fbt-unit.out 2>&1 <<'FINE_FBT_UNIT_W2'
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location('drv', sys.argv[1] + '/ptpad-drive.py')
+d = importlib.util.module_from_spec(sp); sp.loader.exec_module(d)
+# righe FUORI ordine (buffer per CPU): la correlazione deve ordinare per timestamp
+t = """== FBT PRONTA == driver=10
+FBTEV t=500 pid=20 tid=9 k=walk
+FBTEV t=100 pid=10 tid=1 k=mark m=ack-B
+FBTEV t=300 pid=10 tid=1 k=mark m=l1-B
+FBTEV t=200 pid=20 tid=9 k=mmio
+FBTEV t=250 pid=20 tid=9 k=walk
+FBTEV t=400 pid=10 tid=1 k=mark m=ack-A
+FBTEV t=450 pid=20 tid=9 k=mmio
+FBTEV t=600 pid=10 tid=1 k=mark m=l1-A
+FBTEV t=700 pid=10 tid=1 k=mark m=ack-D_DATA
+FBTEV t=710 pid=20 tid=9 k=mmio
+FBTEV t=720 pid=20 tid=9 k=mmio
+FBTEV t=800 pid=10 tid=1 k=mark m=fine
+FBTEV t=900 pid=20 tid=9 k=mmio
+== FBT CHIUSA =="""
+V, C = ['B', 'A', 'D_DATA'], ['B', 'A']
+c = d.fbt_per_caso(t, 10, {20}, V, C)
+ok = c == {'B': (1, 1), 'A': (1, 1), 'D_DATA': (2, 0)}
+print('conte', c, 'OK' if ok else 'ERRATO')
+ok2 = d.fbt_per_caso(t.replace('== FBT CHIUSA ==', ''), 10, {20}, V, C) is None
+print('traccia senza CHIUSA -> None', 'OK' if ok2 else 'ERRATO')
+x = d.inserisci_fbt('PLAN cases=B,A\nCASE B\nCTR before=1\nCASE A\nCTR before=2\n', {'B': (1, 0)})
+ok3 = 'CASE B\nFBT mmio=1 ptp=0\nCTR' in x and 'CASE A\nCTR' in x
+print('inserimento', 'OK' if ok3 else 'ERRATO')
+# #107 §4: separazione dei pid e completezza dei marcatori
+ok4 = d.fbt_per_caso(t.replace('t=300 pid=10', 't=300 pid=11'), 10, {20}, V, C) is None
+print('marcatore da un pid estraneo -> None', 'OK' if ok4 else 'ERRATO')
+ok5 = d.fbt_per_caso(t.replace('t=450 pid=20', 't=450 pid=21'), 10, {20}, V, C) is None
+print('sonda FBT da un pid fuori dal gruppo VM -> None', 'OK' if ok5 else 'ERRATO')
+ok6 = d.fbt_per_caso(t.replace('FBTEV t=600 pid=10 tid=1 k=mark m=l1-A\n', ''), 10, {20}, V, C) is None
+print('marcatore l1 mancante -> None', 'OK' if ok6 else 'ERRATO')
+ok7 = d.fbt_per_caso(t, 10, {20}, ['B', 'C', 'A', 'D_DATA'], C) is None
+print('caso aperto senza ack -> None', 'OK' if ok7 else 'ERRATO')
+sys.exit(0 if ok and ok2 and ok3 and ok4 and ok5 and ok6 and ok7 else 1)
+FINE_FBT_UNIT_W2
+if [ $? = 0 ]; then echo "  ok      FBT: ordinamento, finestre, traccia incompleta, inserimento, pid estranei, marcatori mancanti"; else echo "  ERRATO  FBT unit: $(cat $O/fbt-unit.out)"; nf=$((nf+1)); fi
+
+echo "P12: caso H (controllo HARDWARE di A/A_D, dopo la sessione 1c)"
+MAPR='MAP va_d=ffffffffffc00000 d=fec3000 T=fec6000 pte=fec3007 livelli_codice=3 pteaddr=fec6000'
+QH=0x8b		# RD|WR|PERM_RD|LADDR_VLD, come ept_access_test_paddr_read_only_ad_disabled
+hcaso() {	# hcaso <nome> <ctr0> <ctr1> <rfl0> <rfl1> <riga L1> [fbt "mmio ptp"]
+	printf 'CASE %s\nCTR before=%s\nRFL before=%s\n' "$1" "$2" "$4" >> "$LOG"
+	printf '%s\n' "$6" >> "$LOG"
+	[ -n "$7" ] && printf 'FBT mmio=%s ptp=%s\n' $7 >> "$LOG"
+	printf 'CTR after=%s\nRFL after=%s\nTERM alive\n' "$3" "$5" >> "$LOG"
+}
+HV="L1 viol=1 reason=48 qual=$QH gpa=0xfec6000 paddr=0 pte0=$P0 pte1=$P0 dwr=0 ripadv=0"
+HVD="L1 viol=1 reason=48 qual=$QH gpa=0xfec6000 paddr=0 pte0=$PA pte1=$PA dwr=0 ripadv=0"
+HN="L1 viol=0 reason=18 qual=0x0 gpa=0x0 paddr=0 pte0=$P0 pte1=$PAD dwr=1 ripadv=1"
+# H passa: violazione di scrittura su T, gpa = PTE di D, mmio +0, riflessioni +1
+LOG=$O/h_ok.txt; echo "$MAPR" >| $LOG; hcaso H 50 50 7 8 "$HV"
+att $LOG H HW_CONTROL_PASS
+LOG=$O/hd_ok.txt; echo "$MAPR" >| $LOG; hcaso H_D 50 50 7 8 "$HVD"
+att $LOG H_D HW_CONTROL_PASS
+# H senza violazione: la scrittura hardware passa e accende A/D
+LOG=$O/h_nv.txt; echo "$MAPR" >| $LOG; hcaso H 50 50 7 7 "$HN"
+att $LOG H HW_CONTROL_NO_VIOLATION
+# violazione su un gpa che NON e' la PTE di D
+LOG=$O/h_gpa.txt; echo "$MAPR" >| $LOG; hcaso H 50 50 7 8 "$(echo "$HV" | sed 's/gpa=0xfec6000/gpa=0xfec3000/')"
+att $LOG H INCONCLUSIVE_TEST_SETUP
+# violazione sul DATO (bit8=1) invece che sulla struttura
+LOG=$O/h_dato.txt; echo "$MAPR" >| $LOG; hcaso H 50 50 7 8 "$(echo "$HV" | sed 's/qual=0x8b/qual=0x10b/')"
+att $LOG H INCONCLUSIVE_TEST_SETUP
+# emulazione nel caso H (mmio +1): non e' un controllo hardware
+LOG=$O/h_emul.txt; echo "$MAPR" >| $LOG; hcaso H 50 51 7 8 "$HV"
+att $LOG H INCONCLUSIVE_TEST_SETUP
+# FBT vede l'emulatore nella finestra di H
+LOG=$O/h_fbt.txt; echo "$MAPR" >| $LOG; hcaso H 50 50 7 8 "$HV" "1 0"
+att $LOG H INCONCLUSIVE_TEST_SETUP
+# riflessioni +2 / +1 senza violazione: non attribuibili
+LOG=$O/h_r2.txt; echo "$MAPR" >| $LOG; hcaso H 50 50 7 9 "$HV"
+att $LOG H INCONCLUSIVE_TEST_SETUP
+LOG=$O/h_nvr.txt; echo "$MAPR" >| $LOG; hcaso H 50 50 7 8 "$HN"
+att $LOG H INCONCLUSIVE_TEST_SETUP
+# fail-closed: RFL mancante, MAP mancante, riflessioni a ritroso
+LOG=$O/h_norfl.txt; echo "$MAPR" >| $LOG; caso H 50 50 "$HV" alive
+att $LOG H TEST_ERROR
+LOG=$O/h_nomap.txt; : >| $LOG; hcaso H 50 50 7 8 "$HV"
+att $LOG H TEST_ERROR
+LOG=$O/h_back.txt; echo "$MAPR" >| $LOG; hcaso H 50 50 8 7 "$HV"
+att $LOG H TEST_ERROR
+# MAP DOPO un CASE non conta come mappa della sessione
+LOG=$O/h_maptardi.txt; : >| $LOG; hcaso H 50 50 7 8 "$HV"; echo "$MAPR" >> $LOG
+att $LOG H TEST_ERROR
+# attribuzione: A H1 + H PASS / NO_VIOLATION / inconclusivo; A ARCH_PASS -> nessuna riga
+attr() {	# attr <file> <riga> <atteso o NESSUNA>
+	v=$(/usr/local/bin/python3 $AN "$1" 2>/dev/null | awk -v c="$2" '$1==c{print $2}')
+	if [ "${v:-NESSUNA}" = "$3" ]; then echo "  ok      $2 -> $3"; else echo "  ERRATO  $2: atteso $3, ottenuto ${v:-NESSUNA}"; nf=$((nf+1)); fi
+}
+LOG=$O/attr1.txt; printf 'PLAN cases=B,C,H,A,H_D,A_D\n%s\n' "$MAPR" >| $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+caso C 11 12 "$(L1 0 0 0x0 $PAD $PAD 1 1)" alive
+hcaso H 12 12 7 8 "$HV"
+caso A 12 13 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+hcaso H_D 13 13 8 9 "$HVD"
+caso A_D 13 14 "$(L1 0 0 0x0 $PA $PAD 1 1)" alive
+att $LOG A PATH_COVERED_H1_REPRODUCED
+attr $LOG '(attr-A)' H1_ATTRIBUITA_EMULATORE
+attr $LOG '(attr-A_D)' H1_ATTRIBUITA_EMULATORE
+# #123: una sessione che RIPRODUCE H1 non e' pulita: uscita 4 (non 3 = TEST_ERROR, non 0)
+/usr/local/bin/python3 $AN $LOG > $O/attr1.out 2>&1; u=$?; [ $u = 4 ] && echo "  ok      sessione B,C,H,A,H_D,A_D: nessun TEST_ERROR, NON_PULITA (uscita 4)" || { echo "  ERRATO  sessione H: uscita $u"; nf=$((nf+1)); }
+grep -q 'ATTRIBUZIONE: A=H1_ATTRIBUITA_EMULATORE A_D=H1_ATTRIBUITA_EMULATORE' $O/attr1.out && echo "  ok      riga ATTRIBUZIONE" || { echo "  ERRATO  riga ATTRIBUZIONE: $(grep ATTRIB $O/attr1.out)"; nf=$((nf+1)); }
+grep -q 'QUAL H .*come KUT' $O/attr1.out && echo "  ok      qualifica di H annotata come KUT (0x8b)" || { echo "  ERRATO  annotazione QUAL"; nf=$((nf+1)); }
+LOG=$O/attr2.txt; printf 'PLAN cases=B,H,A\n%s\n' "$MAPR" >| $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+hcaso H 11 11 7 7 "$HN"
+caso A 11 12 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+attr $LOG '(attr-A)' H1_NON_ATTRIBUITA
+att $LOG A_D NOT_RUN
+att $LOG H_D NOT_RUN
+attr $LOG '(attr-A_D)' NESSUNA
+LOG=$O/attr3.txt; printf 'PLAN cases=B,H,A\n%s\n' "$MAPR" >| $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+hcaso H 11 12 7 8 "$HV"
+caso A 12 13 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+attr $LOG '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+LOG=$O/attr4.txt; printf 'PLAN cases=B,H,A\n%s\n' "$MAPR" >| $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+hcaso H 11 11 7 8 "$HV"
+caso A 11 12 "$(L1 1 48 $QT $P0 $P0 0 0)" alive
+att $LOG A PATH_COVERED_ARCH_PASS
+# dopo il parere di Astra sul caso H: un A corretto ha una riga di attribuzione; questa violazione ha
+# gpa 0x5000 (non la PTE) e nessun RFE, quindi la correzione NON e' attribuita (prima: nessuna riga)
+attr $LOG '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+# la sessione 1c VERA (senza H) resta com'era: nessuna riga di attribuzione, H/H_D NOT_RUN
+S1C=$W/logs/ptpad-sessione1c-20261027
+CB=$(find $S1C -name combinato.txt 2>/dev/null | head -1)
+if [ -n "$CB" ]; then
+	/usr/local/bin/python3 $AN $CB > $O/s1c.out 2>&1; u=$?
+	if [ $u = 4 ] && grep -q 'H1=SI' $O/s1c.out && ! grep -q '(attr-' $O/s1c.out && grep -qE '^  H +NOT_RUN' $O/s1c.out; then
+		echo "  ok      sessione 1c reale: H1=SI, H/H_D NOT_RUN, nessuna attribuzione"
+	else echo "  ERRATO  sessione 1c reale riletta: $(tr '\n' '|' < $O/s1c.out)"; nf=$((nf+1)); fi
+else echo "  ERRATO  combinato della sessione 1c non trovato"; nf=$((nf+1)); fi
+
+echo "P13: driver con casi H (VM finta)"
+dr hok B,C,H,A,H_D,A_D h1 0
+att $O/drv-hok/combinato.txt H HW_CONTROL_PASS
+att $O/drv-hok/combinato.txt H_D HW_CONTROL_PASS
+att $O/drv-hok/combinato.txt A PATH_COVERED_H1_REPRODUCED
+attr $O/drv-hok/combinato.txt '(attr-A)' H1_ATTRIBUITA_EMULATORE
+attr $O/drv-hok/combinato.txt '(attr-A_D)' H1_ATTRIBUITA_EMULATORE
+grep -q '^MAP .*pteaddr=fec6000' $O/drv-hok/combinato.txt && echo "  ok      riga MAP copiata nel combinato" || { echo "  ERRATO  MAP assente dal combinato"; nf=$((nf+1)); }
+[ "$(grep -c '^RFL ' $O/drv-hok/combinato.txt)" = 12 ] && echo "  ok      RFL before/after per i 6 casi" || { echo "  ERRATO  righe RFL: $(grep -c '^RFL ' $O/drv-hok/combinato.txt)"; nf=$((nf+1)); }
+dr hnv B,C,H,A,H_D,A_D h_noviol 0
+att $O/drv-hnv/combinato.txt H HW_CONTROL_NO_VIOLATION
+grep -q "^A b'g'" $O/ctr-hnv.acks && echo "  ok      H senza violazione e' un DATO: la sessione prosegue (ACK ad A)" || { echo "  ERRATO  sessione fermata dopo H_NO_VIOLATION"; nf=$((nf+1)); }
+attr $O/drv-hnv/combinato.txt '(attr-A)' H1_NON_ATTRIBUITA
+dr hgpa B,H,A h_gpa 2
+grep -q "^A b'g'" $O/ctr-hgpa.acks && { echo "  ERRATO  ACK ad A dopo un H malformato"; nf=$((nf+1)); } || echo "  ok      H con gpa sbagliato: STOP, nessun ACK ad A"
+att $O/drv-hgpa/combinato.txt A NOT_RUN_FERMATA
+dr hemul B,H,A h_emul 2
+att $O/drv-hemul/combinato.txt H INCONCLUSIVE_TEST_SETUP
+att $O/drv-hemul/combinato.txt A NOT_RUN_FERMATA
+/usr/local/bin/python3 $DRV --piano B,H,H --out $O/drv-hh -- /usr/bin/true > /dev/null 2>&1
+[ $? = 2 ] && echo "  ok      piano con H duplicato rifiutato" || { echo "  ERRATO  H duplicato accettato"; nf=$((nf+1)); }
+/usr/local/bin/python3 $DRV --piano B,X --out $O/drv-x -- /usr/bin/true > /dev/null 2>&1
+[ $? = 2 ] && echo "  ok      caso ignoto rifiutato" || { echo "  ERRATO  caso ignoto accettato"; nf=$((nf+1)); }
+
+echo "P14: correzione di H1 (parere di Astra sul caso H, §5): H1_CORRECTED_ARCH_PASS"
+AV="L1 viol=1 reason=48 qual=0x68b gpa=0xfec6000 paddr=0 pte0=$P0 pte1=$P0 dwr=0 ripadv=0"
+AVD="L1 viol=1 reason=48 qual=0x8b gpa=0xfec6000 paddr=0 pte0=$PA pte1=$PA dwr=0 ripadv=0"
+rcaso() {	# rcaso <nome> <ctr0> <ctr1> <rfe0> <rfe1> <riga L1> [est1] [rip] [rfl1]: caso emulato con RFE,EST,ENC,XINFO
+	printf 'CASE %s\nCTR before=%s\nRFL before=7\nRFE before=%s\nEST before=0\nENC before=0\nXINFO gla=ffffffffffc00000 rip=%s rip_atteso=406f40 va_d=ffffffffffc00000\n%s\nCTR after=%s\nRFL after=%s\nRFE after=%s\nEST after=%s\nENC after=0\nTERM alive\n' \
+	    "$1" "$2" "$4" "${8:-406f40}" "$6" "$3" "${9:-7}" "$5" "${7:-0}" >> "$LOG"
+}
+corr() {	# corr <file> <riga L1 di A> <rfe1 di A> [est1 di A] [rip di A] [rfl1 di A]: sessione corretta
+	LOG=$1; printf 'PLAN cases=B,C,H,A,H_D,A_D\n%s\n' "$MAPR" >| $LOG
+	caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+	caso C 11 12 "$(L1 0 0 0x0 $PAD $PAD 1 1)" alive
+	hcaso H 12 12 7 8 "$HV"
+	rcaso A 12 13 30 "$3" "$2" "${4:-0}" "${5:-406f40}" "${6:-7}"
+	hcaso H_D 13 13 8 9 "$HVD"
+	rcaso A_D 13 14 31 32 "$AVD"
+}
+corr $O/corr1.txt "$AV" 31
+att $O/corr1.txt A PATH_COVERED_ARCH_PASS
+att $O/corr1.txt C PATH_COVERED_ARCH_PASS
+attr $O/corr1.txt '(attr-A)' H1_CORRECTED_ARCH_PASS
+attr $O/corr1.txt '(attr-A_D)' H1_CORRECTED_ARCH_PASS
+/usr/local/bin/python3 $AN $O/corr1.txt > $O/corr1.out 2>&1 && echo "  ok      sessione corretta: nessun TEST_ERROR" || { echo "  ERRATO  sessione corretta: TEST_ERROR"; nf=$((nf+1)); }
+grep -q 'CORREZIONE: H1 corretta nei casi A,A_D' $O/corr1.out && grep -q 'H1=no' $O/corr1.out && echo "  ok      righe CORREZIONE e RIPRODUZIONE H1=no" || { echo "  ERRATO  righe di sintesi: $(grep -E 'CORREZ|RIPROD' $O/corr1.out | tr '\n' '|')"; nf=$((nf+1)); }
+# bit indefiniti 9-11 e bit 0 diversi da H: stessa categoria (non si confrontano)
+corr $O/corr2.txt "$(echo "$AV" | sed 's/qual=0x68b/qual=0x8a/')" 31
+attr $O/corr2.txt '(attr-A)' H1_CORRECTED_ARCH_PASS
+# gpa diverso, permessi diversi, RFE assente o +2: correzione NON attribuita
+corr $O/corr3.txt "$(echo "$AV" | sed 's/gpa=0xfec6000/gpa=0xfec3000/')" 31
+attr $O/corr3.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+corr $O/corr4.txt "$(echo "$AV" | sed 's/qual=0x68b/qual=0x683/')" 31
+attr $O/corr4.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+corr $O/corr5.txt "$AV" 32
+attr $O/corr5.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+LOG=$O/corr6.txt; printf 'PLAN cases=B,H,A\n%s\n' "$MAPR" >| $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+hcaso H 11 11 7 8 "$HV"
+caso A 11 12 "$AV" alive
+att $LOG A PATH_COVERED_ARCH_PASS
+attr $LOG '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+grep -q 'manca RFE' $O/corr6.txt 2>/dev/null; /usr/local/bin/python3 $AN $LOG | grep -q 'manca RFE' && echo "  ok      senza RFE: 'riflessione dell'emulatore non provata'" || { echo "  ERRATO  motivo senza RFE"; nf=$((nf+1)); }
+# driver con la VM finta corretta e RFE presente / assente
+dr corr B,C,H,A,H_D,A_D corretto 0
+attr $O/drv-corr/combinato.txt '(attr-A)' H1_CORRECTED_ARCH_PASS
+attr $O/drv-corr/combinato.txt '(attr-A_D)' H1_CORRECTED_ARCH_PASS
+[ "$(grep -c '^RFE ' $O/drv-corr/combinato.txt)" = 12 ] && echo "  ok      RFE before/after per i 6 casi" || { echo "  ERRATO  righe RFE: $(grep -c '^RFE ' $O/drv-corr/combinato.txt)"; nf=$((nf+1)); }
+RFE_CMD=/usr/bin/false dr norfe B,C,H,A,H_D,A_D corretto 0
+grep -q '^RFE ' $O/drv-norfe/combinato.txt && { echo "  ERRATO  righe RFE senza contatore"; nf=$((nf+1)); } || echo "  ok      contatore RFE assente: nessuna riga, sessione completa"
+grep -q 'RFE ASSENTE' $O/drv-norfe/driver.txt && echo "  ok      assenza di RFE annotata in driver.txt" || { echo "  ERRATO  nota RFE assente"; nf=$((nf+1)); }
+attr $O/drv-norfe/combinato.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+
+echo "P15: parere #110 §5.6 -- stale/nocache"
+# stale > 0 in A: sessione non idonea, nessuna correzione attribuita (nemmeno ad A_D)
+corr $O/st1.txt "$AV" 31 1
+v=$(/usr/local/bin/python3 $AN $O/st1.txt 2>/dev/null | awk '/\(globale\)/{print $2}')
+[ "$v" = SESSIONE_NON_IDONEA_H1 ] && echo "  ok      stale > 0 -> SESSIONE_NON_IDONEA_H1" || { echo "  ERRATO  stale: globale '$v'"; nf=$((nf+1)); }
+attr $O/st1.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+attr $O/st1.txt '(attr-A_D)' ATTRIBUZIONE_INCONCLUSIVA
+# EST/ENC assenti (RFE presente): correzione non attribuita
+LOG=$O/st2.txt; printf 'PLAN cases=B,H,A\n%s\n' "$MAPR" >| $LOG
+caso B 10 11 "$(L1 0 0 0x0 $P0 $PAD 1 1)" alive
+hcaso H 11 11 7 8 "$HV"
+printf 'CASE A\nCTR before=11\nRFL before=8\nRFE before=30\n%s\nCTR after=12\nRFL after=8\nRFE after=31\nTERM alive\n' "$AV" >> $LOG
+attr $LOG '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+/usr/local/bin/python3 $AN $LOG | grep -q 'mancano EST/ENC' && echo "  ok      senza EST/ENC: 'stato della causa non verificato'" || { echo "  ERRATO  motivo senza EST/ENC"; nf=$((nf+1)); }
+# driver: VM finta che fa salire stale in A
+dr stale B,C,H,A,H_D,A_D stale 0
+v=$(/usr/local/bin/python3 $AN $O/drv-stale/combinato.txt 2>/dev/null | awk '/\(globale\)/{print $2}')
+[ "$v" = SESSIONE_NON_IDONEA_H1 ] && echo "  ok      driver: stale > 0 -> SESSIONE_NON_IDONEA_H1" || { echo "  ERRATO  driver stale: '$v'"; nf=$((nf+1)); }
+[ "$(grep -c '^EST ' $O/drv-corr/combinato.txt)" = 12 ] && [ "$(grep -c '^ENC ' $O/drv-corr/combinato.txt)" = 12 ] && echo "  ok      EST/ENC before/after per i 6 casi" || { echo "  ERRATO  righe EST/ENC"; nf=$((nf+1)); }
+# la 1d reale (congelata) riletta: verdetti invariati
+CD=$W/logs/ptpad-sessione1d-20261027/drv/combinato.txt
+/usr/local/bin/python3 $AN $CD > $O/s1d.out 2>&1; u=$?
+[ $u = 4 ] && grep -q 'ATTRIBUZIONE: A=H1_ATTRIBUITA_EMULATORE A_D=H1_ATTRIBUITA_EMULATORE' $O/s1d.out && ! grep -q 'NON_IDONEA' $O/s1d.out && echo "  ok      sessione 1d congelata: verdetti invariati" || { echo "  ERRATO  1d riletta: $(tr '\n' '|' < $O/s1d.out)"; nf=$((nf+1)); }
+
+echo "P16: parere #111 §5 -- GLA/RIP dal VMCS12, riflessioni incrociate, retry"
+corr $O/x1.txt "$AV" 31 0 406f42
+attr $O/x1.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+/usr/local/bin/python3 $AN $O/x1.txt | grep -q 'GLA/RIP diversi' && echo "  ok      A col RIP avanzato: correzione NON attribuita" || { echo "  ERRATO  motivo RIP"; nf=$((nf+1)); }
+corr $O/x2.txt "$AV" 31 0 406f40 8
+attr $O/x2.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+/usr/local/bin/python3 $AN $O/x2.txt | grep -q 'riflessioni hardware 1' && echo "  ok      A con riflessione HARDWARE: correzione NON attribuita" || { echo "  ERRATO  motivo hw-reflect"; nf=$((nf+1)); }
+LOG=$O/x3.txt; echo "$MAPR" >| $LOG
+printf 'CASE H\nCTR before=50\nRFL before=7\nRFE before=30\n%s\nCTR after=50\nRFL after=8\nRFE after=31\nTERM alive\n' "$HV" >> $LOG
+att $LOG H INCONCLUSIVE_TEST_SETUP
+LOG=$O/x4.txt; echo "$MAPR" >| $LOG
+printf 'CASE H\nCTR before=50\nRFL before=7\nXINFO gla=ffffffffffc00000 rip=406f51 rip_atteso=406f4e va_d=ffffffffffc00000\n%s\nCTR after=50\nRFL after=8\nTERM alive\n' "$HV" >> $LOG
+att $LOG H INCONCLUSIVE_TEST_SETUP
+LOG=$O/x5.txt; echo "$MAPR" >| $LOG
+printf 'CASE H\nCTR before=50\nRFL before=7\nXINFO gla=ffffffffffc00000 rip=406f4e rip_atteso=406f4e va_d=ffffffffffc00000\n%s\nCTR after=50\nRFL after=8\nTERM alive\n' "$HV" >> $LOG
+att $LOG H HW_CONTROL_PASS
+dr xok B,C,H,A,H_D,A_D corretto 0
+attr $O/drv-xok/combinato.txt '(attr-A)' H1_CORRECTED_ARCH_PASS
+attr $O/drv-xok/combinato.txt '(attr-A_D)' H1_CORRECTED_ARCH_PASS
+[ "$(grep -c '^XINFO ' $O/drv-xok/combinato.txt)" = 4 ] && echo "  ok      XINFO copiata nei 4 casi con violazione" || { echo "  ERRATO  righe XINFO: $(grep -c '^XINFO ' $O/drv-xok/combinato.txt)"; nf=$((nf+1)); }
+dr xrip B,C,H,A,H_D,A_D xinfo_rip 0
+attr $O/drv-xrip/combinato.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+attr $O/drv-xrip/combinato.txt '(attr-A_D)' H1_CORRECTED_ARCH_PASS
+dr rtry B,C,H,A,H_D,A_D retry 0
+v=$(/usr/local/bin/python3 $AN $O/drv-rtry/combinato.txt 2>/dev/null | awk '/\(globale\)/{print $2}')
+[ "$v" = SESSIONE_NON_IDONEA_H1 ] && echo "  ok      retry > 0 -> SESSIONE_NON_IDONEA_H1" || { echo "  ERRATO  retry: '$v'"; nf=$((nf+1)); }
+attr $O/drv-rtry/combinato.txt '(attr-A)' ATTRIBUZIONE_INCONCLUSIVA
+# NB: corr ridefinisce LOG sul proprio file; il combinato finale si scrive a parte, con >| (il 28/10 un
+# "cat x6b >> $LOG" con LOG gia' uguale a x6b ha accodato il file a se stesso fino a riempire il disco)
+corr $O/x6b.txt "$AV" 31
+{ printf 'FBTDROP stderr=12 correlazione=NON_CERTA\n'; cat $O/x6b.txt; } >| $O/x6.txt
+v=$(/usr/local/bin/python3 $AN $O/x6.txt 2>/dev/null | awk '/\(globale\)/{print $2}' | head -1)
+[ "$v" = TEST_ERROR ] && echo "  ok      FBTDROP -> sessione non conclusiva (TEST_ERROR globale)" || { echo "  ERRATO  FBTDROP: '$v'"; nf=$((nf+1)); }
+
+echo "P17: H2 (parere #119 §3.2) -- controlli hardware HD, forma esatta dei casi D, quattro chiusure"
+MAPH='MAP va_d=ffffffffffc00000 d=fec3000 T=fec6000 pte=fec3007 livelli_codice=3 pteaddr=fec6000'
+XD='XINFO gla=ffffffffffc00000 rip=406f40 rip_atteso=406f40 va_d=ffffffffffc00000'
+XH='XINFO gla=ffffffffffc00000 rip=406f4e rip_atteso=406f4e va_d=ffffffffffc00000'
+dcaso() {	# dcaso <file> <caso> <xinfo> <riga L1> <dmmio> <drfl> <drfe> <sigla H2> <dh2>
+	printf 'CASE %s\nCTR before=10\nRFL before=20\nRFE before=30\n%s before=40\n' "$2" "$8" >> "$1"
+	[ "$3" != - ] && printf '%s\n' "$3" >> "$1"
+	printf '%s\nCTR after=%d\nRFL after=%d\nRFE after=%d\n%s after=%d\nTERM alive\n' "$4" $((10+$5)) $((20+$6)) $((30+$7)) "$8" $((40+$9)) >> "$1"
+}
+LDD='L1 viol=1 reason=48 qual=782 gpa=fec3000 paddr=1 pte0=27 pte1=27 dwr=0 ripadv=0'
+LDP='L1 viol=1 reason=48 qual=81 gpa=fec6000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0'
+LOG=$O/h2a.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA "$XD" "$LDD" 1 0 1 H2F 1
+att $LOG D_DATA PATH_COVERED_ARCH_PASS
+LOG=$O/h2b.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_PTP "$XD" "$LDP" 1 0 1 H2P 1
+att $LOG D_PTP PATH_COVERED_ARCH_PASS
+# ogni condizione della forma esatta, una per volta
+LOG=$O/h2c.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA "$XD" "$(echo "$LDD" | sed 's/gpa=fec3000/gpa=fec4000/')" 1 0 1 H2F 1
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2d.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA - "$LDD" 1 0 1 H2F 1
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2e.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA "$XD" "$LDD" 1 0 0 H2F 1
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2f.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA "$XD" "$LDD" 1 0 1 H2P 1
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2g.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA "$XD" "$LDD" 1 1 1 H2F 1
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2h.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_PTP "$XD" "$(echo "$LDP" | sed 's/qual=81/qual=80/')" 1 0 1 H2P 1
+att $LOG D_PTP INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2i.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA "$XD" "$(echo "$LDD" | sed 's/reason=48/reason=49/')" 1 0 1 H2F 1
+att $LOG D_DATA INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2j.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA "$XD" 'L1 viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1' 1 0 0 H2F 0
+att $LOG D_DATA PATH_COVERED_H2_NO_VIOLATION
+LOG=$O/h2k.txt; echo "$MAPH" >| $LOG; dcaso $LOG D_DATA "$XD" "$LDD" 0 1 0 H2F 0
+att $LOG D_DATA INCONCLUSIVE_HW_PREEMPTED
+# controlli hardware
+LOG=$O/h2l.txt; echo "$MAPH" >| $LOG; dcaso $LOG HD_DATA "$XH" "$LDD" 0 1 0 H2F 0
+att $LOG HD_DATA HW_CONTROL_PASS
+LOG=$O/h2m.txt; echo "$MAPH" >| $LOG; dcaso $LOG HD_PTP "$XH" "$(echo "$LDP" | sed 's/qual=81/qual=681/')" 0 1 0 H2P 0
+att $LOG HD_PTP HW_CONTROL_PASS
+LOG=$O/h2n.txt; echo "$MAPH" >| $LOG; dcaso $LOG HD_DATA "$XH" "$LDD" 1 1 0 H2F 0
+att $LOG HD_DATA INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2o.txt; echo "$MAPH" >| $LOG; dcaso $LOG HD_PTP "$XH" "$LDD" 0 1 0 H2P 0
+att $LOG HD_PTP INCONCLUSIVE_TEST_SETUP
+LOG=$O/h2p.txt; echo "$MAPH" >| $LOG; dcaso $LOG HD_DATA "$XH" 'L1 viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1' 0 0 0 H2F 0
+att $LOG HD_DATA HW_CONTROL_NO_VIOLATION
+# le chiusure senza risposta di L1 (sintetiche): tempo scaduto e VM uscita
+LOG=$O/h2q.txt; echo "$MAPH" >| $LOG; printf 'CASE D_DATA\nCTR before=10\nCTR after=900\nTERM timeout\n' >> $LOG
+att $LOG D_DATA H2_LOOP_SAME_RIP
+LOG=$O/h2r.txt; echo "$MAPH" >| $LOG; printf 'CASE D_DATA\nCTR before=10\nCTR after=11\nTERM timeout\n' >> $LOG
+att $LOG D_DATA INCONCLUSIVE_HANG
+LOG=$O/h2s.txt; echo "$MAPH" >| $LOG; printf 'CASE D_PTP\nCTR before=10\nENC before=0\nCTR after=11\nENC after=1\nTERM vm_exited\n' >> $LOG
+att $LOG D_PTP FAIL_CLOSED_STOP
+LOG=$O/h2t.txt; echo "$MAPH" >| $LOG; printf 'CASE D_PTP\nCTR before=10\nENC before=0\nCTR after=11\nENC after=0\nTERM vm_exited\n' >> $LOG
+att $LOG D_PTP INCONCLUSIVE_VM_EXIT
+LOG=$O/h2u.txt; echo "$MAPH" >| $LOG; printf 'CASE B\nCTR before=10\nCTR after=11\nTERM timeout\n' >> $LOG
+att $LOG B TEST_ERROR
+# il driver con la VM finta, contatori H2 da file
+H2=1 dr h2ok B,HD_DATA,D_DATA h2ok 0
+att $O/drv-h2ok/combinato.txt HD_DATA HW_CONTROL_PASS
+att $O/drv-h2ok/combinato.txt D_DATA PATH_COVERED_ARCH_PASS
+attr $O/drv-h2ok/combinato.txt '(evento-D_DATA)' H2_EVENT_PASS
+attr $O/drv-h2ok/combinato.txt '(effetti-D_DATA)' H2_SIDE_EFFECT_PASS
+H2=1 dr h2okp B,HD_PTP,D_PTP h2ok 0
+att $O/drv-h2okp/combinato.txt HD_PTP HW_CONTROL_PASS
+att $O/drv-h2okp/combinato.txt D_PTP PATH_COVERED_ARCH_PASS
+attr $O/drv-h2okp/combinato.txt '(evento-D_PTP)' H2_EVENT_PASS
+H2=1 dr h2q B,HD_DATA,D_DATA h2qual 0
+attr $O/drv-h2q/combinato.txt '(evento-D_DATA)' H2_QUAL_DIVERSA
+H2=1 dr h2l B,HD_DATA,D_DATA h2loop 3 6
+att $O/drv-h2l/combinato.txt D_DATA H2_LOOP_SAME_RIP
+pgrep -f "ptpad-finta-vm.py $O/ctr-h2l" >/dev/null && { echo "  ERRATO  la VM finta in ciclo e' ancora viva"; nf=$((nf+1)); } || echo "  ok      ciclo interrotto: nessun processo sopravvissuto"
+H2=1 dr h2s B,HD_PTP,D_PTP h2spento 2
+att $O/drv-h2s/combinato.txt D_PTP FAIL_CLOSED_STOP
+H2=1 dr h2n B,HD_DATA,D_DATA h2nessuna 2
+att $O/drv-h2n/combinato.txt D_DATA PATH_COVERED_H2_NO_VIOLATION
+# senza H2=1 i file non ci sono: contatori H2 ASSENTI, anche se l'host avesse il modulo H2 caricato
+dr h2x B,HD_DATA,D_DATA h2ok 2
+att $O/drv-h2x/combinato.txt D_DATA INCONCLUSIVE_TEST_SETUP
+grep -q 'H2F ASSENTE' $O/drv-h2x/driver.txt && echo "  ok      contatori H2 dal file di prova, mai dal sysctl dell'host" || { echo "  ERRATO  H2F non ASSENTE senza file"; nf=$((nf+1)); }
+
+echo "P18: H2-AD (parere #123 §4.6) -- evento e effetti separati, livelli, PULIZIA, esemplari REALI"
+pul() {	# pul <file> <PULITA|NON_PULITA> <uscita attesa>
+	/usr/local/bin/python3 $AN "$1" > "$1.an" 2>&1; u=$?
+	p=$(sed -n 's/^PULIZIA: \([A-Z_]*\).*/\1/p' "$1.an")
+	[ "$p" = "$2" ] && [ $u = $3 ] && echo "  ok      $(basename $1): PULIZIA $2, uscita $3" || { echo "  ERRATO  $(basename $1): PULIZIA '$p' uscita $u, attese $2 $3"; nf=$((nf+1)); }
+}
+# esemplari REALI della campagna H2-only (29/10), congelati: la regressione pulita e la fase 3 con A/D diversi
+FR=/mnt/linuxulator2/vm/nested-work/logs/h2only-campagna-congelamento-20261030
+attr $FR/data-combinato.txt '(evento-D_DATA)' H2_EVENT_PASS
+attr $FR/data-combinato.txt '(effetti-D_DATA)' H2_SIDE_EFFECT_FAIL
+cp $FR/data-combinato.txt $O/reale-data.txt; pul $O/reale-data.txt NON_PULITA 4
+cp $FR/reg-combinato.txt $O/reale-reg.txt; pul $O/reale-reg.txt PULITA 0
+# VM finta: casi _PDE/_ALL con riga LIV
+H2=1 dr h2ad1 B,HD_DATA_ALL,D_DATA_ALL h2ad_ok 0
+att $O/drv-h2ad1/combinato.txt HD_DATA_ALL HW_CONTROL_PASS
+att $O/drv-h2ad1/combinato.txt D_DATA_ALL PATH_COVERED_ARCH_PASS
+attr $O/drv-h2ad1/combinato.txt '(evento-D_DATA_ALL)' H2_EVENT_PASS
+attr $O/drv-h2ad1/combinato.txt '(effetti-D_DATA_ALL)' H2_SIDE_EFFECT_PASS
+pul $O/drv-h2ad1/combinato.txt PULITA 0
+H2=1 dr h2ad2 B,HD_DATA_ALL,D_DATA_ALL h2ad_sup 0
+attr $O/drv-h2ad2/combinato.txt '(effetti-D_DATA_ALL)' H2_SIDE_EFFECT_FAIL
+pul $O/drv-h2ad2/combinato.txt NON_PULITA 4
+H2=1 dr h2ad3 B,HD_DATA_PDE,D_DATA_PDE h2ad_sporco 0
+attr $O/drv-h2ad3/combinato.txt '(effetti-D_DATA_PDE)' EFFETTI_INCONCLUSIVI
+pul $O/drv-h2ad3/combinato.txt NON_PULITA 4
+H2=1 dr h2ad4 B,HD_PTP_ALL,D_PTP_ALL h2ad_ok 0
+attr $O/drv-h2ad4/combinato.txt '(evento-D_PTP_ALL)' H2_EVENT_PASS
+attr $O/drv-h2ad4/combinato.txt '(effetti-D_PTP_ALL)' H2_SIDE_EFFECT_PASS
+# oracolo HARDWARE da solo (sessione col modulo ORIGINALE, nessun caso D): tutti controlli, PULITA
+dr h2ad5 B,HD_DATA_PDE,HD_DATA_ALL,HD_PTP_ALL h2ad_sup 0
+att $O/drv-h2ad5/combinato.txt HD_DATA_ALL HW_CONTROL_PASS
+att $O/drv-h2ad5/combinato.txt HD_PTP_ALL HW_CONTROL_PASS
+grep -q '^LIV pml4=7>27 pdpt=7>27 pde=7>27 pte=7>7' $O/drv-h2ad5/combinato.txt && echo "  ok      riga LIV nel blocco del caso" || { echo "  ERRATO  riga LIV assente dal combinato"; nf=$((nf+1)); }
+pul $O/drv-h2ad5/combinato.txt PULITA 0
+# un caso fuori dagli esiti pieni rende la sessione NON_PULITA anche senza attribuzioni
+H2=1 dr h2ad6 B,HD_DATA,D_DATA h2nessuna 2
+pul $O/drv-h2ad6/combinato.txt NON_PULITA 4
+
+echo "P19: G1 (parere #124) -- precedenza fra dinieghi, esemplare REALE di G0"
+G0=/mnt/linuxulator2/vm/nested-work/logs/ptpad-sessione-hwor-20261030/drv/combinato.txt
+for x in HD_DATA HD_DATA_PDE HD_DATA_ALL HD_PTP HD_PTP_ALL; do att $G0 $x HW_CONTROL_PASS; done
+cp $G0 $O/reale-g0.txt; pul $O/reale-g0.txt PULITA 0
+grep -q '^LIV pml4=fec4007>fec4007 pdpt=fec5007>fec5007 pde=fec6007>fec6007 pte=fec3007>fec3007' $G0 && echo "  ok      G0: HD_DATA_ALL e HD_PTP_ALL non toccano nessun livello" || { echo "  ERRATO  righe LIV di G0"; nf=$((nf+1)); }
+H2=1 dr g1a B,H,HD_CONFLICT,D_CONFLICT h2ad_ok 0
+attr $O/drv-g1a/combinato.txt '(discr-HD_CONFLICT)' DISCRIMINANTE
+att $O/drv-g1a/combinato.txt HD_CONFLICT HW_CONTROL_PASS
+att $O/drv-g1a/combinato.txt D_CONFLICT PATH_COVERED_ARCH_PASS
+attr $O/drv-g1a/combinato.txt '(evento-D_CONFLICT)' H2_EVENT_PASS
+pul $O/drv-g1a/combinato.txt PULITA 0
+H2=1 dr g1b B,H_PDE,HD_CONFLICT_PDE,D_CONFLICT_PDE h2ad_ok 0
+attr $O/drv-g1b/combinato.txt '(evento-D_CONFLICT_PDE)' H2_EVENT_PASS
+attr $O/drv-g1b/combinato.txt '(effetti-D_CONFLICT_PDE)' H2_SIDE_EFFECT_PASS
+H2=1 dr g1c B,HD_CONFLICT,D_CONFLICT h2ad_prec_tab 0
+/usr/local/bin/python3 $AN $O/drv-g1c/combinato.txt | grep -q 'precedenza hardware: TABELLA' && echo "  ok      precedenza TABELLA riconosciuta nel controllo hardware" || { echo "  ERRATO  precedenza TABELLA non riconosciuta"; nf=$((nf+1)); }
+attr $O/drv-g1c/combinato.txt '(evento-D_CONFLICT)' ATTRIBUZIONE_INCONCLUSIVA
+pul $O/drv-g1c/combinato.txt NON_PULITA 4
+H2=1 dr g1d B,HD_CONFLICT_PDE,D_CONFLICT_PDE h2ad_prec_tab 0
+/usr/local/bin/python3 $AN $O/drv-g1d/combinato.txt | grep -q 'precedenza hardware: TABELLA' && echo "  ok      precedenza TABELLA sulla PDE (gpa = pdeaddr)" || { echo "  ERRATO  PDE non riconosciuta"; nf=$((nf+1)); }
+# sintetici: D_CONFLICT con la violazione della TABELLA (H1: RFE 1, H2F 0) e col gpa sbagliato
+MAPG='MAP va_d=ffffffffffc00000 d=fec3000 T=fec6000 pte=fec3007 livelli_codice=3 pdeaddr=fec5000 pteaddr=fec6000'
+LOG=$O/g1e.txt; echo "$MAPG" >| $LOG; dcaso $LOG D_CONFLICT "$XD" 'L1 viol=1 reason=48 qual=8b gpa=fec6000 paddr=0 pte0=fec3007 pte1=fec3007 dwr=0 ripadv=0' 1 0 1 H2F 0
+att $LOG D_CONFLICT PATH_COVERED_ARCH_PASS
+LOG=$O/g1f.txt; echo "$MAPG" >| $LOG; dcaso $LOG D_CONFLICT "$XD" 'L1 viol=1 reason=48 qual=8b gpa=fec4000 paddr=0 pte0=fec3007 pte1=fec3007 dwr=0 ripadv=0' 1 0 1 H2F 0
+att $LOG D_CONFLICT INCONCLUSIVE_TEST_SETUP
+LOG=$O/g1g.txt; echo "$MAPG" >| $LOG; dcaso $LOG D_CONFLICT "$XD" 'L1 viol=1 reason=48 qual=8b gpa=fec6000 paddr=0 pte0=fec3007 pte1=fec3007 dwr=0 ripadv=0' 1 0 1 H2F 1
+att $LOG D_CONFLICT INCONCLUSIVE_TEST_SETUP
+
+echo "P20: G1b (parere #126) -- controlli positivi H/H_PDE nella STESSA sessione, righe EPT"
+# l'esemplare REALE di G1-hw (senza H/H_PDE): ora NON discriminante e NON_PULITA
+G1R=/mnt/linuxulator2/vm/nested-work/logs/ptpad-h2ad-g1-hw-20261030/drv/combinato.txt
+attr $G1R '(discr-HD_CONFLICT)' NON_DISCRIMINANTE
+attr $G1R '(discr-HD_CONFLICT_PDE)' NON_DISCRIMINANTE
+cp $G1R $O/reale-g1hw.txt; pul $O/reale-g1hw.txt NON_PULITA 4
+dr g1b1 B,H,H_PDE,HD_CONFLICT,HD_CONFLICT_PDE g1b_ok 0
+att $O/drv-g1b1/combinato.txt H HW_CONTROL_PASS
+att $O/drv-g1b1/combinato.txt H_PDE HW_CONTROL_PASS
+att $O/drv-g1b1/combinato.txt HD_CONFLICT HW_CONTROL_PASS
+attr $O/drv-g1b1/combinato.txt '(discr-HD_CONFLICT)' DISCRIMINANTE
+attr $O/drv-g1b1/combinato.txt '(discr-HD_CONFLICT_PDE)' DISCRIMINANTE
+pul $O/drv-g1b1/combinato.txt PULITA 0
+# H_PDE senza violazione e' un DATO (come H: il driver non ferma), ma rende il conflitto PDE non discriminante
+dr g1b2 B,H,H_PDE,HD_CONFLICT,HD_CONFLICT_PDE g1b_pde_inefficace 0
+att $O/drv-g1b2/combinato.txt H_PDE HW_CONTROL_NO_VIOLATION
+attr $O/drv-g1b2/combinato.txt '(discr-HD_CONFLICT)' DISCRIMINANTE
+attr $O/drv-g1b2/combinato.txt '(discr-HD_CONFLICT_PDE)' NON_DISCRIMINANTE
+pul $O/drv-g1b2/combinato.txt NON_PULITA 4
+dr g1b3 B,H,H_PDE,HD_CONFLICT,HD_CONFLICT_PDE g1b_ept_diverso 0
+attr $O/drv-g1b3/combinato.txt '(discr-HD_CONFLICT)' DISCRIMINANTE
+attr $O/drv-g1b3/combinato.txt '(discr-HD_CONFLICT_PDE)' NON_DISCRIMINANTE
+pul $O/drv-g1b3/combinato.txt NON_PULITA 4
+
+echo "P21: H2_MMIO (parere #131) -- HM_RAM/HM_PTP/DM_PTP, Y libero, esito del runner separato dall'esito tecnico"
+runner_e() { grep -q "^RUNNER=$2$" "$1" && echo "  ok      $(basename $(dirname $1)): RUNNER=$2" || { echo "  ERRATO  $(basename $(dirname $1)): RUNNER $(grep '^RUNNER=' $1), atteso $2"; nf=$((nf+1)); }; }
+vivi_e() { pgrep -f "ptpad-finta-vm.py $O/ctr-$1" >/dev/null && { echo "  ERRATO  processi della VM finta $1 ancora vivi"; nf=$((nf+1)); } || echo "  ok      $1: nessun processo del gruppo sopravvissuto"; }
+dr hm1 B,HD_PTP,HM_RAM,HM_PTP hm_fab 0
+att $O/drv-hm1/combinato.txt HM_RAM HW_CONTROL_PASS
+att $O/drv-hm1/combinato.txt HM_PTP FABRICATED_L1_VIOLATION
+attr $O/drv-hm1/combinato.txt '(discr-HM_PTP)' DISCRIMINANTE
+runner_e $O/drv-hm1/combinato.txt COMPLETE
+dr hm2 B,HD_PTP,HM_RAM,HM_PTP hm_l0 0
+att $O/drv-hm2/combinato.txt HM_PTP L0_HANDLED
+dr hm3 B,HD_PTP,HM_RAM,HM_PTP hm_silent 3 6
+att $O/drv-hm3/combinato.txt HM_PTP TIMEOUT
+runner_e $O/drv-hm3/combinato.txt TIMED_OUT
+vivi_e hm3
+# #132 §3.2: il ciclo di riflessioni si ferma dal driver, senza aspettare il timeout (6 s)
+dr hm4 B,HD_PTP,HM_RAM,HM_PTP hm_loop 2 6
+att $O/drv-hm4/combinato.txt HM_PTP LOOP_RIFLESSIONI_FERMATO
+grep -q '^STOP kind=LOOP' $O/drv-hm4/combinato.txt && echo "  ok      hm4: STOP kind=LOOP prima del timeout" || { echo "  ERRATO  hm4: niente STOP kind=LOOP"; nf=$((nf+1)); }
+runner_e $O/drv-hm4/combinato.txt KILLED
+vivi_e hm4
+ms_e() {	# ms_e <nome> <motivo> <ms massimi>: la finestra degli errori si chiude per <motivo> entro <ms>
+	l=$(grep '^EVENT VMRUN_ERRORS' $O/drv-$1/combinato.txt)
+	m=$(echo "$l" | sed -n 's/.* ms=\([0-9]*\) motivo=\([a-z]*\)$/\1 \2/p')
+	if [ -n "$m" ] && [ "${m#* }" = "$2" ] && [ "${m% *}" -lt $3 ]; then echo "  ok      $1: finestra chiusa per $2 in ${m% *} ms (< $3)"; else echo "  ERRATO  $1: finestra '$l', attesi motivo=$2 entro $3 ms"; nf=$((nf+1)); fi
+}
+dr dm1 B,HM_RAM,DM_PTP dm_hot 0
+att $O/drv-dm1/combinato.txt DM_PTP HOT_LOOP_REPRODUCED
+attr $O/drv-dm1/combinato.txt '(discr-DM_PTP)' DISCRIMINANTE
+runner_e $O/drv-dm1/combinato.txt KILLED
+ms_e dm1 ripetuti 1500
+vivi_e dm1
+dr dm2 B,HM_RAM,DM_PTP dm_single 0
+att $O/drv-dm2/combinato.txt DM_PTP H2_MMIO_VM_RUN_ERROR_REPRODUCED
+runner_e $O/drv-dm2/combinato.txt KILLED
+ms_e dm2 finestra 4000
+vivi_e dm2
+dr dm3 B,HM_RAM,DM_PTP dm_exit 0
+att $O/drv-dm3/combinato.txt DM_PTP TERMINAL_ERROR_CONFIRMED
+runner_e $O/drv-dm3/combinato.txt VM_EXITED
+grep -q 'QEMU_TERMINATED_BY_DRIVER' $O/drv-dm3/combinato.txt && { echo "  ERRATO  dm3: il driver dichiara di aver ucciso una QEMU uscita da sola"; nf=$((nf+1)); } || echo "  ok      dm3: nessun segnale del driver, QEMU uscita da sola"
+vivi_e dm3
+dr dm4 B,HM_RAM,DM_PTP dm_timeout 3 6
+att $O/drv-dm4/combinato.txt DM_PTP TIMEOUT
+runner_e $O/drv-dm4/combinato.txt TIMED_OUT
+vivi_e dm4
+
+echo "P22: parere #132 -- raccolta delle regioni fail-closed, EPT12 del caso, criteri di FABRICATED, arresto anticipato di DM"
+nack_e() {	# nack_e <nome> <caso>: il caso non ha mai ricevuto l'ACK (L2 non e' partito)
+	grep -q "^$2 b'g'" $O/ctr-$1.acks 2>/dev/null && { echo "  ERRATO  $1: $2 ha ricevuto l'ACK"; nf=$((nf+1)); } || echo "  ok      $1: $2 senza ACK, L2 non e' partito"
+}
+reg_e() {	# reg_e <nome> <modo> <frammento del motivo>: raccolta rifiutata PRIMA di HM_RAM
+	dr $1 B,HD_PTP,HM_RAM,HM_PTP $2 2
+	att $O/drv-$1/combinato.txt HM_RAM NOT_RUN_FERMATA
+	att $O/drv-$1/combinato.txt HM_PTP NOT_RUN_FERMATA
+	grep '^STOP kind=GATE motivo=regioni prima di HM_RAM' $O/drv-$1/combinato.txt | grep -q -- "$3" && echo "  ok      $1: STOP prima di HM_RAM ($3)" || { echo "  ERRATO  $1: motivo atteso '$3', trovato '$(grep '^STOP' $O/drv-$1/combinato.txt)'"; nf=$((nf+1)); }
+	nack_e $1 HM_RAM
+	nack_e $1 HM_PTP
+	runner_e $O/drv-$1/combinato.txt STOPPED
+}
+reg_e r1 hm_tronca 'non chiusa da PCI_SCAN_COMPLETE'
+reg_e r2 hm_senza_pcidev 'fuori posto'
+reg_e r3 hm_manca_bar 'enumerazione PCI incompleta'
+reg_e r4 hm_barbad 'malformata o BARBAD'
+reg_e r5 hm_ram 'RAM_SIZE 20000000 inattesa'
+reg_e r6 hm_yp_y 'coincide con Y'
+reg_e r7 hm_bar_parziale 'Y_NON_LIBERO: bar 10/1 copre Y (40000800+800)'
+reg_e r8 hm_overflow 'non decodificabile'
+reg_e r9 hm_rom_y 'Y_NON_LIBERO: rom 10'
+reg_e r10 hm_bridge_y 'Y_NON_LIBERO: bridge 18 pref'
+reg_e r11 hm_bridge_senza 'bridge senza riga BRIDGE'
+reg_e r12 hm_bar_y 'Y_NON_LIBERO: bar 10/1'
+# controlli del bordo: la stessa raccolta con la regione che NON tocca Y passa (il rifiuto non e' indiscriminato)
+dr r13 B,HD_PTP,HM_RAM,HM_PTP hm_bar_bordo 0
+att $O/drv-r13/combinato.txt HM_PTP FABRICATED_L1_VIOLATION
+dr r14 B,HD_PTP,HM_RAM,HM_PTP hm_bridge_alto 0
+att $O/drv-r14/combinato.txt HM_PTP FABRICATED_L1_VIOLATION
+# EPT12 del caso
+dr e1 B,HD_PTP,HM_RAM,HM_PTP hm_eptbad 2
+att $O/drv-e1/combinato.txt HM_RAM HW_CONTROL_PASS
+att $O/drv-e1/combinato.txt HM_PTP INCONCLUSIVE_TEST_SETUP
+grep -q '^STOP kind=GATE motivo=EPTBAD HM_PTP' $O/drv-e1/combinato.txt && echo "  ok      e1: EPTBAD da L1 -> STOP, L2 non eseguito" || { echo "  ERRATO  e1: EPTBAD non fermato"; nf=$((nf+1)); }
+awk '/^CASE HM_PTP/{f=1} f && /^L1 /{print}' $O/drv-e1/combinato.txt | grep -q . && { echo "  ERRATO  e1: riga L1 dopo EPTBAD"; nf=$((nf+1)); } || echo "  ok      e1: nessuna riga L1 nel caso HM_PTP"
+for m in e2:hm_ept_perm:'non RWX verso' e3:hm_ept_verso:'traduzione EPT12 del walk non conforme' e4:hm_remap:'rimappata durante il caso' \
+    f1:hm_fab_emul:'non e. il percorso hardware' f2:hm_fab_rip:'GLA o RIP' f3:hm_fab_2rfl:'delta riflessioni 2 != 1'; do
+	n=${m%%:*}; r=${m#*:}; md=${r%%:*}; fr=${r#*:}
+	dr $n B,HD_PTP,HM_RAM,HM_PTP $md 0
+	att $O/drv-$n/combinato.txt HM_PTP INCONCLUSIVE_TEST_SETUP
+	/usr/local/bin/python3 $AN $O/drv-$n/combinato.txt | grep '^  HM_PTP ' | grep -q -- "$fr" && echo "  ok      $n: HM_PTP inconclusivo ($fr)" || { echo "  ERRATO  $n: motivo atteso '$fr'"; nf=$((nf+1)); }
+	attr $O/drv-$n/combinato.txt '(conferma-HM_PTP)' NESSUNA
+done
+attr $O/drv-hm1/combinato.txt '(conferma-HM_PTP)' FABRICATED_L1_VIOLATION_CONFIRMED
+attr $O/drv-hm2/combinato.txt '(conferma-HM_PTP)' NESSUNA
+# DM: arresto anticipato e separazione degli esiti (#132 §3.2)
+dr k1 B,HM_RAM,DM_PTP dm_err3 0
+att $O/drv-k1/combinato.txt DM_PTP REPEATED_VM_RUN_ERRORS
+ms_e k1 ripetuti 1500
+runner_e $O/drv-k1/combinato.txt KILLED
+vivi_e k1
+dr k2 B,HM_RAM,DM_PTP dm_fuori 2
+att $O/drv-k2/combinato.txt DM_PTP NOT_RUN_FERMATA
+ms_e k2 subito 1000
+nack_e k2 DM_PTP
+runner_e $O/drv-k2/combinato.txt KILLED
+vivi_e k2
+dr k3 B,HM_RAM,DM_PTP dm_progresso 0
+att $O/drv-k3/combinato.txt DM_PTP INCONCLUSIVE_TEST_SETUP
+vivi_e k3
+dr k4 B,HM_RAM,DM_PTP dm_vivo_kill 0 30
+att $O/drv-k4/combinato.txt DM_PTP H2_MMIO_VM_RUN_ERROR_REPRODUCED
+grep -q '^EVENT QEMU_TERMINATED_BY_DRIVER segnale=KILL' $O/drv-k4/combinato.txt && echo "  ok      k4: QEMU sorda al TERM, il driver passa al KILL" || { echo "  ERRATO  k4: nessun KILL dopo il TERM ignorato"; nf=$((nf+1)); }
+runner_e $O/drv-k4/combinato.txt KILLED
+vivi_e k4
+DRV_EXTRA=--collaudo-killpg-fallito dr k5 B,HM_RAM,DM_PTP dm_single 5 30
+runner_e $O/drv-k5/combinato.txt UNKNOWN
+grep -q '^EVENT KILL_FAILED segnale=TERM errno=1' $O/drv-k5/combinato.txt && grep -q '^EVENT SURVIVORS ' $O/drv-k5/combinato.txt && echo "  ok      k5: killpg fallito e superstiti registrati, ripristino NON dichiarato" || { echo "  ERRATO  k5: KILL_FAILED o SURVIVORS mancanti"; nf=$((nf+1)); }
+att $O/drv-k5/combinato.txt DM_PTP H2_MMIO_VM_RUN_ERROR_REPRODUCED
+pkill -KILL -f "ptpad-finta-vm.py $O/ctr-k5" ; sleep 1
+vivi_e k5
+# DM reale 30/10: UN errore di VM_RUN, QEMU rientra, L1 risponde (movsq saltato), la serie finisce. Prima: eccezione
+# nel driver (chiudi_errore con aperto None) e TERM bhyve_died aggiunto al caso gia' chiuso
+dr k6 B,HM_RAM,DM_PTP dm_salta 0
+att $O/drv-k6/combinato.txt DM_PTP INSTRUCTION_SKIPPED_AFTER_VMRUN_ERROR
+runner_e $O/drv-k6/combinato.txt COMPLETE
+grep -q 'Traceback' $O/drv-k6.out && { echo "  ERRATO  k6: eccezione nel driver"; nf=$((nf+1)); } || echo "  ok      k6: nessuna eccezione nel driver"
+[ "$(awk '/^CASE DM_PTP/,0' $O/drv-k6/combinato.txt | grep -c '^TERM ')" = 1 ] && echo "  ok      k6: un solo TERM nel caso DM_PTP" || { echo "  ERRATO  k6: TERM multipli nel caso DM_PTP"; nf=$((nf+1)); }
+grep -q 'motivo=l1$' $O/drv-k6/combinato.txt && echo "  ok      k6: finestra chiusa dalla risposta di L1" || { echo "  ERRATO  k6: manca motivo=l1"; nf=$((nf+1)); }
+vivi_e k6
+
+echo "P24: parere #136 §6.1 -- QEMU con la porta di VM_RUN: nessun VM_RUN dopo l'errore (FBT), GATE_CONTAINED"
+/usr/local/bin/python3 - $(cd "$(dirname "$0")" && pwd) > $O/vmrun-unit.out 2>&1 <<'FINE_VMRUN_UNIT_136'
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location('drv', sys.argv[1] + '/ptpad-drive.py')
+d = importlib.util.module_from_spec(sp); sp.loader.exec_module(d)
+base = """== FBT PRONTA == driver=10
+FBTEV t=300 pid=20 tid=9 k=vmrun
+FBTEV t=100 pid=20 tid=9 k=vmrun
+FBTEV t=200 pid=20 tid=9 k=mmio
+FBTEV t=400 pid=20 tid=9 k=vmrun_err rc=14
+%s== FBT CHIUSA =="""
+r1 = d.vmrun_dopo_errore(base % '', {20})
+r2 = d.vmrun_dopo_errore(base % 'FBTEV t=500 pid=20 tid=9 k=vmrun\nFBTEV t=600 pid=20 tid=9 k=vmrun\n', {20})
+r3 = d.vmrun_dopo_errore((base % '').replace('== FBT CHIUSA ==', ''), {20})
+r4 = d.vmrun_dopo_errore(base % 'FBTEV t=500 pid=21 tid=9 k=vmrun\n', {20})
+r5 = d.vmrun_dopo_errore(base.replace('FBTEV t=400 pid=20 tid=9 k=vmrun_err rc=14\n', '') % '', {20})
+# #137 §5: finestra del caso dai marcatori del driver (pid 10), anche fuori ordine nel file
+m = 'FBTEV t=350 pid=10 tid=1 k=mark m=ack-DM_PTP\nFBTEV t=50 pid=10 tid=1 k=mark m=ack-B\nFBTEV t=60 pid=10 tid=1 k=mark m=l1-B\n'
+r6 = d.vmrun_dopo_errore(base % m, {20}, 10)
+r7 = d.vmrun_dopo_errore(base % 'FBTEV t=350 pid=10 tid=1 k=mark m=l1-HM_RAM\n', {20}, 10)
+r8 = d.vmrun_dopo_errore(base % 'FBTEV t=350 pid=99 tid=1 k=mark m=ack-DM_PTP\n', {20}, 10)
+r9 = d.vmrun_dopo_errore(base % 'FBTEV t=500 pid=20 tid=8 k=vmrun\n', {20})
+ok = (r1 == {'errori': 1, 'dopo': 0, 'rc': 14, 'caso': None, 'tids': 1, 'prima_cont': None} and r2['dopo'] == 2 and r3 is None and r4 is None
+      and r5 == {'errori': 0, 'dopo': 0, 'rc': None, 'caso': None, 'tids': 1, 'prima_cont': None} and r6['caso'] == 'DM_PTP' and r7['caso'] is None
+      and r8['caso'] is None and r9['tids'] == 2 and r9['dopo'] == 1)
+print(r1, r2, r3, r4, r5, r6, r7, r8, 'OK' if ok else 'ERRATO')
+sys.exit(0 if ok else 1)
+FINE_VMRUN_UNIT_136
+if [ $? = 0 ]; then echo "  ok      vmrun_dopo_errore: ordine, VM_RUN dopo l'errore, traccia non chiusa, pid estraneo, nessun errore"; else echo "  ERRATO  vmrun_dopo_errore: $(cat $O/vmrun-unit.out)"; nf=$((nf+1)); fi
+dr g1 B,HM_RAM,DM_PTP dm_porta 0
+att $O/drv-g1/combinato.txt DM_PTP INCONCLUSIVE_TEST_SETUP
+grep -q '^EVENT QEMU_PORTA bhyve: vCPU 0' $O/drv-g1/combinato.txt && grep -q '^EVENT QEMU_PORTA_VM ' $O/drv-g1/combinato.txt && echo "  ok      g1: righe della porta di QEMU registrate come EVENT nel caso" || { echo "  ERRATO  g1: EVENT QEMU_PORTA mancanti"; nf=$((nf+1)); }
+/usr/local/bin/python3 $AN $O/drv-g1/combinato.txt | grep '^  DM_PTP ' | grep -q 'senza traccia FBT' && echo "  ok      g1: senza FBT il contenimento NON e' dichiarato" || { echo "  ERRATO  g1: senza FBT non inconclusivo"; nf=$((nf+1)); }
+runner_e $O/drv-g1/combinato.txt VM_EXITED
+vivi_e g1
+for x in "0 14 DM_PTP 1 0,0,1 GATE_CONTAINED_AFTER_EFAULT" "2 14 DM_PTP 1 0,0,1 GATE_FAILED" \
+    "0 5 DM_PTP 1 0,0,1 INCONCLUSIVE_TEST_SETUP" "0 14 HM_RAM 1 0,0,1 INCONCLUSIVE_TEST_SETUP" \
+    "0 14 - 1 0,0,1 INCONCLUSIVE_TEST_SETUP" "0 14 DM_PTP 2 0,0,1 INCONCLUSIVE_TEST_SETUP" \
+    "0 14 DM_PTP 1 31,1,1 INCONCLUSIVE_TEST_SETUP" "0 14 DM_PTP 1 0,0,0 INCONCLUSIVE_TEST_SETUP" \
+    "0 14 DM_PTP 1 nessuno INCONCLUSIVE_TEST_SETUP"; do
+	set -- $x
+	f=$O/g1-fbtv-$1-$2-$3-$4-$5.txt
+	cp $O/drv-g1/combinato.txt $f
+	if [ "$5" != nessuno ]; then echo "$5" | awk -F, '{printf "FBTSTATO stderr=%s righe_perdite=%s chiusa=%s\n", $1, $2, $3}' >> $f; fi
+	echo "FBTV errori=1 dopo_errore=$1 rc=$2 caso=$3 tid=$4" >> $f
+	att $f DM_PTP $6
+done
+# #137 §5: senza l'evento della porta della VM, o con una riflessione a L1, il contenimento NON si dichiara
+grep -v '^EVENT QEMU_PORTA_VM ' $O/g1-fbtv-0-14-DM_PTP-1-0,0,1.txt > $O/g1-senza-porta-vm.txt
+att $O/g1-senza-porta-vm.txt DM_PTP INCONCLUSIVE_TEST_SETUP
+awk '/^CASE DM_PTP/{c=1} c && /^RFL after=/ && !f {sub(/=.*/, "=9999"); f=1} {print}' $O/g1-fbtv-0-14-DM_PTP-1-0,0,1.txt > $O/g1-rfl.txt
+att $O/g1-rfl.txt DM_PTP INCONCLUSIVE_TEST_SETUP
+# formato FBTV precedente (senza caso=): fail-closed
+cp $O/drv-g1/combinato.txt $O/g1-fbtv-vecchio.txt; echo "FBTV errori=1 dopo_errore=0 rc=14 caso=DM_PTP" >> $O/g1-fbtv-vecchio.txt
+att $O/g1-fbtv-vecchio.txt DM_PTP TEST_ERROR
+# #137 §4: identita' di esecuzione (binario e libvmmapi in uso, da procstat) registrata dal driver
+DRV_EXTRA="--ident-comm python" dr g2 B,HM_RAM dm_porta 0
+grep -q '^IDENT pid=[0-9]* bin=/.*python.* libvmmapi=assente$' $O/drv-g2/combinato.txt && echo "  ok      g2: IDENT con binario in uso (procstat) e libvmmapi" || { echo "  ERRATO  g2: IDENT mancante o malformata: $(grep IDENT $O/drv-g2/combinato.txt)"; nf=$((nf+1)); }
+echo "P25: pareri #140 §3 / #141 §3 -- cancello di osservabilita' QMP (-S, capabilities, READY, cont, EOF)"
+/usr/local/bin/python3 - $(cd "$(dirname "$0")" && pwd) "$O/qmp-finto.sock" > $O/qmp-unit.out 2>&1 <<'FINE_QMP_UNIT_141'
+import importlib.util, sys, socket, threading, queue, time
+sp = importlib.util.spec_from_file_location('drv', sys.argv[1] + '/ptpad-drive.py')
+d = importlib.util.module_from_spec(sp); sp.loader.exec_module(d)
+P = sys.argv[2]
+ordine = []
+def server(path, modo):
+	srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); srv.bind(path); srv.listen(1)
+	if modo == 'tardivo':
+		time.sleep(1.0)			# il socket accetta tardi: con -S la VM e' comunque ferma
+	c, _ = srv.accept(); f = c.makefile('rb')
+	c.sendall(b'{"QMP": {"version": {}, "capabilities": []}}\n')
+	f.readline()
+	if modo == 'rifiuta':
+		c.sendall(b'{"error": {}}\n'); time.sleep(0.5); c.close(); return
+	c.sendall(b'{"return": {}}\n')
+	l = f.readline()
+	ordine.append(('cont', b'cont' in l, 'segnato' in ordine))
+	c.sendall(b'{"return": {}}\n')
+	if modo != 'muto':
+		c.sendall(b'{"event": "SHUTDOWN", "data": {"guest": false, "reason": "host-error"}}\n')
+	c.close()
+def prova(modo, attesa=5.0):
+	p = P + '-' + modo
+	if modo != 'assente':
+		threading.Thread(target=server, args=(p, modo), daemon=True).start()
+		time.sleep(0.1)
+	q = queue.Queue()
+	del ordine[:]
+	d.qmp_lettore(p, q, lambda: ordine.append('segnato'), attesa)
+	r = []
+	while not q.empty():
+		r.append(q.get()[2])
+	return r, list(ordine)
+r, o = prova('normale')
+ok1 = (r.index('QMP_READY') < r.index('QMP_CONT_INVIATO') and r[-1] == 'QMP_EOF' and
+       d.qmp_evento([x for x in r if 'SHUTDOWN' in x][0]) == 'EVENT QMP_SHUTDOWN guest=false reason=host-error' and
+       o == ['segnato', ('cont', True, True)])
+r2, o2 = prova('tardivo')
+ok2 = 'QMP_READY' in r2 and 'QMP_EOF' in r2
+r3, o3 = prova('rifiuta')
+ok3 = any(x.startswith('QMP_NON_PRONTO capabilities') for x in r3) and 'QMP_CONT_INVIATO' not in r3 and o3 == []
+r4, o4 = prova('assente', 0.5)
+ok4 = len(r4) == 1 and r4[0].startswith('QMP_NON_PRONTO connessione')
+r5, o5 = prova('muto')
+ok5 = r5[-1] == 'QMP_EOF' and not any('SHUTDOWN' in x for x in r5)
+print(ok1, ok2, ok3, ok4, ok5, r, r3, r4, 'OK' if all((ok1, ok2, ok3, ok4, ok5)) else 'ERRATO')
+sys.exit(0 if all((ok1, ok2, ok3, ok4, ok5)) else 1)
+FINE_QMP_UNIT_141
+if [ $? = 0 ]; then echo "  ok      qmp_lettore: READY prima del cont, marcatore prima del cont, accettazione tardiva, capabilities rifiutate (nessun cont), socket assente, EOF senza SHUTDOWN"; else echo "  ERRATO  qmp: $(cat $O/qmp-unit.out)"; nf=$((nf+1)); fi
+DRV_EXTRA="--qmp $O/ctr-q1.qmp.sock" dr q1 B,HM_RAM,DM_PTP dm_porta_qmp 0
+for e in 'EVENT QMP_READY' 'EVENT QMP_CONT_INVIATO' 'EVENT QMP_SHUTDOWN guest=false reason=host-error' 'EVENT QMP_EOF' 'EVENT QMP_CHIUSURA eof=1' 'VM_RC=1'; do
+	grep -q "^$e" $O/drv-q1/combinato.txt && echo "  ok      q1: $e" || { echo "  ERRATO  q1: manca $e"; nf=$((nf+1)); }
+done
+attr $O/drv-q1/combinato.txt '(osservabilita-QMP)' QMP_ORDER_UNPROVEN
+attr $O/drv-q1/combinato.txt '(arresto-QEMU)' NON_OSSERVATO
+attr $O/drv-q1/combinato.txt '(uscita-QEMU)' EXIT_FAILURE_OBSERVED
+fv() {	# fv <file d'origine> <nuovo> <prima_cont>: aggiunge stato FBT pulito e FBTV
+	cp $1 $2; echo "FBTSTATO stderr=0 righe_perdite=0 chiusa=1" >> $2; echo "FBTV errori=1 dopo_errore=0 rc=14 caso=DM_PTP tid=1 prima_cont=$3" >> $2
+}
+fv $O/drv-q1/combinato.txt $O/q1-pronto.txt 0
+attr $O/q1-pronto.txt '(osservabilita-QMP)' QMP_READY_BEFORE_FIRST_VMRUN
+attr $O/q1-pronto.txt '(arresto-QEMU)' HOST_ERROR_REPORTED
+att $O/q1-pronto.txt DM_PTP GATE_CONTAINED_AFTER_EFAULT
+fv $O/drv-q1/combinato.txt $O/q1-tardi.txt 3
+attr $O/q1-tardi.txt '(osservabilita-QMP)' QMP_LATE
+attr $O/q1-tardi.txt '(arresto-QEMU)' NON_OSSERVATO
+DRV_EXTRA="--qmp $O/ctr-q2.qmp.sock" dr q2 B,HM_RAM,DM_PTP dm_porta_qmp_rifiuta 2
+grep -q '^STOP kind=QMP motivo=QMP_NON_PRONTO capabilities' $O/drv-q2/combinato.txt && echo "  ok      q2: capabilities rifiutate -> STOP, VM mai fatta partire" || { echo "  ERRATO  q2: niente STOP kind=QMP"; nf=$((nf+1)); }
+[ "$(grep -c '^CASE ' $O/drv-q2/combinato.txt)" = 0 ] && echo "  ok      q2: nessun caso eseguito (L1 mai partito)" || { echo "  ERRATO  q2: casi eseguiti senza QMP pronto"; nf=$((nf+1)); }
+att $O/drv-q2/combinato.txt B NOT_RUN_FERMATA
+vivi_e q2
+DRV_EXTRA="--qmp $O/ctr-q3.qmp.sock" dr q3 B,HM_RAM,DM_PTP dm_porta_qmp_muto 0
+fv $O/drv-q3/combinato.txt $O/q3-pronto.txt 0
+attr $O/q3-pronto.txt '(arresto-QEMU)' SHUTDOWN_ASSENTE
+DRV_EXTRA="--qmp $O/ctr-q4.qmp.sock" dr q4 B,HM_RAM,DM_PTP dm_porta_qmp_panic 0
+fv $O/drv-q4/combinato.txt $O/q4-pronto.txt 0
+attr $O/q4-pronto.txt '(arresto-QEMU)' CAUSA_GUEST_PANIC_GUEST_FALSE
+# la sessione r10 (nessun QMP): monitor non osservato, nessuna conclusione sull'arresto
+attr $O/g1-fbtv-0-14-DM_PTP-1-0,0,1.txt '(arresto-QEMU)' NON_OSSERVATO
+echo "P23: parere #134 §7 -- il driver chiude cio' che possiede anche se crolla o viene ucciso"
+DRV_EXTRA=--collaudo-eccezione dr x2 B,HM_RAM silenzio 1 30
+grep -q "pulizia finale: segnale 15 al gruppo" $O/drv-x2.out && echo "  ok      x2: eccezione nel driver -> pulizia finale del gruppo" || { echo "  ERRATO  x2: nessuna pulizia finale dopo l'eccezione"; nf=$((nf+1)); }
+vivi_e x2
+echo 1000 >| $O/ctr-x3; echo 5000 >| $O/ctr-x3.rfl; mkdir -p $O/ctr-x3.h2
+/usr/local/bin/python3 $DRV --piano B,HM_RAM --out $O/drv-x3 --timeout 60 --h2-dir $O/ctr-x3.h2 \
+    --ctr-cmd "cat $O/ctr-x3" --rfl-cmd "cat $O/ctr-x3.rfl" --rfe-cmd false --est-cmd false --enc-cmd false \
+    --rtx-cmd false --rtr-cmd false -- /usr/local/bin/python3 $FVM $O/ctr-x3 silenzio > $O/drv-x3.out 2>&1 &
+px3=$!
+sleep 3
+kill -TERM $px3; wait $px3; u=$?
+[ $u = 143 ] && echo "  ok      x3: driver ucciso con TERM -> uscita 143" || { echo "  ERRATO  x3: uscita $u dopo TERM"; nf=$((nf+1)); }
+grep -q "pulizia finale: segnale 15 al gruppo" $O/drv-x3.out && echo "  ok      x3: TERM al driver -> pulizia finale del gruppo" || { echo "  ERRATO  x3: nessuna pulizia finale dopo TERM"; nf=$((nf+1)); }
+vivi_e x3
+pgrep -f "ptpad-finta-vm.py $O/" >/dev/null && { echo "  ERRATO  VM finte di questa suite ancora vive: $(pgrep -f "ptpad-finta-vm.py $O/" | tr '\n' ' ')"; nf=$((nf+1)); } || echo "  ok      fine suite: nessuna VM finta viva"
+
+echo "controlli errati: $nf"
+[ $nf -eq 0 ]

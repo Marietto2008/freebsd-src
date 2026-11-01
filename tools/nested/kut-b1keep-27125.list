@@ -1,0 +1,7 @@
+# Parere #80 §3: suite B1 sul modulo 27125f004917, vept_keep=1, verify HPA=1, retry 1. 5 test = 5 VM QEMU (vm2).
+# Binario identificato vmxc-plain.flat (kut f4a29d65; codice B1 invariato da 45d77ef5).
+b1_casi     | vmxc-plain.flat | vmx_ept_b1_test         | -cpu max | 1 | 1024 | 180
+b1_persist  | vmxc-plain.flat | vmx_ept_b1_persist_test | -cpu max | 1 | 1024 | 1200
+b1_conc     | vmxc-plain.flat | vmx_ept_b1_conc_test    | -cpu max | 2 | 1024 | 600
+b1_conc4    | vmxc-plain.flat | vmx_ept_b1_conc4_test   | -cpu max | 4 | 1024 | 900
+b1_memgen   | vmxc-plain.flat | vmx_ept_b1_memgen_test  | -cpu max | 1 | 1024 | 180

@@ -1,0 +1,2 @@
+# Parere #82: b1_race sul modulo 27125f004917 (binario vmxc-plain.flat, kut f4a29d65). 1 VM per prova.
+b1_race | vmxc-plain.flat | vmx_ept_b1_race_test | -cpu max | 1 | 1024 | 300

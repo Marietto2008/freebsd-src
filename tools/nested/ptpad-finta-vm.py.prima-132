@@ -1,0 +1,222 @@
+#!/usr/local/bin/python3
+# ptpad-finta-vm.py -- Claude 27/10/2026, parere #106. L1 FINTO per collaudare ptpad-drive.py
+# senza VM: parla il protocollo di ptpad_test.c.inc su stdin/stdout e simula il contatore host
+# in un file. Nessun kernel, nessun vmm.
+#   ptpad-finta-vm.py <file contatore> <modo>
+# modi: ok (risposte plausibili, delta 1), eco_sbagliata, noack, muore_d (errore di VM_RUN nel caso
+# D: stampa "Error running vm" su stderr e resta in un anello che fa salire il contatore, come QEMU),
+# muore_b (errore di VM_RUN nel caso B), silenzio (non risponde dopo CASE), senza_runner (attende
+# il piano 2 s, poi "skip" senza eseguire casi).
+# Parere #107: b_errato (B risponde senza scrivere A/D, poi L1 stampa CASE C e ATTENDE: il driver non
+# deve mandare l'ACK), delta2 (il caso A fa salire il contatore di 2), fuori_seq (dopo B stampa
+# CASE A invece di C). Ogni byte ricevuto come ACK e' annotato in <file contatore>.acks.
+# Caso H (dopo la sessione 1c): stampa PTPAD MAP con pteaddr; i casi H/H_D NON fanno salire il
+# contatore mmio ma quello delle riflessioni (<file contatore>.rfl) se c'e' violazione. Modi: h1 (A e
+# A_D riproducono H1, H/H_D violano: attribuzione all'emulatore), h_noviol (A/A_D H1 e H/H_D passano
+# SENZA violazione), h_gpa (H viola su un gpa che non e' la PTE di D), h_emul (H fa salire mmio).
+# Correzione di H1: corretto (A/A_D ricevono dall'emulatore la stessa violazione di H/H_D e fanno
+# salire anche <file contatore>.rfe, le riflessioni dell'emulatore). Parere #111: prima di ogni risposta
+# con violazione stampa PTPAD XINFO (GLA e RIP); xinfo_rip (A con RIP avanzato), retry (RTR sale in A).
+# H2 (29/10, parere #119): h2ok (D_DATA/D_PTP ricevono dall'emulatore la violazione ESATTA che
+# HD_DATA/HD_PTP ricevono dall'hardware; salgono mmio, RFE e H2F/H2P in <file contatore>.h2/),
+# h2qual (D_DATA con il bit 9 diverso da HD_DATA), h2loop (caso D: nessuna risposta, l'emulazione si
+# ripete), h2spento (caso D: ENC sale e la VM esce da sola), h2nessuna (D_DATA scrive D senza violazione).
+# H2-AD (30/10, parere #123): casi _PDE/_ALL e riga PTPAD LIV (quattro livelli prima>dopo) nei modi h2ad_*:
+# h2ad_ok (emulatore e hardware lasciano tutto com'era), h2ad_sup (l'hardware accende A nei livelli superiori,
+# l'emulatore no), h2ad_sporco (nel controllo hardware la PDE parte gia' con A=1).
+# G1 (30/10, parere #124): casi _CONFLICT; h2ad_prec_tab = l'hardware da' la precedenza alla TABELLA (violazione sulla
+# PTE o sulla PDE), l'emulatore al DATO.
+# G1b (30/10, parere #126): H_PDE e riga PTPAD EPT nei modi h2ad_*/g1b_*; g1b_ok (controlli positivi, conflitti
+# DATO), g1b_pde_inefficace (H_PDE senza violazione), g1b_ept_diverso (la PD non e' R-only nel conflitto).
+# H2_MMIO (#131): modi hm_* (HM_RAM/HM_PTP: hm_fab violazione inventata, hm_l0 servito da L0, hm_silent silenzio,
+# hm_loop rientri ripetuti, hm_bar_y una BAR copre Y) e dm_* (DM_PTP: dm_hot ciclo caldo, dm_single un errore,
+# dm_exit QEMU esce dopo l'errore, dm_timeout silenzio).
+import os, sys, time, select
+
+ctr, modo = sys.argv[1], sys.argv[2]
+L1 = {
+	'B': 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1',
+	'C': 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=67 pte1=67 dwr=1 ripadv=1',
+	'A': 'viol=1 reason=48 qual=82 gpa=9000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'A_D': 'viol=1 reason=48 qual=82 gpa=9000 paddr=0 pte0=47 pte1=47 dwr=0 ripadv=0',
+	'D_DATA': 'viol=1 reason=48 qual=102 gpa=5000 paddr=1 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'D_PTP': 'viol=1 reason=48 qual=80 gpa=9000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'H': 'viol=1 reason=48 qual=8b gpa=fec6000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'H_D': 'viol=1 reason=48 qual=8b gpa=fec6000 paddr=0 pte0=47 pte1=47 dwr=0 ripadv=0',
+	'HD_DATA': 'viol=1 reason=48 qual=782 gpa=fec3000 paddr=1 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'HD_PTP': 'viol=1 reason=48 qual=681 gpa=fec6000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0',
+}
+for x in ('_PDE', '_ALL'):
+	L1['HD_DATA' + x] = L1['HD_DATA']
+L1['HD_PTP_ALL'] = L1['HD_PTP']
+L1['HD_CONFLICT'] = L1['HD_CONFLICT_PDE'] = L1['HD_DATA']
+L1['H_PDE'] = 'viol=1 reason=48 qual=68b gpa=fec5ff0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=0 ripadv=0'
+if modo == 'g1b_pde_inefficace':
+	L1['H_PDE'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=1 ripadv=1'
+if modo == 'h2ad_prec_tab':
+	L1['HD_CONFLICT'] = 'viol=1 reason=48 qual=68b gpa=fec6000 paddr=0 pte0=fec3007 pte1=fec3007 dwr=0 ripadv=0'
+	L1['HD_CONFLICT_PDE'] = 'viol=1 reason=48 qual=68b gpa=fec5ff0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=0 ripadv=0'
+if modo.startswith('h2'):
+	L1['D_DATA'] = L1['HD_DATA']
+	L1['D_PTP'] = L1['HD_PTP'].replace('qual=681', 'qual=81')	# bit 9-11 indefiniti con bit8=0
+if modo == 'h2qual':
+	L1['D_DATA'] = L1['HD_DATA'].replace('qual=782', 'qual=582')
+for x in ('_PDE', '_ALL'):
+	L1['D_DATA' + x] = L1['D_DATA']
+L1['D_PTP_ALL'] = L1['D_PTP']
+L1['D_CONFLICT'] = L1['D_CONFLICT_PDE'] = L1['D_DATA']
+L1['HM_RAM'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=1 ripadv=1'
+L1['HM_PTP'] = ('viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=1 ripadv=1' if modo == 'hm_l0' else
+    'viol=1 reason=48 qual=81 gpa=fec6000 paddr=0 pte0=fec3067 pte1=fec3067 dwr=0 ripadv=0')
+L1['DM_PTP'] = L1['HM_PTP']
+if modo == 'h2nessuna':
+	L1['D_DATA'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1'
+if modo in ('h1', 'h_noviol'):
+	L1['A'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1'
+	L1['A_D'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=47 pte1=67 dwr=1 ripadv=1'
+if modo == 'h_noviol':
+	L1['H'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1'
+	L1['H_D'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=47 pte1=67 dwr=1 ripadv=1'
+if modo in ('corretto', 'stale', 'xinfo_rip', 'retry'):
+	L1['A'] = L1['H'].replace('qual=8b', 'qual=68b')	# bit 9-10 indefiniti: diversi apposta
+	L1['A_D'] = L1['H_D']
+if modo == 'h_gpa':
+	L1['H'] = L1['H'].replace('gpa=fec6000', 'gpa=fec3000')
+
+
+def scrivi(s):
+	sys.stdout.write(s + '\r\n')		# la COM1 di KUT manda CRLF
+	sys.stdout.flush()
+
+
+def sali(f=None):
+	f = f or ctr
+	v = int(open(f).read())
+	open(f, 'w').write(str(v + 1))
+
+
+def leggi_byte(attesa, caso):
+	r, _, _ = select.select([sys.stdin], [], [], attesa)
+	b = sys.stdin.buffer.read(1) if r else b''
+	with open(ctr + '.acks', 'a') as f:
+		f.write('%s %r\n' % (caso, b))
+	return b
+
+
+scrivi('PTPAD MAP va_d=ffffffffffc00000 d=fec3000 T=fec6000 pte=fec3007 livelli_codice=3 pdeaddr=fec5ff0 pteaddr=fec6000')
+if modo.startswith('hm') or modo.startswith('dm'):
+	scrivi('PTPAD MEM ram=10000000 y=40000000 yp=3f00000')
+	scrivi('PTPAD FIXMMIO ioapic=fec00000+1000 hpet=fed00000+400 lapic=fee00000+1000')
+	scrivi('PTPAD PCIDEV bdf=8 id=e1b36 hdr=0')
+	scrivi('PTPAD BAR bdf=8 n=0 mem=1 addr=febf1000 size=1000')
+	if modo == 'hm_bar_y':
+		scrivi('PTPAD BAR bdf=8 n=1 mem=1 addr=40000000 size=100000')
+scrivi('PTPAD WAIT piano')
+if modo == 'senza_runner':
+	time.sleep(2)
+	scrivi('SKIP vmx_ptpad_fidelity_test: nessun piano')
+	sys.exit(1)
+piano = sys.stdin.buffer.readline().decode().strip()
+scrivi('PTPAD PLAN cases=%s' % (piano + ',C' if modo == 'eco_sbagliata' else piano))
+open(ctr + '.acks', 'w').close()
+sequenza = piano.split(',')
+if modo == 'fuori_seq':
+	sequenza = ['B', 'A'] + [x for x in sequenza if x not in ('B', 'A')]
+for caso in sequenza:
+	scrivi('PTPAD CASE %s' % caso)
+	if modo == 'noack':
+		scrivi('PTPAD NOACK %s' % caso)
+		sys.exit(3)
+	if leggi_byte(10, caso) != b'g':
+		scrivi('PTPAD NOACK %s' % caso)
+		sys.exit(3)
+	if caso.startswith('H'):	# scrittura hardware: nessuna emulazione
+		if 'viol=1' in L1[caso]:
+			sali(ctr + '.rfl')	# violazione riflessa a L1
+		if modo == 'h_emul':
+			sali()
+	else:
+		sali()				# il movsq emulato del caso
+		if modo in ('corretto', 'stale', 'xinfo_rip', 'retry') and caso in ('A', 'A_D'):
+			sali(ctr + '.rfe')	# violazione riflessa DALL'EMULATORE
+		if modo == 'stale' and caso == 'A':
+			sali(ctr + '.est')	# una violazione dell'emulatore trovata fuori da L2
+		if (modo in ('h2ok', 'h2qual') or modo.startswith('h2ad')) and caso.startswith('D_'):
+			sali(ctr + '.rfe')
+			h2 = os.path.join(ctr + '.h2', 'H2F' if (caso.startswith('D_DATA') or 'CONFLICT' in caso) else 'H2P')
+			if os.path.exists(h2):		# modulo senza H2: contatore assente, non sale
+				sali(h2)
+		if modo == 'h2loop' and caso.startswith('D_'):
+			while True:		# l'istruzione riparte senza violazione: emulazioni a ripetizione
+				sali()
+				time.sleep(0.01)
+		if modo == 'h2spento' and caso.startswith('D_'):
+			sali(ctr + '.enc')
+			sys.exit(0)		# VM spenta da L0: QEMU esce da solo
+	if modo == 'delta2' and caso == 'A':
+		sali()
+	if (modo == 'muore_d' and caso.startswith('D_')) or (modo == 'muore_b' and caso == 'B'):
+		sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+		sys.stderr.flush()
+		while True:			# QEMU rientra in vm_run: anello caldo
+			sali()
+			time.sleep(0.01)
+	if modo == 'silenzio':
+		time.sleep(3600)
+	if modo.startswith('hm') or modo.startswith('dm'):
+		t = 0x3f00007 if caso == 'HM_RAM' else 0x40000007 if caso in ('HM_PTP', 'DM_PTP') else 0xfec6007
+		scrivi('PTPAD EPT t=%x pd=fec5007 d=fec3007' % t)
+		if caso == 'HM_PTP' and modo == 'hm_silent':
+			time.sleep(3600)
+		if caso == 'HM_PTP' and modo == 'hm_loop':
+			while True:
+				sali(ctr + '.rfl')
+				time.sleep(0.01)
+		if caso == 'DM_PTP' and modo in ('dm_hot', 'dm_single', 'dm_exit', 'dm_timeout'):
+			sali()			# il movsq arriva all'emulatore
+			if modo == 'dm_timeout':
+				time.sleep(3600)
+			sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+			sys.stderr.flush()
+			if modo == 'dm_exit':
+				sys.exit(1)
+			if modo == 'dm_single':
+				time.sleep(3600)
+			while True:		# dm_hot: QEMU rientra in vm_run e l'errore si ripete
+				sali()
+				sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+				sys.stderr.flush()
+				time.sleep(0.05)
+	if modo.startswith('g1b') or modo.startswith('h2ad'):
+		tro = caso in ('H', 'HD_CONFLICT', 'D_CONFLICT')	# T senza W
+		pdro = caso in ('H_PDE', 'HD_CONFLICT_PDE', 'D_CONFLICT_PDE')	# PD senza W
+		if modo == 'g1b_ept_diverso' and caso == 'HD_CONFLICT_PDE':
+			pdro = False
+		dass = caso.startswith('HD_') or caso.startswith('D_')	# D non presente
+		scrivi('PTPAD EPT t=%x pd=%x d=%x' % (0xfec6031 if tro else 0xfec6037, 0xfec5031 if pdro else 0xfec5037,
+		    0xfec3030 if dass else 0xfec3037))
+	if modo.startswith('g1b'):
+		pde0 = 0xfec6007 if caso.endswith('_PDE') else 0xfec6027
+		scrivi('PTPAD LIV pml4=fec4027>fec4027 pdpt=fec5027>fec5027 pde=%x>%x pte=fec3067>fec3067' % (pde0, pde0))
+	if modo.startswith('h2ad'):
+		az = ('pde',) if caso.endswith('_PDE') else ('pml4', 'pdpt', 'pde') if caso.endswith('_ALL') else ()
+		liv = []
+		for nm in ('pml4', 'pdpt', 'pde', 'pte'):
+			v0 = 0x7 if (nm in az or nm == 'pte') else 0x27
+			if modo == 'h2ad_sporco' and caso.startswith('H') and nm == 'pde':
+				v0 = 0x27
+			v1 = v0 | 0x20 if (modo == 'h2ad_sup' and caso.startswith('H') and nm != 'pte') else v0
+			liv.append('%s=%x>%x' % (nm, v0, v1))
+		scrivi('PTPAD LIV ' + ' '.join(liv))
+	if 'viol=1' in L1[caso]:
+		rip = '406f4e' if caso.startswith('H') else '406f40'
+		got = '406f42' if (modo == 'xinfo_rip' and caso == 'A') else rip
+		scrivi('PTPAD XINFO gla=ffffffffffc00000 rip=%s rip_atteso=%s va_d=ffffffffffc00000' % (got, rip))
+	if modo == 'retry' and caso == 'A':
+		sali(ctr + '.rtr')
+	if modo == 'b_errato' and caso == 'B':
+		scrivi('PTPAD L1 %s' % L1[caso].replace('pte1=67', 'pte1=27'))
+		continue
+	scrivi('PTPAD L1 %s' % L1[caso])
+scrivi('SUMMARY: 1 tests')
+sys.exit(1)

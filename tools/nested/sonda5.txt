@@ -1,0 +1,5 @@
+nested_probe EXTINT#1 vec=222 info=0 pin12=0x3f exit12=0x2b6ffb l2rip=0x420148 entryinfo12=0
+nested_probe EXTINT#2 vec=222 info=0 pin12=0x3f exit12=0x2b6ffb l2rip=0x40c264 entryinfo12=0
+nested_probe EXTINT#3 vec=222 info=0 pin12=0x3f exit12=0x2b6ffb l2rip=0x40c348 entryinfo12=0
+nested_probe EXTINT#4 vec=222 info=0x800000de pin12=0x3f exit12=0x2beffb l2rip=0x420148 entryinfo12=0
+nested_probe EXTINT#5 vec=32 info=0x80000020 pin12=0x3f exit12=0x2beffb l2rip=0x420148 entryinfo12=0x800000de

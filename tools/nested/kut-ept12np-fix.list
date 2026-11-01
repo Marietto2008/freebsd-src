@@ -1,0 +1,2 @@
+# Parere #74 §4: UNA sola corsa, ept12_remap_np col test fail-closed (kut 1f86ba87)
+ept12_remap_np | vmxc-np.flat | ept12_remap_np | -cpu max | 1 | 1024 | 120

@@ -1,0 +1,244 @@
+#!/bin/sh
+# COPIA di 12-Windows-11-nvidia-vm12 SENZA la GPU in passthrough (Claude 18/10/2026):
+# esperimento di riduzione del parere esterno. Solo fbuf/VNC come schermo.
+
+setxkbmap it
+# fsck -y /dev/da0p2
+
+# NB: il ricarico del vmm nested lo fa il blocco piu' sotto, per ID e solo a
+# zero VM attive ('kldunload vmm' a mano fallirebbe: il file e' vmm-restore.ko).
+
+vms="$(ls /dev/vmm/*)"
+vncs="$(ps ax | awk '/vncviewer [0]/{print $6}')"
+session="${vm##*/}"
+echo $vms
+echo $vncs
+echo $session
+sh /mnt/linuxulator2/vm/nested-work/freebsd-nested/tools/nested/vm-propria.sh vm0:12 || exit 1	# claude 29/10: solo la PROPRIA VM, e solo se e' un residuo
+
+# claude 29/10: tolto "bhyvectl --vm=vm2 --destroy": vm2 e' la VM di QEMU (KUT), non di questo script
+#kldunload vmm-restore
+#kldload vmm-restore
+
+# NIDIFICAZIONE (Claude 16/10/2026): il vmm NESTED va caricato DAL BOOT.
+# Lo scambio a CALDO del modulo e' impossibile: dentro vmm-restore.ko c'e'
+# anche pci/ppt, e le GPU (3/0/x + 4/0/x) legate a ppt dai pptdevs tengono il
+# modulo "Device busy" -> kldunload fallisce sempre. Quindi il nested sta in
+# /boot/kernel/vmm-restore.ko (loader.conf: vmm_load=YES, vmm_name=vmm-restore)
+# e si carica all'avvio con le GPU gia' su ppt, pulite.
+#
+# Per aggiornare il modulo nested dopo una ricompilazione:
+#   cp -n /boot/kernel/vmm-restore.ko /boot/kernel/vmm-restore.ko.nonnested
+#   cp /mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko \
+#      /boot/kernel/vmm-restore.ko
+#   reboot
+# Per tornare al vmm non-nested: ripristina il .nonnested e riavvia.
+NESTED_VMM=/mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko
+loaded=$(kldstat -v 2>/dev/null | awk -F'[()]' '/vmm-restore\.ko \(/{print $2; exit}')
+if [ -z "$loaded" ]; then
+	echo "vmm non caricato: controlla vmm_load=YES in /boot/loader.conf"
+	exit 1
+fi
+if ! cmp -s "$loaded" "$NESTED_VMM"; then
+	echo "ATTENZIONE: il vmm caricato ($loaded) NON coincide col nested"
+	echo "aggiornato ($NESTED_VMM). Installa in /boot e riavvia l'host:"
+	echo "  cp -n /boot/kernel/vmm-restore.ko /boot/kernel/vmm-restore.ko.nonnested"
+	echo "  cp '$NESTED_VMM' /boot/kernel/vmm-restore.ko && reboot"
+	exit 1
+fi
+echo "vmm nested aggiornato e attivo: $loaded"
+
+sleep 2
+
+#if ! pciconf -l pci0:7:0:0 | grep -q "^ppt"; then
+#echo "USB-PCI controller 7/0/0 is not attached to ppt,attaching..."
+#devctl detach pci0:1:0:0
+#devctl clear driver -f pci0:7:0:0
+#devctl set driver -f pci0:7:0:0 ppt
+#else
+#echo "USB-PCI controller 7/0/0 already attached to ppt"
+#fi
+
+# ---------------------------------------------------------------------------
+# L'INGRESSO AUDIO -- "rec=/dev/dsp" non si puo' usare   [claude 19/9/2026]
+# ---------------------------------------------------------------------------
+# /dev/dsp e' il dispositivo PREDEFINITO, e qui punta all'unita' 12:
+# l'uscita HDMI Intel, che sa solo RIPRODURRE. Provato: in scrittura si
+# apre, in lettura risponde "Operation not supported". bhyve apre `rec`,
+# fallisce, e scatta la assert in hda_init (pci_hda.c:352).
+#
+# Si sceglie il primo dispositivo che DICHIARA di saper registrare.
+recdev=$(awk -F: '/^pcm[0-9]+:/ && /rec/ {sub("pcm","",$1); print "/dev/dsp" $1; exit}' /dev/sndstat)
+if [ -z "$recdev" ]; then
+	echo "nessuna scheda sa registrare: la VM restera' senza microfono"
+	recdev=/dev/null
+fi
+echo "audio: play=/dev/dsp (default, unit $(sysctl -n hw.snd.default_unit)) rec=$recdev"
+
+# claude 29/10: tolto il ciclo "destroying ghost vms": distruggeva OGNI VM senza un vncviewer, anche quelle vive
+
+#if ! pciconf -l pci0:1:0:0 | grep -q "^ppt"; then
+#echo "gtx 1060 slot 1/0/0 is not attached to ppt,attaching..."
+#devctl detach pci0:1:0:0
+#devctl clear driver -f pci0:1:0:0
+#devctl set driver -f pci0:1:0:0 ppt
+#else
+#echo "gtx 1060 slot 1/0/0 is already attached to ppt"
+#fi
+
+#if ! pciconf -l pci0:1:0:1 | grep -q "^ppt"; then
+#echo "gtx 1060 slot 1/0/1 is not attached to ppt,attaching..."
+#devctl detach pci0:1:0:1
+#devctl clear driver -f pci0:1:0:1
+#devctl set driver -f pci0:1:0:1 ppt
+#else
+#echo "gtx 1060 slot 1/0/1 is already attached to ppt"
+#fi
+
+#echo "gtx 1060 is fully attached to ppt"
+
+if ! pciconf -l pci0:4:0:0 | grep -q "^ppt"; then
+echo "rtx 2080ti slot 4/0/0 is not attached to ppt,attaching..."
+kldload nvidia-modeset
+#devctl detach pci0:4:0:0
+devctl clear driver -f pci0:4:0:0
+devctl set driver -f pci0:4:0:0 ppt
+else
+echo "rtx 2080ti slot 4/0/0 is already attached to ppt"
+fi
+
+if ! pciconf -l pci0:4:0:1 | grep -q "^ppt"; then
+echo "rtx 2080ti slot 4/0/1 is not attached to ppt,attaching..."
+#devctl detach pci0:4:0:1
+devctl clear driver -f pci0:4:0:1
+devctl set driver -f pci0:4:0:1 ppt
+else
+echo "rtx 2080ti slot 4/0/1 is already attached to ppt"
+fi
+
+if ! pciconf -l pci0:4:0:2 | grep -q "^ppt"; then
+echo "rtx 2080ti slot 4/0/2 is not attached to ppt,attaching..."
+#devctl detach pci0:4:0:2
+devctl clear driver -f pci0:4:0:2
+devctl set driver -f pci0:4:0:2 ppt
+else
+echo "rtx 2080ti slot 4/0/2 is already attached to ppt"
+fi
+
+if ! pciconf -l pci0:4:0:3 | grep -q "^ppt"; then
+echo "rtx 2080ti slot 4/0/3 is not attached to ppt,attaching..."
+#devctl detach pci0:4:0:3
+devctl clear driver -f pci0:4:0:3
+devctl set driver -f pci0:4:0:3 ppt
+else
+echo "rtx 2080ti slot 4/0/3 is already attached to ppt"
+fi
+
+echo "rtx 2080ti is fully attached to ppt"
+
+# claude 29/10: tolto il ciclo "destroying ghost vms": distruggeva OGNI VM senza un vncviewer, anche quelle vive
+
+vmdisk0=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (NM13N4CZ)/ && d{print d}'`
+echo "Seagate M3 Portable 1.8 TB UFS ; $vmdisk0"
+
+vmdisk1=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (2022285F1175)/ && d{print d}'`
+echo "CT1000P1SSD8 ; $vmdisk1"
+
+vmdisk2=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (2015020204055E)/ && d{print d}'`
+echo "TOSHIBA External USB 3.0 1.8 TB ZFS ; $vmdisk2"
+
+vmdisk3=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (20130506005976F)/ && d{print d}'`
+echo "TOSHIBA External USB 3.0 932G ZFS ; $vmdisk3"
+
+vmdisk4=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (BE0191500218)/ && d{print d}'`
+echo "G-DRIVE USB ; $vmdisk4"
+
+vmdisk5=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (38434B4237354B45)/ && d{print d}'`
+echo "Elements 25A3 ; $vmdisk5"
+
+vmdisk6=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (WD-WCAV2X597309)/ && d{print d}'`
+echo "WDC WD3200AAJS-00L7A0-298 GB ; $vmdisk6"
+
+vmdisk7=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (0774911DDC4200A6)/ && d{print d}'`
+echo "SanDisk Cruzer-15GB ; $vmdisk7"
+
+vmdisk8=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (60A44C4138D8F311190A0149)/ && d{print d}'`
+echo "Kingston DataTraveler 2.0 ; $vmdisk8"
+
+vmdisk9=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (20140100006C)/ && d{print d}'`
+echo "Corsair Force 3 SSD ; $vmdisk9"
+
+vmdisk10=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (1924E20B2AE5)/ && d{print d}'`
+echo "CT500MX500SSD4 ; $vmdisk10"
+
+vmdisk11=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (575845583038524844323238)/ && d{print d}'`
+echo "WD-2500BMV ; $vmdisk11"
+
+vmdisk12=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (57442D575845323039544433303334)/ && d{print d}'`
+echo "WD-3200BMV ; $vmdisk12"
+
+vmdisk13=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (S3Z2NB0KB99028V)/ && d{print d}'`
+echo "Seagate M3 Portable 1.8 TB ; $vmdisk13"
+
+vmdisk14=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (19112701010623)/ && d{print d}'`
+echo "Intenso Basic Line ; $vmdisk14"
+
+#zpool import -f -R /mnt/zroot2 zroot2
+#zpool import -f -R /mnt/zroot-133 zroot-133
+#zpool export -f zroot2
+#zpool export -f zroot-133
+
+# fsck -y /dev/$vmdisk4'p2'
+mount -t ufs /dev/$vmdisk4'p2' /mnt/$vmdisk4'p2'
+
+# -S -c sockets=4,cores=2,threads=1 -m 8G -w -H \
+# /mnt/linuxulator2/freebsd-radxa-src/bhyve-nvidia-corvin/bhyve-full-gpu -S -c sockets=8,cores=1,threads=1 -m 16G -w -H -A \
+# -s 1,ahci-hd,/mnt/$vmdisk4'p2'/bhyve/img/Windows/11/Windows11.img,bootindex=1 \
+# -s 1,ahci-hd,/mnt/zroot-133/bhyve/img/Windows/Windows11.img,bootindex=1 \
+
+# NIDIFICAZIONE: bhyve NESTED (ottobre + nested = contiene le fix GPU/HLT) e
+# '-o x86.nested_virt=true' che espone VT-x al guest -> Hyper-V/WSL2 annidati.
+# Il vecchio binario (senza nested) e' qui sotto, commentato, per tornare indietro:
+# /mnt/linuxulator2/freebsd-radxa-src/bhyve-native-gpu-16/build-out/bhyve-hlt-mirrorfix -S -c sockets=8,cores=1,threads=1 -m 32G -w -H -A \
+
+#-o x86.nested_virt=true \
+
+# Claude 24/10/2026 -- parere #44 §8: COPIA di 12-Windows-11-vm12-senza-gpu con -x (local APIC
+# del guest in modalita' x2APIC) per la prova A/B; l'originale resta senza -x.
+/mnt/linuxulator2/vm/nested-work/stage/current/sbin/bhyve -S -c sockets=2,cores=1,threads=1 -m 32G -w -H -A -x \
+-o x86.nested_virt=true \
+-s 0,hostbridge \
+-s 1,ahci-hd,/mnt/$vmdisk4'p2'/bhyve/img/Windows/11/Windows11.img,bootindex=1 \
+-s 2,ahci-hd,/dev/$vmdisk5 \
+-s 11,hda,play=/dev/dsp,rec=$recdev \
+-s 13,virtio-net,tap12 \
+-s 29,fbuf,tcp=0.0.0.0:5912,w=1600,h=950,wait \
+-s 30,xhci,tablet \
+-s 31,lpc \
+-l bootrom,/usr/local/share/uefi-firmware/BHYVE_UEFI_CODE.fd \
+vm0:12 < /dev/null & sleep 10 && vncviewer localhost:12 &
+
+#-s 2,ahci-hd,/dev/nda0 \
+#-s 3,ahci-hd,/dev/$vmdisk5 \
+#-s 2,ahci-cd,/mnt/zroot2/zroot2/OS/ISO/Windows/11/Windows_11_21H2_NOTPM.iso \
+#-s 2,ahci-hd,/mnt/zroot-133/bhyve/img/Windows/nvme.img \
+#-s 3,ahci-hd,/dev/$vmdisk5 \
+#-s 2,ahci-hd,/dev/$vmdisk12'p1' \
+#-s 4,ahci-hd,/dev/$vmdisk5 \
+#-s 11,hda,play=/dev/dsp,rec=/dev/dsp \
+#-s 1,ahci-hd,/mnt/zroot2/zroot2/bhyve/img/Windows/Windows11.img,bootindex=1 \
+#-s 2,virtio-blk,/mnt/$vmdisk3'p2'/bhyve/img/Linux/ubuntu2204-cuda510.img,bootindex=1 \
+#-s 3,nvme,/dev/$vmdisk0 \
+#-s 8:0,passthru,4/0/0 \
+#-s 8:1,passthru,4/0/1 \
+#-s 8:2,passthru,4/0/2 \
+#-s 8:3,passthru,4/0/3 \
+#-s 2,virtio-blk,/dev/$vmdisk \
+#-s 3,virtio-blk,/dev/$vmdisk0 \
+#-s 2,virtio-blk,/dev/$vmdisk2 \
+#-s 3,virtio-blk,/dev/$vmdisk3 \
+#-s 4,virtio-blk,/dev/$vmdisk4 \
+#-s 5,virtio-blk,/dev/$vmdisk5 \
+#-s 6,passthru,1/0/0 \
+#-s 7,passthru,5/0/0 \
+#-s 11,hda,play=/dev/dsp,rec=/dev/dsp \

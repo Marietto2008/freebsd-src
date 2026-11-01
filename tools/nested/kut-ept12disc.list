@@ -1,0 +1,6 @@
+# EPT12 discriminante (indagine 26/10): remap EPT12 GPA->pagina nuova + INVEPT, L2 rilegge.
+# Due varianti identiche tranne il tipo di INVEPT di L1: SINGLE (aggancia lo slot per eptp12)
+# contro GLOBAL (invalida tutto). Se GLOBAL passa e SINGLE no -> match single-context nel modulo.
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+ept12_remap                                 | vmxc.flat | ept12_remap                                 | -cpu max | 1 | 1024 | 120
+ept12_remap_g                               | vmxc.flat | ept12_remap_g                               | -cpu max | 1 | 1024 | 120

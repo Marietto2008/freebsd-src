@@ -1,0 +1,2 @@
+# 26/10 notte: ept12_remap_sentinel con vept_keep=1 (binario vmxc-plain.flat, kut f4a29d65). 1 VM.
+ept12_remap_sentinel | vmxc-plain.flat | ept12_remap_sentinel | -cpu max | 1 | 1024 | 120

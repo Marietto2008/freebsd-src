@@ -1,0 +1,5 @@
+# Controllo D4 (parere #52): suite breve con tante uscite da L2. vmx_pf_invvpid (INVLPG intercettati)
+# e vmx_vpid_ctx (cambi di VPID12 + controllo di contenuto). Entrambi rilevano traduzioni stantie.
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+vmx_pf_invvpid_test                         | vmxc.flat | vmx_pf_invvpid_test                         | -cpu max,-pku | 1 | 1024 | 600
+vmx_vpid_ctx_test                           | vmxc.flat | vmx_vpid_ctx_test                           | -cpu max,-pku | 1 | 1024 | 600

@@ -1,0 +1,3 @@
+# EPT12 remap/violation SOTTO migrazione forzata (parere #55 §8, test CPU 6->7). Con opt=0 (INVEPT
+# incondizionato) deve passare; diventa discriminante con opt=2. nome|file|args|qemu|smp|mem|tmo
+EPT_A_D_disabled                            | vmxc.flat | EPT_A/D_disabled                            | -cpu max | 1 | 1024 | 300

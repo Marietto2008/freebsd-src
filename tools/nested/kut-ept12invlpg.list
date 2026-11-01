@@ -1,0 +1,2 @@
+# INVLPG prima della rilettura (parere #59 §5)
+ept12_remap_invlpg | vmxc.flat | ept12_remap_invlpg | -cpu max | 1 | 1024 | 120
