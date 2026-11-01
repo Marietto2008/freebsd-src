@@ -238,8 +238,26 @@ NESTED_CTR(nested_ept_mmio_emulated,
     "nested: EPT violation dell'L2 emulate come MMIO dell'L1");
 NESTED_CTR(nested_ept12_viol_reflected,
     "nested: EPT violation riflesse all'L1 (Hyper-V le vede)");
+/* #135 Fase C: VEPT_MMIO non emulabile (EPT12 concede, nessun backing in L0): fermato, MAI riflesso all'L1 */
+NESTED_CTR(nested_vept_mmio_unemulable,
+    "nested: accessi di L2 senza backing in L0 non emulabili (vCPU fermato, nessuna riflessione)");
+SDT_PROBE_DEFINE5(vmm, vmx, nested, veptunemul, "int", "uint64_t", "uint64_t",
+    "uint64_t", "uint64_t");
+/* #160 R3: operando di un'istruzione VMX dell'L1 che L0 non sa completare: fermato, MAI saltato */
+NESTED_CTR(nested_operand_fatal,
+    "nested: istruzioni VMX dell'L1 con operando non accessibile da L0 (vCPU fermato, istruzione non eseguita)");
+SDT_PROBE_DEFINE5(vmm, vmx, nested, opndfatal, "int", "int", "int", "uint64_t",
+    "uint64_t");
+NESTED_CTR(nested_ept12_viol_emul_reflected,
+    "nested: EPT violation trovate dall'emulatore (A/D senza W) riflesse");
+NESTED_CTR(nested_ept12_viol_emul_stale,
+    "nested: violazioni dell'emulatore trovate fuori da L2 (deve essere 0)");
+NESTED_CTR(nested_ept12_viol_emul_nocache,
+    "nested: violazioni dell'emulatore senza il loro VMCS12 (deve essere 0)");
 NESTED_CTR(nested_ept12_misconf_reflected,
     "nested: EPT misconfiguration riflesse all'L1");
+NESTED_CTR(nested_ept12_misconf_emul_reflected,
+    "nested: EPT misconfiguration trovate dall'emulatore riflesse (H2)");
 NESTED_CTR(nested_l2_entries, "nested: ingressi in L2");
 NESTED_CTR(nested_l2_tsc, "nested: cicli TSC di guest in L2");
 NESTED_CTR(nested_l1_tsc, "nested: cicli TSC di guest in L1 (vCPU nested)");
@@ -639,14 +657,6 @@ nested_advance_rip(struct vmx_vcpu *vcpu)
 	    rip + vcpu->nested->exit_insn_length);
 }
 
-/*
- * Decodifica l'operando di memoria di un'istruzione VMX (SDM: campo
- * VM-exit instruction-information + exit qualification) e lo traduce nel
- * GPA dell'L1. Ritorna 0 e *gpa, oppure -1 se e' stata iniettata
- * un'eccezione (#GP/#PF) nell'L1. Il formato dei bit coincide con quello
- * gia' usato da inout_str_* e con KVM/SDM: addrsize 9:7, seg 17:15,
- * index 21:18 (invalido se bit 22), base 26:23 (invalido se bit 27).
- */
 /* indirizzo canonico a 48 bit (LA57 non esposto all'L1) */
 static bool
 nested_canonical(uint64_t a)
@@ -654,29 +664,109 @@ nested_canonical(uint64_t a)
 	return ((int64_t)(a << 16) >> 16) == (int64_t)a;
 }
 
-static int
-nested_operand_gpa_at(struct vmx_vcpu *vcpu, int prot, uint64_t add,
-    uint64_t *gpa);
+/*
+ * #160 R6: esito dell'accesso all'operando in memoria di un'istruzione VMX
+ * dell'L1. Prima si traduceva il solo primo byte e si tenevano 8 byte contigui
+ * da quel GPA: con l'operando a cavallo di pagina (offset 0xff9..0xfff, lecito
+ * per l'SDM, che chiede l'allineamento al VALORE del puntatore, non al suo
+ * indirizzo) _vm_gpa_hold va in panic, e la seconda pagina non era tradotta.
+ * Ora l'accesso e' una copia: vm_copy_setup traduce TUTTE le pagine, poi le
+ * tiene tutte, e solo dopo si copia un byte; vm_copy_teardown su ogni uscita.
+ * Un esito "conteso" (P3) non esiste ancora: nessun cammino lo produce.
+ */
+enum nested_opnd {
+	NOPND_OK,		/* operando copiato per intero */
+	NOPND_INIETTATO,	/* #GP/#SS/#PF gia' iniettato all'L1: riparte */
+	NOPND_HOST_FATALE,	/* L0 non completa l'accesso: nessun byte copiato */
+	NOPND_CONTESO,		/* P3: walk conteso oltre il limite: nessun effetto, riparte servita */
+};
 
+/*
+ * #160 R3: l'operando non si puo' completare per un errore di L0 (walk delle
+ * tabelle dell'L1 su un GPA senza memoria, operando su un GPA senza backing,
+ * vmread del descrittore di segmento fallito). Prima il gestore restituiva 0
+ * senza nested_advance_rip: con nextrip gia' avanzato da vm_run l'istruzione
+ * dell'L1 era SALTATA in silenzio (niente VMfail, niente eccezione). Ora, come
+ * la Fase C (VEPT_MMIO non emulabile): latch fatale del vCPU (che registra il
+ * nextrip avanzato), nextrip di nuovo sull'istruzione, uscita BOGUS di
+ * lunghezza 0, ENOTRECOVERABLE fino a vm_run; K3 respinge ogni VM_RUN
+ * successivo. Nessuna eccezione e nessun VMfail inventati.
+ */
 static int
-nested_operand_gpa(struct vmx_vcpu *vcpu, int prot, uint64_t *gpa)
+nested_operand_latch(struct vmx_vcpu *vcpu, int err, int stadio, uint64_t gla,
+    int valide)
 {
-	return (nested_operand_gpa_at(vcpu, prot, 0, gpa));
+	struct vm_exit *vme = vm_exitinfo(vcpu->vcpu);
+	int error;
+
+	error = vm_fatal_latch(vcpu->vcpu, err, stadio, vme->rip, 0, gla, NULL,
+	    0, valide);
+	vm_restart_instruction(vcpu->vcpu);	/* vCPU FROZEN: nextrip = RIP */
+	vme->exitcode = VM_EXITCODE_BOGUS;
+	vme->inst_length = 0;
+	atomic_add_long(&nested_operand_fatal, 1);
+	SDT_PROBE5(vmm, vmx, nested, opndfatal, vcpu->vcpuid, stadio, err,
+	    vme->rip, (valide & VM_FATAL_V_GLA) ? gla : 0);
+	return (error);
 }
 
-/* Come sopra, per gli 8 byte a 'add' byte dall'inizio dell'operando
- * (descrittori di INVVPID/INVEPT: 16 byte, letti in due meta'). */
-static int
-nested_operand_gpa_at(struct vmx_vcpu *vcpu, int prot, uint64_t add,
-    uint64_t *gpa)
+/*
+ * #163 (09): limite dell'ULTIMO byte di un operando, con l'offset NON troncato
+ * (SDM vol. 3A 253668-085US, ottobre 2024, 6.3 "Limit Checking" (5.3 nelle revisioni precedenti)). Expand-up: <= limite; dati expand-down: <= 0xffff o
+ * 0xffffffff secondo il bit B. Il primo byte (e il limite inferiore di un
+ * expand-down) lo controlla vie_calculate_gla, con lo stesso criterio di tipo.
+ * Segmento piatto (base 0, limite 0xffffffff, dati expand-up o codice): per
+ * l'SDM con limite effettivo FFFFFFFFH il controllo e' "implementation-
+ * specific", e le CPU con VMX non lo fanno (KVM get_vmx_mem_address): niente
+ * #GP, l'operando prosegue e l'indirizzo lineare si avvolge a 4 GB.
+ */
+static bool
+nested_seg_last_ok(const struct seg_desc *d, uint64_t last)
 {
+	if (d->base == 0 && d->limit == 0xffffffff &&
+	    ((SEG_DESC_TYPE(d->access) & 0x8) != 0 ||
+	    (SEG_DESC_TYPE(d->access) & 0x4) == 0))	/* piatto */
+		return (true);
+	if ((SEG_DESC_TYPE(d->access) & 0xC) == 0x4)	/* dati expand-down */
+		return (last <= (SEG_DESC_DEF32(d->access) ? 0xffffffffULL :
+		    0xffffULL));
+	return (last <= d->limit);
+}
+
+/*
+ * Decodifica l'operando di memoria di un'istruzione VMX (SDM: campo
+ * VM-exit instruction-information + exit qualification), lo valida per
+ * 'len' byte (segmento, limite, canonicita' del primo e dell'ultimo byte) e
+ * lo copia da/verso 'buf' (VM_PROT_WRITE: verso il guest). Stadio 10, K5:
+ * niente piu' parametro 'add' (tutti i chiamanti passavano 0): un 'add' non
+ * nullo sommato prima del troncamento riaprirebbe il difetto corretto da 09
+ * (l'EA si tronca UNA volta). Il descrittore m128 di INVEPT/INVVPID e' un accesso unico di
+ * 16 byte: tutti i controlli di segmento prima di ogni traduzione, tutte le
+ * pagine tradotte e tenute prima di copiare un solo byte. Il formato dei bit
+ * coincide con quello gia' usato da inout_str_* e con KVM/SDM: addrsize 9:7,
+ * seg 17:15, index 21:18 (invalido se bit 22), base 26:23 (invalido se bit 27).
+ */
+static enum nested_opnd
+nested_operand_copy(struct vmx_vcpu *vcpu, int prot, void *buf, size_t len)
+{
+	struct vm_copyinfo ci[4];		/* 2 pezzi al piu', 2 pagine ciascuno */
 	struct vm_guest_paging paging;
 	struct seg_desc desc;
-	uint64_t qual, offset, gla;
+	struct {
+		uint64_t gla;
+		size_t len;
+	} pz[2];
+	uint64_t qual, offset, ea, gla0, pga, gpa;
 	uint32_t info;
 	enum vm_reg_name seg;
-	int scaling, addrsize, fault, error;
+	size_t fatto;
+	int scaling, addrsize, fault, error, i, k, npg, npz;
+	bool conteso;			/* P3: walk conteso oltre il limite */
 
+	KASSERT(len == 4 || len == 8 || len == 16, ("%s: len %zu", __func__,
+	    len));
+	CTASSERT(nitems(ci) >= 2 * nitems(pz));
+	bzero(ci, sizeof(ci));
 	qual = vcpu->nested->exit_qual;		/* catturati col VMCS corrente */
 	info = (uint32_t)vcpu->nested->exit_insn_info;
 
@@ -688,58 +778,158 @@ nested_operand_gpa_at(struct vmx_vcpu *vcpu, int prot, uint64_t add,
 	}
 	seg = vm_segment_name((info >> 15) & 0x7);
 
-	offset = qual + add;			/* displacement */
+	offset = qual;				/* displacement */
 	if (((info >> 27) & 0x1) == 0)		/* BaseReg valido */
 		offset += vmx_get_guest_reg(vcpu, (info >> 23) & 0xf);
 	if (((info >> 22) & 0x1) == 0)		/* IndexReg valido */
 		offset += vmx_get_guest_reg(vcpu, (info >> 18) & 0xf) << scaling;
 
 	error = vmx_getdesc(vcpu, seg, &desc);	/* sicuro: VMPTRLD a vcpu frozen */
-	if (error != 0)
-		return (-1);
-	paging = vcpu->nested->exit_paging;	/* catturato col VMCS corrente */
-	if (vie_calculate_gla(paging.cpu_mode, seg, &desc, offset, 8, addrsize,
-	    prot, &gla) != 0) {
-		/* SDM: riferimento via SS -> #SS(0), altrimenti #GP(0) */
-		if (seg == VM_REG_GUEST_SS)
-			vm_inject_ss(vcpu->vcpu, 0);
-		else
-			vm_inject_gp(vcpu->vcpu);
-		return (-1);
+	if (error != 0) {
+		/* solo un vmread fallito (vmcs_getdesc): errore di L0, non dell'L1 */
+		(void)nested_operand_latch(vcpu, error, VM_FATAL_NESTED_SEGDESC, 0, 0);
+		return (NOPND_HOST_FATALE);
 	}
+	paging = vcpu->nested->exit_paging;	/* catturato col VMCS corrente */
+	/*
+	 * #163 (09): l'indirizzo effettivo si calcola UNA volta, troncato
+	 * all'address size; i byte dell'operando stanno agli offset EA + i SENZA
+	 * troncamento (SDM vol. 3A 253668-085US, ottobre 2024, 6.3 "Limit Checking" (5.3 nelle revisioni precedenti):
+	 * "a quadword at an offset greater than
+	 * (effective-limit - 7)" -> #GP, #SS via SS). Prima vie_calculate_gla era
+	 * chiamata per meta' (EA + 8 ri-troncato: la seconda meta' di un m128 a
+	 * 0xfff8 con indirizzamento a 16 bit finiva a base + 0) e controllava il
+	 * limite con l'offset di ogni byte troncato, cioe' avvolto: un quadword a
+	 * 0xfffc con limite 0xffff passava. Qui vie_calculate_gla controlla il
+	 * PRIMO byte (segmento utilizzabile, tipo e permessi, limite, base) e ne
+	 * da' l'indirizzo lineare; l'ultimo byte si confronta col limite qui. I
+	 * byte sono a gla0 + i: a 32 bit fuori dal modo 64 bit (base + offset
+	 * oltre 4 GB si avvolge), a 64 bit in modo 64 bit (la base di FS/GS si
+	 * somma all'EA troncato, senza troncare la somma).
+	 */
+	ea = offset & (addrsize == 8 ? ~0ULL : addrsize == 4 ? 0xffffffffULL :
+	    0xffffULL);
+	if (vie_calculate_gla(paging.cpu_mode, seg, &desc, ea, 1, addrsize, prot,
+	    &gla0) != 0)
+		goto segfault;
+	if (paging.cpu_mode != CPU_MODE_64BIT &&
+	    !nested_seg_last_ok(&desc, ea + len - 1))
+		goto segfault;
 	/*
 	 * In modo 64 bit vie_calculate_gla non rifiuta un indirizzo non
-	 * canonico: lo farebbe vm_gla2gpa, ma sempre con #GP. Via SS l'SDM
-	 * vuole #SS(0) (kvm-unit-tests invvpid_test_ss).
+	 * canonico: lo farebbe vm_gla2gpa, ma sempre con #GP e solo per la
+	 * pagina che traduce. Via SS l'SDM vuole #SS(0) (kvm-unit-tests
+	 * invvpid_test_ss). Primo E ultimo byte: l'operando puo' finire oltre.
 	 */
-	if (paging.cpu_mode == CPU_MODE_64BIT && !nested_canonical(gla)) {
-		if (seg == VM_REG_GUEST_SS)
-			vm_inject_ss(vcpu->vcpu, 0);
-		else
-			vm_inject_gp(vcpu->vcpu);
-		return (-1);
+	if (paging.cpu_mode == CPU_MODE_64BIT && (!nested_canonical(gla0) ||
+	    !nested_canonical(gla0 + len - 1)))
+		goto segfault;
+	/*
+	 * #162 (08): l'accesso in PEZZI lineari contigui. Fuori dal modo 64 bit
+	 * l'indirizzo lineare e' di 32 bit: un operando che passa 0xffffffff si
+	 * spezza e il resto ricomincia da 0. Prima vm_copy_setup proseguiva oltre
+	 * 4 GB: i walk a 32 bit e PAE traducono quell'indirizzo per indici
+	 * mascherati, ma un #PF lo avrebbe messo tale e quale in CR2. Con due
+	 * pezzi prima si traducono TUTTE le pagine, in ordine e senza tenerle,
+	 * poi i vm_copy_setup che le tengono: un #PF del secondo pezzo precede un
+	 * backing assente del primo, come in un accesso unico. Nessun byte si
+	 * copia prima che tutto sia tenuto.
+	 */
+	if (paging.cpu_mode != CPU_MODE_64BIT && gla0 + len > (1ULL << 32)) {
+		pz[0].gla = gla0;
+		pz[0].len = (1ULL << 32) - gla0;
+		pz[1].gla = 0;
+		pz[1].len = len - pz[0].len;
+		npz = 2;
+	} else {
+		pz[0].gla = gla0;
+		pz[0].len = len;
+		npz = 1;
 	}
-	if (vm_gla2gpa(vcpu->vcpu, &paging, gla, prot, gpa, &fault) != 0 || fault)
-		return (-1);			/* #PF iniettato da vm_gla2gpa */
-	return (0);
+	for (k = 0; npz > 1 && k < npz; k++) {
+		npg = (int)(((pz[k].gla & PAGE_MASK) + pz[k].len - 1) / PAGE_SIZE) + 1;
+		for (i = 0; i < npg; i++) {
+			pga = i == 0 ? pz[k].gla :
+			    (pz[k].gla & ~(uint64_t)PAGE_MASK) + i * PAGE_SIZE;
+			error = vm_gla2gpa_budget(vcpu->vcpu, &paging, pga, prot,
+			    &gpa, &fault, &conteso);
+			if (error == 0 && !fault && conteso)	/* P3 */
+				return (NOPND_CONTESO);
+			if (error != 0) {
+				(void)nested_operand_latch(vcpu, error,
+				    VM_FATAL_NESTED_OPERAND, pga, VM_FATAL_V_GLA);
+				return (NOPND_HOST_FATALE);
+			}
+			if (fault)		/* #PF iniettato da vm_gla2gpa */
+				return (NOPND_INIETTATO);
+		}
+	}
+	for (k = 0; k < npz; k++) {
+		error = vm_copy_setup_budget(vcpu->vcpu, &paging, pz[k].gla,
+		    pz[k].len, prot, &ci[2 * k], 2, &fault, &conteso);
+		if (error == 0 && !fault && conteso) {	/* P3: nulla copiato */
+			vm_copy_teardown(ci, nitems(ci));	/* i pezzi gia' tenuti */
+			return (NOPND_CONTESO);
+		}
+		if (error != 0) {
+			vm_copy_teardown(ci, nitems(ci));	/* i pezzi gia' tenuti */
+			(void)nested_operand_latch(vcpu, error,
+			    VM_FATAL_NESTED_OPERAND, pz[k].gla, VM_FATAL_V_GLA);
+			return (NOPND_HOST_FATALE);
+		}
+		if (fault) {			/* #PF iniettato da vm_gla2gpa */
+			vm_copy_teardown(ci, nitems(ci));
+			return (NOPND_INIETTATO);
+		}
+	}
+	for (k = 0, fatto = 0; k < npz; fatto += pz[k].len, k++) {
+		if (prot & VM_PROT_WRITE)
+			vm_copyout((const char *)buf + fatto, &ci[2 * k],
+			    pz[k].len);
+		else
+			vm_copyin(&ci[2 * k], (char *)buf + fatto, pz[k].len);
+	}
+	vm_copy_teardown(ci, nitems(ci));
+	return (NOPND_OK);
+segfault:
+	/* SDM: riferimento via SS -> #SS(0), altrimenti #GP(0) */
+	if (seg == VM_REG_GUEST_SS)
+		vm_inject_ss(vcpu->vcpu, 0);
+	else
+		vm_inject_gp(vcpu->vcpu);
+	return (NOPND_INIETTATO);
 }
 
-/* Legge gli 8 byte (puntatore VMCS/regione) all'operando. -1 = fallito. */
-static int
+/* Legge gli 8 byte (puntatore VMCS/regione) all'operando. */
+static enum nested_opnd
 nested_read_operand_u64(struct vmx_vcpu *vcpu, uint64_t *out)
 {
-	uint64_t gpa, *p;
-	void *cookie;
+	return (nested_operand_copy(vcpu, VM_PROT_READ, out, sizeof(*out)));
+}
 
-	if (nested_operand_gpa(vcpu, VM_PROT_READ, &gpa) != 0)
-		return (-1);			/* eccezione gia' iniettata */
-	p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t), VM_PROT_READ, &cookie);
-	if (p == NULL) {
-		nested_vmfail_invalid(vcpu);
-		return (-1);
-	}
-	*out = *p;
-	vm_gpa_release(cookie);
+/*
+ * Esito NOPND_HOST_FATALE nel gestore: il latch e' gia' chiuso e l'uscita gia'
+ * BOGUS (nested_operand_latch); il gestore restituisce l'errore del latch,
+ * senza nested_advance_rip, VMfail o effetti dell'istruzione.
+ */
+static int
+nested_operand_fatale(struct vmx_vcpu *vcpu)
+{
+	(void)vcpu;
+	return (ENOTRECOVERABLE);
+}
+
+/*
+ * P3 (stadio 11): esito NOPND_CONTESO nel gestore. La copia dell'operando non
+ * ha avuto effetti (nessun byte copiato, nessuna pagina tenuta, nessuna
+ * eccezione): l'istruzione riparte e l'uscita e' segnalata a vm_run, che la
+ * serve invece di rientrare dal ciclo nested stretto.
+ */
+static int
+nested_operand_conteso(struct vmx_vcpu *vcpu)
+{
+	vm_restart_instruction(vcpu->vcpu);
+	vm_segnala_conteso(vcpu->vcpu);
 	return (0);
 }
 
@@ -809,8 +999,16 @@ nested_vmxon(struct vmx_vcpu *vcpu)
 		vm_inject_gp(vcpu->vcpu);
 		return (0);
 	}
-	if (nested_read_operand_u64(vcpu, &ptr) != 0)
+	switch (nested_read_operand_u64(vcpu, &ptr)) {
+	case NOPND_OK:
+		break;
+	case NOPND_INIETTATO:
 		return (0);
+	case NOPND_HOST_FATALE:
+		return (nested_operand_fatale(vcpu));
+	case NOPND_CONTESO:
+		return (nested_operand_conteso(vcpu));
+	}
 	/* VMXON region: allineata a 4K, entro MAXPHYADDR, revisione giusta. */
 	if ((ptr & PAGE_MASK) != 0 || (ptr >> cpu_maxphyaddr) != 0) {
 		nested_vmfail_invalid(vcpu);
@@ -1066,8 +1264,16 @@ nested_vmclear(struct vmx_vcpu *vcpu)
 	int i;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
-	if (nested_read_operand_u64(vcpu, &vmcs12) != 0)
+	switch (nested_read_operand_u64(vcpu, &vmcs12)) {
+	case NOPND_OK:
+		break;
+	case NOPND_INIETTATO:
 		return (0);
+	case NOPND_HOST_FATALE:
+		return (nested_operand_fatale(vcpu));
+	case NOPND_CONTESO:
+		return (nested_operand_conteso(vcpu));
+	}
 	if ((vmcs12 & PAGE_MASK) != 0 || (vmcs12 >> cpu_maxphyaddr) != 0) {
 		nested_vmx_result(vcpu, VMXERR_VMCLEAR_INVALID_ADDRESS);
 		goto done;
@@ -1114,8 +1320,16 @@ nested_vmptrld(struct vmx_vcpu *vcpu)
 	int i, slot;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
-	if (nested_read_operand_u64(vcpu, &vmcs12) != 0)
+	switch (nested_read_operand_u64(vcpu, &vmcs12)) {
+	case NOPND_OK:
+		break;
+	case NOPND_INIETTATO:
 		return (0);
+	case NOPND_HOST_FATALE:
+		return (nested_operand_fatale(vcpu));
+	case NOPND_CONTESO:
+		return (nested_operand_conteso(vcpu));
+	}
 	if ((vmcs12 & PAGE_MASK) != 0 || (vmcs12 >> cpu_maxphyaddr) != 0) {
 		nested_vmx_result(vcpu, VMXERR_VMPTRLD_INVALID_ADDRESS);
 		goto done;
@@ -1207,21 +1421,21 @@ static int
 nested_vmptrst(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
-	uint64_t gpa, *p;
-	void *cookie;
+	uint64_t cur;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
-	if (nested_operand_gpa(vcpu, VM_PROT_WRITE, &gpa) != 0)
+	cur = n->current_vmcs12;		/* VMCS12_GPA_NONE se nessuno */
+	switch (nested_operand_copy(vcpu, VM_PROT_WRITE, &cur, sizeof(cur))) {
+	case NOPND_OK:
+		break;
+	case NOPND_INIETTATO:
 		return (0);
-	p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t), VM_PROT_WRITE, &cookie);
-	if (p == NULL) {
-		nested_vmfail_invalid(vcpu);
-		goto done;
+	case NOPND_HOST_FATALE:
+		return (nested_operand_fatale(vcpu));
+	case NOPND_CONTESO:
+		return (nested_operand_conteso(vcpu));
 	}
-	*p = n->current_vmcs12;			/* VMCS12_GPA_NONE se nessuno */
-	vm_gpa_release(cookie);
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
-done:
 	nested_advance_rip(vcpu);
 	return (0);
 }
@@ -2009,22 +2223,47 @@ nested_field_mask(uint32_t field)
  * in reg2 (bit 31:28), valore/dest in reg1 (bit 6:3) se registro (bit 10),
  * altrimenti operando di memoria (SDM/KVM).
  */
+/*
+ * Stadio 10, K3 (SDM vol. 3C, VMREAD/VMWRITE/INVEPT/INVVPID: fuori dal modo
+ * 64 bit gli operandi registro sono di 32 bit e i bit 63:32 si ignorano; KVM
+ * kvm_register_read): il registro operando come lo vede l'istruzione. Unico
+ * punto per il campo di VMREAD/VMWRITE, il valore registro di VMWRITE e il tipo
+ * di INVEPT/INVVPID. Le istruzioni VMX in compatibilita' danno #UD prima
+ * dell'uscita: fuori dal modo 64 bit qui c'e' solo il modo protetto.
+ */
+static uint64_t
+nested_reg_operando(struct vmx_vcpu *vcpu, int reg)
+{
+	uint64_t v;
+
+	v = vmx_get_guest_reg(vcpu, reg);
+	if (vcpu->nested->exit_paging.cpu_mode != CPU_MODE_64BIT)
+		v &= 0xffffffffULL;
+	return (v);
+}
+
 static int
 nested_vmread(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c;
-	uint64_t val, gpa, *p;
+	uint64_t val, field64;
 	uint32_t info, field;
-	void *cookie;
+	size_t len;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
 	c = nested_current_cache(n);
 	if (c == NULL) { nested_vmfail_invalid(vcpu); goto done; }
 
 	info = (uint32_t)vcpu->nested->exit_insn_info; /* catturato */
-	field = (uint32_t)vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
-	if (!nested_field_ok(vcpu, field)) {
+	field64 = nested_reg_operando(vcpu, (info >> 28) & 0xf);
+	field = (uint32_t)field64;
+	/*
+	 * Stadio 10, K2 (SDM VMREAD/VMWRITE: in modo 64 bit un campo con i bit
+	 * 63:32 non nulli non corrisponde a nessun componente -> VMfail(12)).
+	 * Fuori dal modo 64 bit nested_reg_operando li ha gia' azzerati (K3).
+	 */
+	if ((field64 >> 32) != 0 || !nested_field_ok(vcpu, field)) {
 		nested_vmx_result(vcpu, VMXERR_UNSUPPORTED_VMCS_COMPONENT);
 		goto done;
 	}
@@ -2032,17 +2271,28 @@ nested_vmread(struct vmx_vcpu *vcpu)
 		val = vmcs12_read_field(c, field & ~1U) >> 32;
 	else
 		val = vmcs12_read_field(c, field) & nested_field_mask(field);
+	/*
+	 * #160 R7: fuori dal modo 64 bit l'operando e' di 32 bit (SDM VMREAD):
+	 * i bit alti del campo non si leggono, e in memoria si scrivono 4 byte,
+	 * non 8 (prima: 4 byte oltre l'operando sovrascritti).
+	 */
+	len = vcpu->nested->exit_paging.cpu_mode == CPU_MODE_64BIT ? 8 : 4;
+	if (len == 4)
+		val &= 0xffffffffULL;
 
 	if ((info >> 10) & 0x1) {
 		vmx_set_guest_reg(vcpu, (info >> 3) & 0xf, val);
 	} else {
-		if (nested_operand_gpa(vcpu, VM_PROT_WRITE, &gpa) != 0)
+		switch (nested_operand_copy(vcpu, VM_PROT_WRITE, &val, len)) {
+		case NOPND_OK:
+			break;
+		case NOPND_INIETTATO:
 			return (0);
-		p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t),
-		    VM_PROT_WRITE, &cookie);
-		if (p == NULL) { nested_vmfail_invalid(vcpu); goto done; }
-		*p = val;
-		vm_gpa_release(cookie);
+		case NOPND_HOST_FATALE:
+			return (nested_operand_fatale(vcpu));
+		case NOPND_CONTESO:
+			return (nested_operand_conteso(vcpu));
+		}
 	}
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 done:
@@ -2055,29 +2305,44 @@ nested_vmwrite(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vmcs12_cache *c;
-	uint64_t val, gpa, *p;
+	uint64_t val, field64;
 	uint32_t info, field;
-	void *cookie;
+	size_t len;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
 	c = nested_current_cache(n);
 	if (c == NULL) { nested_vmfail_invalid(vcpu); goto done; }
 
 	info = (uint32_t)vcpu->nested->exit_insn_info; /* catturato */
-	field = (uint32_t)vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
+	field64 = nested_reg_operando(vcpu, (info >> 28) & 0xf);
+	field = (uint32_t)field64;
 
+	/*
+	 * #160 R7: fuori dal modo 64 bit la sorgente e' di 32 bit (SDM VMWRITE):
+	 * si leggono 4 byte, e un campo piu' largo ha i bit alti azzerati.
+	 */
+	len = vcpu->nested->exit_paging.cpu_mode == CPU_MODE_64BIT ? 8 : 4;
+	val = 0;
 	if ((info >> 10) & 0x1) {
-		val = vmx_get_guest_reg(vcpu, (info >> 3) & 0xf);
+		val = nested_reg_operando(vcpu, (info >> 3) & 0xf);
 	} else {
-		if (nested_operand_gpa(vcpu, VM_PROT_READ, &gpa) != 0)
+		switch (nested_operand_copy(vcpu, VM_PROT_READ, &val, len)) {
+		case NOPND_OK:
+			break;
+		case NOPND_INIETTATO:
 			return (0);
-		p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t),
-		    VM_PROT_READ, &cookie);
-		if (p == NULL) { nested_vmfail_invalid(vcpu); goto done; }
-		val = *p;
-		vm_gpa_release(cookie);
+		case NOPND_HOST_FATALE:
+			return (nested_operand_fatale(vcpu));
+		case NOPND_CONTESO:
+			return (nested_operand_conteso(vcpu));
+		}
 	}
-	if (!nested_field_ok(vcpu, field)) {
+	/*
+	 * Stadio 10, K2 (SDM VMREAD/VMWRITE: in modo 64 bit un campo con i bit
+	 * 63:32 non nulli non corrisponde a nessun componente -> VMfail(12)).
+	 * Fuori dal modo 64 bit nested_reg_operando li ha gia' azzerati (K3).
+	 */
+	if ((field64 >> 32) != 0 || !nested_field_ok(vcpu, field)) {
 		nested_vmx_result(vcpu, VMXERR_UNSUPPORTED_VMCS_COMPONENT);
 		goto done;
 	}
@@ -2122,6 +2387,26 @@ static bool
 nested_pa_ok(uint64_t pa, uint64_t align)
 {
 	return ((pa & (align - 1)) == 0 && (pa >> cpu_maxphyaddr) == 0);
+}
+
+/*
+ * #162: EPTP valido per le capacita' EPT esposte all'L1 (la EPT/VPID cap
+ * virtuale): tipo di memoria UC (bit 8) o WB (bit 14), page walk a 4 livelli
+ * (il 5 non e' esposto), A/D solo col bit 21, bit 11:7 a zero, entro
+ * MAXPHYADDR. Lo stesso controllo serve al VM entry (SDM 26.2.1.1) e a INVEPT
+ * single-context ("un EPTP che farebbe fallire un VM entry" -> VMfail; KVM
+ * nested_vmx_check_eptp). Prima era scritto solo nel controllo d'ingresso.
+ */
+static bool
+nested_eptp_ok(uint64_t cap, uint64_t e)
+{
+	uint64_t mt = e & 7;
+
+	return (((mt == 0 && (cap & (1ULL << 8))) ||
+	    (mt == 6 && (cap & (1ULL << 14)))) &&
+	    ((e >> 3) & 7) == 3 &&
+	    ((e & (1ULL << 6)) == 0 || (cap & (1ULL << 21)) != 0) &&
+	    (e & 0xf80) == 0 && (e >> cpu_maxphyaddr) == 0);
 }
 
 static bool
@@ -2224,17 +2509,9 @@ nested_check_vmentry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	if ((proc2 & PROCBASED2_ENABLE_VPID) &&
 	    (vmcs12_read_field(c, VMCS_VPID) & 0xffff) == 0)
 		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-	if (proc2 & PROCBASED2_ENABLE_EPT) {
-		uint64_t e = vmcs12_read_field(c, VMCS_EPTP);
-		uint64_t mt = e & 7;
-
-		if (!((mt == 0 && (cap & (1ULL << 8))) ||
-		    (mt == 6 && (cap & (1ULL << 14)))) ||
-		    ((e >> 3) & 7) != 3 ||
-		    ((e & (1ULL << 6)) && (cap & (1ULL << 21)) == 0) ||
-		    (e & 0xf80) != 0 || (e >> cpu_maxphyaddr) != 0)
-			return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-	}
+	if ((proc2 & PROCBASED2_ENABLE_EPT) &&
+	    !nested_eptp_ok(cap, vmcs12_read_field(c, VMCS_EPTP)))
+		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
 	if ((proc2 & PROCBASED2_UNRESTRICTED_GUEST) &&
 	    (proc2 & PROCBASED2_ENABLE_EPT) == 0)
 		return (VMXERR_ENTRY_INVALID_CONTROL_FIELD);
@@ -3109,6 +3386,8 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	n->msr_phase = 0;
 
 	n->in_l2 = false;
+	n->emu_viol = false;		/* una violazione dell'emulatore non
+					 * ancora consegnata decade con l'L2 */
 	vmexit->rip = hrip;
 	vmexit->inst_length = 0;
 	vm_exit_intinfo(vcpu->vcpu, 0);
@@ -4138,9 +4417,7 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 	struct vmx_nested *n = vcpu->nested;
 	struct invvpid_desc d;
 	uint32_t info = (uint32_t)n->exit_insn_info;
-	uint64_t type, cap = n->vmx_msr[0x48c - 0x480], q[2], gpa, *p;
-	void *ck;
-	int i;
+	uint64_t type, cap = n->vmx_msr[0x48c - 0x480], q[2];
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
 	/*
@@ -4149,22 +4426,29 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 	 * byte in memoria: VPID nei bit 15:0, bit 63:16 riservati, poi
 	 * l'indirizzo lineare. Tipo nel registro (bit 31:28 di insn_info).
 	 */
-	type = vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
-	for (i = 0; i < 2; i++) {
-		if (nested_operand_gpa_at(vcpu, VM_PROT_READ, i * 8, &gpa) != 0)
-			return (0);		/* #PF/#GP/#SS gia' iniettata */
-		p = vm_gpa_hold(vcpu->vcpu, gpa, sizeof(uint64_t),
-		    VM_PROT_READ, &ck);
-		if (p == NULL) {
-			nested_vmfail_invalid(vcpu);
-			return (0);
-		}
-		q[i] = *p;
-		vm_gpa_release(ck);
+	type = nested_reg_operando(vcpu, (info >> 28) & 0xf);
+	/*
+	 * #160: SDM INVVPID, il tipo non annunciato (bit 40 + tipo dell'EPT/VPID
+	 * cap) da' VMfail PRIMA di leggere il descrittore; poi il descrittore
+	 * m128 si legge in un accesso solo (prima: due meta' da 8, la seconda
+	 * tradotta dopo aver letto la prima, e il tipo controllato dopo).
+	 */
+	if (type > 3 || (cap & (1ULL << (40 + type))) == 0) {
+		nested_vmx_result(vcpu, VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID);
+		nested_advance_rip(vcpu);
+		return (0);
 	}
-	/* tipi annunciati nell'EPT/VPID cap: bit 40 + tipo (0..3) */
-	if (type > 3 || (cap & (1ULL << (40 + type))) == 0 ||
-	    (q[0] >> 16) != 0 ||				/* riservati */
+	switch (nested_operand_copy(vcpu, VM_PROT_READ, q, sizeof(q))) {
+	case NOPND_OK:
+		break;
+	case NOPND_INIETTATO:
+		return (0);
+	case NOPND_HOST_FATALE:
+		return (nested_operand_fatale(vcpu));
+	case NOPND_CONTESO:
+		return (nested_operand_conteso(vcpu));
+	}
+	if ((q[0] >> 16) != 0 ||				/* riservati */
 	    (type != 2 && (q[0] & 0xffff) == 0) ||		/* VPID 0 */
 	    (type == 0 && !nested_canonical(q[1]))) {		/* indirizzo */
 		nested_vmx_result(vcpu, VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID);
@@ -4201,21 +4485,45 @@ nested_invept(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	uint32_t info = (uint32_t)n->exit_insn_info;
-	uint64_t type, eptp = 0, cap = n->vmx_msr[0x48c - 0x480], rip;
+	uint64_t type, eptp = 0, cap = n->vmx_msr[0x48c - 0x480], rip, desc[2];
 	sbintime_t t0;
 	u_long ns;
 	int wiped, kept;
 
 	if (!n->vmxon) { vm_inject_ud(vcpu->vcpu); return (0); }
-	type = vmx_get_guest_reg(vcpu, (info >> 28) & 0xf);
+	type = nested_reg_operando(vcpu, (info >> 28) & 0xf);
 	if (!((type == 1 && (cap & (1ULL << 25))) ||
 	    (type == 2 && (cap & (1ULL << 26))))) {
 		nested_vmx_result(vcpu, VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID);
 		nested_advance_rip(vcpu);
 		return (0);
 	}
-	if (type == 1 && nested_read_operand_u64(vcpu, &eptp) != 0)
-		return (0);			/* eccezione o VMfail gia' dati */
+	/*
+	 * #160: SDM INVEPT, per OGNI tipo annunciato il descrittore m128 si legge
+	 * (un #PF e' possibile anche con all-context); l'EPTP sono i primi 8
+	 * byte e conta solo per single-context.
+	 */
+	switch (nested_operand_copy(vcpu, VM_PROT_READ, desc, sizeof(desc))) {
+	case NOPND_OK:
+		break;
+	case NOPND_INIETTATO:
+		return (0);
+	case NOPND_HOST_FATALE:
+		return (nested_operand_fatale(vcpu));
+	case NOPND_CONTESO:
+		return (nested_operand_conteso(vcpu));
+	}
+	if (type == 1) {
+		eptp = desc[0];
+		/* #162: EPTP che farebbe fallire un VM entry -> VMfail 28, nessuna
+		 * invalidazione (SDM INVEPT, single-context) */
+		if (!nested_eptp_ok(cap, eptp)) {
+			nested_vmx_result(vcpu,
+			    VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID);
+			nested_advance_rip(vcpu);
+			return (0);
+		}
+	}
 	t0 = sbinuptime();
 	wiped = vmx_vept_invept(vcpu, type, eptp, &kept);
 	ns = (u_long)sbttons(sbinuptime() - t0);
@@ -4316,6 +4624,81 @@ nested_probe_walk(struct vmx_vcpu *vcpu, int r, uint64_t l1gpa, uint64_t perm)
 	}
 }
 
+/*
+ * Sessione 1d (parere di Astra sul caso H): EPT violation trovata
+ * dall'EMULATORE di L0 (vmx_vept_ptp_write: A/D in una tabella dell'L2 su una
+ * pagina che EPT12 non concede in scrittura), consegnata qui da vmx_run prima
+ * di rientrare in L2. L'istruzione dell'L2 non ha scritto nulla ed e' gia'
+ * ripartita (rip invariato nel VMCS02). Si riflette con il ramo SINTETICO di
+ * nested_reflect_to_l1: quello hardware copierebbe GPA e indirizzo lineare
+ * dall'ultima uscita del VMCS02, che per un movsq da MMIO e' il fault sulla
+ * SORGENTE; qui GPA e lineare sono quelli della voce di tabella e del walk.
+ */
+static int
+nested_ept_emul_reflect(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vm_exit *vmexit = vm_exitinfo(vcpu->vcpu);
+	struct vmcs12_cache *c;
+	uint64_t gpa = n->emu_viol_gpa, gla = n->emu_viol_gla;
+
+	/*
+	 * Chi chiama ha gia' verificato in_l2 (emu_viol => in_l2: nasce solo in
+	 * L2 e decade in nested_reflect_to_l1). GPA e lineare sono copiati qui,
+	 * la qualifica passa in synth_qual PRIMA della riflessione:
+	 * nested_reflect_to_l1 azzera emu_viol ma non ne tocca i dati.
+	 *
+	 * Parere #110 §3: il VMCS12 va verificato PRIMA di consumare la causa.
+	 * Con c == NULL nested_reflect_to_l1 esce senza riflettere, e il resto di
+	 * questa funzione darebbe all'L1 un RIP mai preparato. Irraggiungibile:
+	 * il VMCS12 corrente e le cache cambiano solo emulando VMXON/VMXOFF/
+	 * VMCLEAR/VMPTRLD dell'L1, mai fra la produzione (in L2, con c != NULL,
+	 * vmx_vept_ptp_write) e questo punto. Se capitasse: nessuna riflessione
+	 * parziale; la VM si spegne (come per un errore dello shadow VMCS),
+	 * l'host resta intatto, nessun panic.
+	 */
+	c = nested_current_cache(n);
+	if (c == NULL || n->current_vmcs12 != n->emu_viol_vmcs12) {
+		n->emu_viol = false;
+		atomic_add_long(&nested_ept12_viol_emul_nocache, 1);
+		vm_suspend(vcpu->vmx->vm, VM_SUSPEND_POWEROFF);
+		return (0);
+	}
+	n->emu_viol = false;		/* consumata: UNA sola riflessione */
+	VMPTRLD(vcpu->vmcs);			/* il VMCS02 */
+	/* H2: anche una misconfiguration (motivo 49, qualificazione 0) */
+	vmexit->u.vmx.exit_reason = n->emu_viol_reason;
+	n->synth = true;
+	n->synth_qual = n->emu_viol_qual;
+	n->synth_intr_info = 0;
+	n->slow_reflect = true;
+	nested_reflect_to_l1(vcpu, vmexit);
+	n->slow_reflect = false;
+	n->synth = false;
+	n->synth_qual = 0;
+	c = nested_current_cache(n);	/* invariato dalla riflessione */
+	if (c != NULL) {
+		/* dopo la riflessione, prima del prossimo ingresso in L1: la copia
+		 * verso lo shadow VMCS avviene all'ingresso e legge il VMCS12 in
+		 * quel momento; i due campi si segnano anche qui (parere #109 §2.D),
+		 * senza contare sul segno globale di nested_reflect_to_l1 */
+		vmcs12_write_field(c, VMCS_GUEST_PHYSICAL_ADDRESS, gpa);
+		shvmcs_mark(n, c, VMCS_GUEST_PHYSICAL_ADDRESS);
+		/* la misconfiguration non riporta l'indirizzo lineare (SDM) */
+		if (n->emu_viol_reason == EXIT_REASON_EPT_FAULT) {
+			vmcs12_write_field(c, VMCS_GUEST_LINEAR_ADDRESS, gla);
+			shvmcs_mark(n, c, VMCS_GUEST_LINEAR_ADDRESS);
+		}
+	}
+	VMCLEAR(vcpu->vmcs01);			/* niente VMCS attivo nello slow path */
+	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP, vmexit->rip);
+	/* #110 §3: conta la riflessione COSTRUITA, non il tentativo */
+	atomic_add_long(n->emu_viol_reason == EXIT_REASON_EPT_FAULT ?
+	    &nested_ept12_viol_emul_reflected :
+	    &nested_ept12_misconf_emul_reflected, 1);
+	return (0);
+}
+
 static int
 nested_ept_slow(struct vmx_vcpu *vcpu)
 {
@@ -4340,6 +4723,24 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 		vmexit->inst_length = 0;
 		atomic_add_long(&nested_ept_mmio_emulated, 1);
 		return (0);
+	}
+	if (r == VEPT_MMIO) {
+		/*
+		 * #135 Fase C. EPT12 CONCEDE (vmx_vept_fault ha gia' confrontato l'accesso coi permessi) ma l'L1-GPA non
+		 * ha backing in L0 e l'accesso non e' un dato emulabile (walk delle tabelle, bit 8 = 0; fetch; nessun
+		 * GLA). Prima ricadeva nella riflessione qui sotto: reason 48 INVENTATA, con la qualifica riscritta dai
+		 * permessi RWX (sessione HM del 30/10, qual 0x6b9). Ora: nessuna riflessione, latch fatale del vCPU,
+		 * contatore proprio (RFL torna a contare solo le violation vere). E' un fail-stop, non il supporto delle
+		 * tabelle di L2 su MMIO. Nessun VMCS e' caricato qui (si esce prima del VMPTRLD sotto); l'exitcode non
+		 * puo' restare VM_EXITCODE_NESTED con un errore (KASSERT in vm_run).
+		 */
+		atomic_add_long(&nested_vept_mmio_unemulable, 1);
+		SDT_PROBE5(vmm, vmx, nested, veptunemul, vcpu->vcpuid, n->ept_gpa,
+		    n->ept_qual, l1gpa, vmexit->rip);
+		vmexit->exitcode = VM_EXITCODE_BOGUS;
+		vmexit->inst_length = 0;
+		return (vm_fatal_latch(vcpu->vcpu, EFAULT, VM_FATAL_NESTED_VEPT,
+		    vmexit->rip, n->ept_gpa, 0, NULL, 0, VM_FATAL_V_GPA));
 	}
 	atomic_add_long(r == VEPT_MISCONF ? &nested_ept12_misconf_reflected :
 	    &nested_ept12_viol_reflected, 1);
@@ -4370,6 +4771,77 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
  * che ha causato l'uscita, col vCPU FROZEN. VMLAUNCH/VMRESUME (T2.4),
  * VMREAD/VMWRITE (T1.8) e VMCALL non sono ancora qui: per ora #UD.
  */
+/*
+ * #162 R8: in VMX non-root un'istruzione VMX dell'L1 esce verso L0 PRIMA dei
+ * controlli che l'SDM fa dopo la VM exit: "ELSIF in VMX non-root operation
+ * THEN VM exit; ELSIF CPL > 0 THEN #GP(0)". Prima solo VMXON li rifaceva: a
+ * CPL 3 l'L1 poteva eseguire VMPTRLD, VMWRITE, VMLAUNCH... (KVM:
+ * nested_vmx_check_permission). Qui, prima di shvmcs_pull, dell'operando e del
+ * VMCS12: "non in VMX operation" -> #UD, poi CPL > 0 -> #GP(0); niente VMfail,
+ * RIP fermo (l'iniezione fa ripartire l'istruzione). Le uscite di L2 riflesse
+ * all'L1 sono gia' tornate (restart_only). VMXON ha regole sue (#UD per
+ * CR4.VMXE, #GP a CPL > 0 anche fuori da VMX, poi VMfail in VMX root) e resta
+ * nel suo gestore; VMCALL non e' un'istruzione di gestione VMX.
+ *
+ * La CPL letta qui e' quella di QUESTA uscita (V4) perche' valgono due
+ * condizioni, da conservare in ogni modifica futura:
+ *  1. vmx.c cattura exit_paging (vmx_paging_info) a OGNI uscita con una delle
+ *     ragioni sotto, e quell'uscita lascia vmx_run come VM_EXITCODE_NESTED,
+ *     non gestita: nessun'altra uscita puo' sovrascrivere la cattura prima
+ *     di arrivare qui;
+ *  2. le uscite di L2 sono gia' deviate verso l'L1 (o restart_only) prima del
+ *     guard: quando gira L2 la cattura descrive L2, e non arriva qui.
+ *
+ * Stadio 10, K6 (come KVM handle_invept/handle_invvpid): INVEPT e INVVPID non
+ * esposte all'L1 (controllo secondario "enable EPT"/"enable VPID" non
+ * consentito, o bit di capacita' INVEPT 20 / INVVPID 32 spento nelle MSR VMX
+ * virtuali) danno #UD PRIMA del controllo della CPL. Oggi L0 le espone
+ * entrambe (vmx_nested_init_msrs): difesa per configurazioni future.
+ */
+static bool
+nested_inv_esposta(struct vmx_nested *n, uint32_t reason)
+{
+	uint64_t ctl2 = n->vmx_msr[0x48b - 0x480] >> 32, cap = n->vmx_msr[0x48c - 0x480];
+
+	if (reason == EXIT_REASON_INVEPT)
+		return ((ctl2 & PROCBASED2_ENABLE_EPT) != 0 && (cap & (1ULL << 20)) != 0);
+	return ((ctl2 & PROCBASED2_ENABLE_VPID) != 0 && (cap & (1ULL << 32)) != 0);
+}
+
+static bool
+nested_insn_guard(struct vmx_vcpu *vcpu, uint32_t reason)
+{
+	switch (reason) {
+	case EXIT_REASON_VMCLEAR:
+	case EXIT_REASON_VMLAUNCH:
+	case EXIT_REASON_VMPTRLD:
+	case EXIT_REASON_VMPTRST:
+	case EXIT_REASON_VMREAD:
+	case EXIT_REASON_VMRESUME:
+	case EXIT_REASON_VMWRITE:
+	case EXIT_REASON_VMXOFF:
+	case EXIT_REASON_INVEPT:
+	case EXIT_REASON_INVVPID:
+		break;
+	default:
+		return (false);
+	}
+	if ((reason == EXIT_REASON_INVEPT || reason == EXIT_REASON_INVVPID) &&
+	    !nested_inv_esposta(vcpu->nested, reason)) {
+		vm_inject_ud(vcpu->vcpu);		/* K6: prima della CPL */
+		return (true);
+	}
+	if (!vcpu->nested->vmxon) {
+		vm_inject_ud(vcpu->vcpu);
+		return (true);
+	}
+	if (vcpu->nested->exit_paging.cpl != 0) {	/* CPL dell'L1, catturato all'uscita (vmx_cpl) */
+		vm_inject_gp(vcpu->vcpu);
+		return (true);
+	}
+	return (false);
+}
+
 int
 vmx_nested_exit(void *vcpui)
 {
@@ -4396,6 +4868,18 @@ vmx_nested_exit(void *vcpui)
 		}
 	}
 
+	/* Sessione 1d: violazione EPT12 trovata dall'emulatore, consegnata da
+	 * vmx_run prima di rientrare in L2. Fuori da L2 (invariante violato:
+	 * emu_viol nasce solo in L2 e decade con l'uscita verso l'L1) la si
+	 * scarta e si prosegue con gli altri pending, senza ritornare: un
+	 * return qui salterebbe restart_only ed ept_pending (parere #109 §2.B) */
+	if (vcpu->nested != NULL && vcpu->nested->emu_viol) {
+		if (vcpu->nested->in_l2)
+			return (nested_ept_emul_reflect(vcpu));
+		vcpu->nested->emu_viol = false;
+		atomic_add_long(&nested_ept12_viol_emul_stale, 1);
+	}
+
 	/* Uscita di L2 gia' riflessa all'L1 in vmx_exit_process: qui va solo
 	 * fatto ripartire vmx_run. Il motivo d'uscita e' di L2 (es. VMCALL):
 	 * passarlo allo switch sotto inietterebbe un #UD nell'L1. */
@@ -4408,6 +4892,10 @@ vmx_nested_exit(void *vcpui)
 		vcpu->nested->ept_pending = false;
 		return (nested_ept_slow(vcpu));
 	}
+
+	/* #162 R8: VMX non attiva e CPL > 0, prima di qualunque effetto */
+	if (vcpu->nested != NULL && nested_insn_guard(vcpu, reason))
+		return (0);
 
 	/*
 	 * Shadow VMCS (parere #44 §3-4): i gestori che consumano il VMCS12 ne

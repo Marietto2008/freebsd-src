@@ -126,6 +126,15 @@ int vm_gla2gpa(struct vcpu *vcpu, struct vm_guest_paging *paging,
  */
 int vm_gla2gpa_nofault(struct vcpu *vcpu, struct vm_guest_paging *paging,
     uint64_t gla, int prot, uint64_t *gpa, int *is_fault);
+
+/*
+ * P3 (stadio 11): come vm_gla2gpa, ma con un limite alle ripartenze del walk
+ * (hw.vmm.gla2gpa_restart_max). Oltre il limite: ritorno 0, *is_fault = 0,
+ * *conteso = true, nessuna pagina tenuta, nessuna eccezione. Solo per i
+ * chiamanti migrati (operando VMX nested); vm_gla2gpa resta senza limite.
+ */
+int vm_gla2gpa_budget(struct vcpu *vcpu, struct vm_guest_paging *paging,
+    uint64_t gla, int prot, uint64_t *gpa, int *is_fault, bool *conteso);
 #endif /* _KERNEL */
 
 void vie_restart(struct vie *vie);

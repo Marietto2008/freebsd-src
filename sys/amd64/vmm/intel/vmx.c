@@ -3542,7 +3542,8 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		 */
 		if (vcpu->nested != NULL) {
 			/*
-			 * Cattura i campi d'uscita ORA, col VMCS01 corrente:
+			 * Cattura i campi d'uscita ORA, col VMCS corrente
+			 * (VMCS01 per le uscite dell'L1, VMCS02 per quelle di L2):
 			 * nel slow path (vcpu FROZEN) il VMCS non e' caricato
 			 * e rileggerli con vmcs_read grezza panica.
 			 */
@@ -3941,6 +3942,20 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
 		    vcpu->nested->vept_keep && vmx_vept_memgen_stale(vcpu)) {
 			vcpu->nested->vept_memgen_pending = true;
+			vmexit->rip = rip;
+			vmexit->inst_length = 0;
+			vmexit->exitcode = VM_EXITCODE_NESTED;
+			break;
+		}
+		/*
+		 * Sessione 1d: l'emulatore ha trovato che l'EPT dell'L1 nega la
+		 * scrittura di A/D in una tabella dell'L2 (vmx_vept_ptp_write) e
+		 * ha fatto ripartire l'istruzione (rip). Non si rientra in L2:
+		 * si esce verso lo slow path, che riflette la EPT violation
+		 * all'L1 (nested_ept_emul_reflect). Prima di ogni iniezione.
+		 */
+		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+		    vcpu->nested->emu_viol) {
 			vmexit->rip = rip;
 			vmexit->inst_length = 0;
 			vmexit->exitcode = VM_EXITCODE_NESTED;
@@ -5469,9 +5484,17 @@ vmx_restore_tsc(void *vcpui, uint64_t offset)
 #endif
 
 static int
-vmx_nested_gpa(void *vcpui, uint64_t gpa, int prot, uint64_t *l1gpa)
+vmx_nested_gpa(void *vcpui, uint64_t gpa, int prot, uint64_t gla, int flags,
+    uint64_t *l1gpa)
 {
-	return (vmx_vept_l1gpa(vcpui, gpa, prot, l1gpa));
+	return (vmx_vept_l1gpa_emul(vcpui, gpa, prot, gla, flags, l1gpa));
+}
+
+static int
+vmx_nested_ptp_write(void *vcpui, uint64_t ptegpa, uint64_t l1held,
+    uint64_t gla, bool *denied)
+{
+	return (vmx_vept_ptp_write(vcpui, ptegpa, l1held, gla, denied));
 }
 
 const struct vmm_ops vmm_ops_intel = {
@@ -5492,6 +5515,7 @@ const struct vmm_ops vmm_ops_intel = {
 	.setcap		= vmx_setcap,
 	.nested_exit	= vmx_nested_exit,
 	.nested_gpa	= vmx_nested_gpa,
+	.nested_ptp_write = vmx_nested_ptp_write,
 	.vmspace_alloc	= vmx_vmspace_alloc,
 	.vmspace_free	= vmx_vmspace_free,
 	.vlapic_init	= vmx_vlapic_init,
