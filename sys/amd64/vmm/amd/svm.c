@@ -2839,9 +2839,17 @@ svm_nested_exit(void *vcpui __unused)
 
 static int
 svm_nested_gpa(void *vcpui __unused, uint64_t gpa, int prot __unused,
-    uint64_t *l1gpa)
+    uint64_t gla __unused, int flags __unused, uint64_t *l1gpa)
 {
 	*l1gpa = gpa;	/* niente nested su SVM: identita' */
+	return (0);
+}
+
+static int
+svm_nested_ptp_write(void *vcpui __unused, uint64_t ptegpa __unused,
+    uint64_t l1held __unused, uint64_t gla __unused, bool *denied)
+{
+	*denied = false;	/* niente nested su SVM: si scrive come prima */
 	return (0);
 }
 
@@ -2863,6 +2871,7 @@ const struct vmm_ops vmm_ops_amd = {
 	.setcap		= svm_setcap,
 	.nested_exit	= svm_nested_exit,
 	.nested_gpa	= svm_nested_gpa,
+	.nested_ptp_write = svm_nested_ptp_write,
 	.vmspace_alloc	= svm_vmspace_alloc,
 	.vmspace_free	= svm_vmspace_free,
 	.vlapic_init	= svm_vlapic_init,
