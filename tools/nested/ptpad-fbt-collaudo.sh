@@ -12,7 +12,7 @@
 N=$(cd "$(dirname "$0")" && pwd)
 O=${1:?cartella}
 FBTS=${2:-$N/ptpad-fbt.d}
-QEMU=/mnt/linuxulator2/vm/nested-work/stage/current/bin/qemu-system-x86_64
+QEMU=/mnt/linuxulator2/vm/wsl2/fbsd/stage/current/bin/qemu-system-x86_64
 PY=/usr/local/bin/python3
 mkdir -p "$O" || exit 1
 nf=0

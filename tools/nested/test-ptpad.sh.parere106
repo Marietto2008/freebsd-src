@@ -4,7 +4,7 @@
 # contatore host + stato terminale) per OGNI verdetto e per i casi limite, e verifica che il
 # classificatore dia esattamente il verdetto atteso. Verifica anche i bit della qualifica EPT.
 # Uso: test-ptpad.sh <cartella di lavoro>
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 AN=$W/ptpad_an.py
 O=${1:?cartella}
 mkdir -p "$O" || exit 1

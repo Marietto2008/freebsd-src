@@ -4,14 +4,14 @@
 # contatore host + stato terminale) per OGNI verdetto e per i casi limite, e verifica che il
 # classificatore dia esattamente il verdetto atteso. Verifica anche i bit della qualifica EPT.
 # Uso: test-ptpad.sh <cartella di lavoro>
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 AN=$W/ptpad_an.py
 O=${1:?cartella}
 mkdir -p "$O" || exit 1
 # #152 §5: i socket AF_UNIX del collaudo (server QMP finti) stanno in una cartella BREVE propria, su ZFS, unica per
 # esecuzione: non dipendono piu' dal nome (arbitrario) della cartella di sessione. Nessuna cancellazione.
-mkdir -p /mnt/linuxulator2/vm/nested-work/q || exit 1
-QSD=$(mktemp -d /mnt/linuxulator2/vm/nested-work/q/XXXXXX) || exit 1
+mkdir -p /mnt/linuxulator2/vm/wsl2/fbsd/q || exit 1
+QSD=$(mktemp -d /mnt/linuxulator2/vm/wsl2/fbsd/q/XXXXXX) || exit 1
 echo "$QSD" > "$O/cartella-socket.txt"
 nf=0
 # #134 §7: nessuna VM finta di QUESTA suite sopravvive, nemmeno se la suite viene interrotta
@@ -669,7 +669,7 @@ pul() {	# pul <file> <PULITA|NON_PULITA> <uscita attesa>
 	[ "$p" = "$2" ] && [ $u = $3 ] && echo "  ok      $(basename $1): PULIZIA $2, uscita $3" || { echo "  ERRATO  $(basename $1): PULIZIA '$p' uscita $u, attese $2 $3"; nf=$((nf+1)); }
 }
 # esemplari REALI della campagna H2-only (29/10), congelati: la regressione pulita e la fase 3 con A/D diversi
-FR=/mnt/linuxulator2/vm/nested-work/logs/h2only-campagna-congelamento-20261030
+FR=/mnt/linuxulator2/vm/wsl2/fbsd/logs/h2only-campagna-congelamento-20261030
 attr $FR/data-combinato.txt '(evento-D_DATA)' H2_EVENT_PASS
 attr $FR/data-combinato.txt '(effetti-D_DATA)' H2_SIDE_EFFECT_FAIL
 cp $FR/data-combinato.txt $O/reale-data.txt; pul $O/reale-data.txt NON_PULITA 4
@@ -701,7 +701,7 @@ H2=1 dr h2ad6 B,HD_DATA,D_DATA h2nessuna 2
 pul $O/drv-h2ad6/combinato.txt NON_PULITA 4
 
 echo "P19: G1 (parere #124) -- precedenza fra dinieghi, esemplare REALE di G0"
-G0=/mnt/linuxulator2/vm/nested-work/logs/ptpad-sessione-hwor-20261030/drv/combinato.txt
+G0=/mnt/linuxulator2/vm/wsl2/fbsd/logs/ptpad-sessione-hwor-20261030/drv/combinato.txt
 for x in HD_DATA HD_DATA_PDE HD_DATA_ALL HD_PTP HD_PTP_ALL; do att $G0 $x HW_CONTROL_PASS; done
 cp $G0 $O/reale-g0.txt; pul $O/reale-g0.txt PULITA 0
 grep -q '^LIV pml4=fec4007>fec4007 pdpt=fec5007>fec5007 pde=fec6007>fec6007 pte=fec3007>fec3007' $G0 && echo "  ok      G0: HD_DATA_ALL e HD_PTP_ALL non toccano nessun livello" || { echo "  ERRATO  righe LIV di G0"; nf=$((nf+1)); }
@@ -731,7 +731,7 @@ att $LOG D_CONFLICT INCONCLUSIVE_TEST_SETUP
 
 echo "P20: G1b (parere #126) -- controlli positivi H/H_PDE nella STESSA sessione, righe EPT"
 # l'esemplare REALE di G1-hw (senza H/H_PDE): ora NON discriminante e NON_PULITA
-G1R=/mnt/linuxulator2/vm/nested-work/logs/ptpad-h2ad-g1-hw-20261030/drv/combinato.txt
+G1R=/mnt/linuxulator2/vm/wsl2/fbsd/logs/ptpad-h2ad-g1-hw-20261030/drv/combinato.txt
 attr $G1R '(discr-HD_CONFLICT)' NON_DISCRIMINANTE
 attr $G1R '(discr-HD_CONFLICT_PDE)' NON_DISCRIMINANTE
 cp $G1R $O/reale-g1hw.txt; pul $O/reale-g1hw.txt NON_PULITA 4

@@ -6,8 +6,8 @@
 # (dichiarato), e in un caso uno diverso nel braccio 3. Soglie di EVIDENZA
 # fissate prima, non toccate qui.
 # Uso: test-abba-an.sh <cartella di lavoro vuota>   (legge i log via sudo, sola lettura)
-AN=/mnt/linuxulator2/vm/nested-work/abba_retry_an.py
-L=/mnt/linuxulator2/vm/nested-work/logs
+AN=/mnt/linuxulator2/vm/wsl2/fbsd/abba_retry_an.py
+L=/mnt/linuxulator2/vm/wsl2/fbsd/logs
 B=${1:?cartella}
 nf=0
 LAV='AZIONI_CC=2610

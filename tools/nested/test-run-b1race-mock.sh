@@ -9,7 +9,7 @@
 # sopravvive a kut-run (attesa); R7 QEMU oltre il timeout; R8 VM gia' viva.
 # Uso: test-run-b1race-mock.sh <cartella di lavoro vuota>
 T=$(cd "$(dirname "$0")" && pwd)
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 B=${1:?cartella}
 D83=$(/sbin/sha256 -q $T/diag83.d); VER=$(/sbin/sha256 -q $T/verdetto-b1race.py)
 QPAT='[q]emu-system-x86_64 -smp'

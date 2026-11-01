@@ -11,7 +11,7 @@
 # P6 VM gia' viva.
 # Uso: test-run-abba-prova-mock.sh <cartella di lavoro vuota>
 T=$(cd "$(dirname "$0")" && pwd)
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 B=${1:?cartella}
 nf=0
 prepara() {	# $1 cartella

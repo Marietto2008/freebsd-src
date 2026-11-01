@@ -4,7 +4,7 @@
 # contatore host + stato terminale) per OGNI verdetto e per i casi limite, e verifica che il
 # classificatore dia esattamente il verdetto atteso. Verifica anche i bit della qualifica EPT.
 # Uso: test-ptpad.sh <cartella di lavoro>
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 AN=$W/ptpad_an.py
 O=${1:?cartella}
 mkdir -p "$O" || exit 1
@@ -659,7 +659,7 @@ pul() {	# pul <file> <PULITA|NON_PULITA> <uscita attesa>
 	[ "$p" = "$2" ] && [ $u = $3 ] && echo "  ok      $(basename $1): PULIZIA $2, uscita $3" || { echo "  ERRATO  $(basename $1): PULIZIA '$p' uscita $u, attese $2 $3"; nf=$((nf+1)); }
 }
 # esemplari REALI della campagna H2-only (29/10), congelati: la regressione pulita e la fase 3 con A/D diversi
-FR=/mnt/linuxulator2/vm/nested-work/logs/h2only-campagna-congelamento-20261030
+FR=/mnt/linuxulator2/vm/wsl2/fbsd/logs/h2only-campagna-congelamento-20261030
 attr $FR/data-combinato.txt '(evento-D_DATA)' H2_EVENT_PASS
 attr $FR/data-combinato.txt '(effetti-D_DATA)' H2_SIDE_EFFECT_FAIL
 cp $FR/data-combinato.txt $O/reale-data.txt; pul $O/reale-data.txt NON_PULITA 4

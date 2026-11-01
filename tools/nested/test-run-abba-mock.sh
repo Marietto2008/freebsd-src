@@ -11,7 +11,7 @@
 # Uso (da marietto; legge i dati reali via sudo, in sola lettura):
 #   test-run-abba-mock.sh <cartella di lavoro vuota>
 T=$(cd "$(dirname "$0")" && pwd)
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 REAL=$W/logs/abbavpid-20261025-2021
 B=${1:?cartella}
 mkdir -p $B/fixture || exit 1

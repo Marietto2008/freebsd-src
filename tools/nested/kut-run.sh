@@ -15,7 +15,7 @@ KUT="$NESTED_ROOT/kut"
 LOGS="$NESTED_ROOT/logs"
 QEMU="$STAGE/current/bin/qemu-system-x86_64"
 # QEMU ignora QEMU_DATADIR: senza -L non trova bios-256k.bin ed esce subito.
-: "${QEMU_SRC:=/mnt/linuxulator2/vm/nested-work/qemu-nested}"
+: "${QEMU_SRC:=/mnt/linuxulator2/vm/wsl2/fbsd/qemu-nested}"
 PCBIOS="$QEMU_SRC/pc-bios"
 NESTED_PROP=""		# vuoto = capability spenta; "nested=on" per accenderla
 

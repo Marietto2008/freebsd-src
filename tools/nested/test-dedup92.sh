@@ -29,7 +29,7 @@
 #   P10 involucro del livello 2 finto (test-run-dedup95-mock.sh)
 # Uso: test-dedup92.sh <cartella di lavoro vuota>
 T=$(cd "$(dirname "$0")" && pwd)
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 AN=$W/dedup92_an.py
 OUT=${1:?cartella}
 mkdir -p "$OUT" || exit 1
@@ -545,7 +545,7 @@ echo "P6: braccio A reale come base (sola lettura)"
 /usr/local/bin/python3 - "$AN" <<'PYTEST93P6'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location('an', sys.argv[1]); an = importlib.util.module_from_spec(spec); spec.loader.exec_module(an)
-b = an.base_A('/mnt/linuxulator2/vm/nested-work/logs/misura-8vp-20261027-0933')
+b = an.base_A('/mnt/linuxulator2/vm/wsl2/fbsd/logs/misura-8vp-20261027-0933')
 nf = 0
 def c(nome, ok, v=''):
 	global nf

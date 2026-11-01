@@ -20,7 +20,7 @@
 
 import argparse, mmap, os, re, signal, socket, struct, subprocess, sys, threading, time
 
-W = "/mnt/linuxulator2/vm/nested-work"
+W = "/mnt/linuxulator2/vm/wsl2/fbsd"
 VM = "vm0:12"
 WIN_IP = "win11"
 WIN_PW_FILE = "/home/marietto/.config/claude-wsl2/password-windows"

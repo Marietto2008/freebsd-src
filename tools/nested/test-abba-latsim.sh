@@ -4,7 +4,7 @@
 # VERO (pid provider) su abba-invept-latsim.c. Confronta conteggi esatti e
 # intervalli plausibili per massimi e percentili. Nessuna VM.
 T=$(cd "$(dirname "$0")" && pwd)
-AN=/mnt/linuxulator2/vm/nested-work/abba_retry_an.py
+AN=/mnt/linuxulator2/vm/wsl2/fbsd/abba_retry_an.py
 OUT=${1:-/tmp}
 /usr/local/bin/python3 $T/gen-abba-lat.py $OUT >/dev/null || exit 1
 /usr/bin/cc -O0 -Wall -Wextra -Werror -o $OUT/abba-invept-latsim $T/abba-invept-latsim.c || exit 1

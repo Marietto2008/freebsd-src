@@ -14,7 +14,7 @@ session="${vm##*/}"
 echo $vms
 echo $vncs
 echo $session
-sh /mnt/linuxulator2/vm/nested-work/freebsd-nested/tools/nested/vm-propria.sh vm0:12 || exit 1	# claude 29/10: solo la PROPRIA VM, e solo se e' un residuo
+sh /mnt/linuxulator2/vm/wsl2/fbsd/freebsd-nested/tools/nested/vm-propria.sh vm0:12 || exit 1	# claude 29/10: solo la PROPRIA VM, e solo se e' un residuo
 
 # claude 29/10: tolto "bhyvectl --vm=vm2 --destroy": vm2 e' la VM di QEMU (KUT), non di questo script
 #kldunload vmm-restore
@@ -29,11 +29,11 @@ sh /mnt/linuxulator2/vm/nested-work/freebsd-nested/tools/nested/vm-propria.sh vm
 #
 # Per aggiornare il modulo nested dopo una ricompilazione:
 #   cp -n /boot/kernel/vmm-restore.ko /boot/kernel/vmm-restore.ko.nonnested
-#   cp /mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko \
+#   cp /mnt/linuxulator2/vm/wsl2/fbsd/stage/current/vmm-restore.ko \
 #      /boot/kernel/vmm-restore.ko
 #   reboot
 # Per tornare al vmm non-nested: ripristina il .nonnested e riavvia.
-NESTED_VMM=/mnt/linuxulator2/vm/nested-work/stage/current/vmm-restore.ko
+NESTED_VMM=/mnt/linuxulator2/vm/wsl2/fbsd/stage/current/vmm-restore.ko
 loaded=$(kldstat -v 2>/dev/null | awk -F'[()]' '/vmm-restore\.ko \(/{print $2; exit}')
 if [ -z "$loaded" ]; then
 	echo "vmm non caricato: controlla vmm_load=YES in /boot/loader.conf"
@@ -203,7 +203,7 @@ mount -t ufs /dev/$vmdisk4'p2' /mnt/$vmdisk4'p2'
 
 #-o x86.nested_virt=true \
 
-/mnt/linuxulator2/vm/nested-work/stage/current/sbin/bhyve -S -c sockets=2,cores=1,threads=1 -m 32G -w -H -A \
+/mnt/linuxulator2/vm/wsl2/fbsd/stage/current/sbin/bhyve -S -c sockets=2,cores=1,threads=1 -m 32G -w -H -A \
 -o x86.nested_virt=true \
 -s 0,hostbridge \
 -s 1,ahci-hd,/mnt/$vmdisk4'p2'/bhyve/img/Windows/11/Windows11.img,bootindex=1 \

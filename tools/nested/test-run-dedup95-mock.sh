@@ -7,7 +7,7 @@
 # STOP; D4 meno di 2 GiB liberi -> STOP; D5 budget iniziale non standard -> STOP; D6 disco non
 # in scrittura -> STOP; D7 SIGTERM durante il braccio -> INTERROTTA col ripristino.
 # Uso: test-run-misura-8vp-mock.sh <cartella di lavoro vuota>
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 B=${1:?cartella}
 nf=0
 prepara() {	# $1 cartella, $2 budget, $3 modo di mount (rw|ro)

@@ -5,7 +5,7 @@
 # (retry 2 passato al braccio, cartella misura-8vp-B-*); M2 budget 4000 -> STOP; M3 disco non in
 # scrittura -> STOP; M4 MISURA_R=3 -> uscita 4; M5 braccio A (predefinito) regolare.
 # Uso: test-run-misura-8vp-mock.sh <cartella di lavoro vuota>
-W=/mnt/linuxulator2/vm/nested-work
+W=/mnt/linuxulator2/vm/wsl2/fbsd
 B=${1:?cartella}
 nf=0
 prepara() {	# $1 cartella, $2 budget, $3 modo di mount (rw|ro)
