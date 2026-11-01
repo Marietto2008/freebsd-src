@@ -196,7 +196,6 @@ int	vm_fatal_latch(struct vcpu *vcpu, int err, int stadio, uint64_t rip,
 	cpuset_t	exitinfo_cpuset; /* (x) storage for vmexit handlers */ \
 	uint64_t	nextrip;	/* (x) next instruction to execute */ \
 	struct vm_fatal	fatal;		/* (i) latch fatale di VM_RUN (#135) */ \
-	bool		gla2gpa_conteso; /* (x) P3: l'istruzione riparte per contesa */ \
 	uint64_t	tsc_offset	/* (o) TSC offsetting */
 
 #define	VMM_VM_MD_FIELDS						\
@@ -473,12 +472,6 @@ int vm_copy_setup(struct vcpu *vcpu, struct vm_guest_paging *paging,
     uint64_t gla, size_t len, int prot, struct vm_copyinfo *copyinfo,
     int num_copyinfo, int *is_fault);
 void vm_copy_teardown(struct vm_copyinfo *copyinfo, int num_copyinfo);
-/* P3 (stadio 11): vm_copy_setup con vm_gla2gpa_budget; *conteso come la' */
-int vm_copy_setup_budget(struct vcpu *vcpu, struct vm_guest_paging *paging,
-    uint64_t gla, size_t len, int prot, struct vm_copyinfo *copyinfo,
-    int num_copyinfo, int *is_fault, bool *conteso);
-/* P3: il gestore dell'uscita segnala che l'istruzione riparte per contesa */
-void vm_segnala_conteso(struct vcpu *vcpu);
 void vm_copyin(struct vm_copyinfo *copyinfo, void *kaddr, size_t len);
 void vm_copyout(const void *kaddr, struct vm_copyinfo *copyinfo, size_t len);
 

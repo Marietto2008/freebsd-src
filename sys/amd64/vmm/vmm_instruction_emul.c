@@ -2240,30 +2240,9 @@ ptp_commit(struct vcpu *vcpu, struct ptp_pend *p, int n, uint64_t gla)
 	return (0);
 }
 
-/*
- * P3 (stadio 11, parere #158 D1): il walk riparte (goto restart) quando un
- * CAS su A/D fallisce o la voce cambia fra due letture. Senza limite un
- * guest con una contesa persistente tiene il vCPU nel kernel all'infinito,
- * congelato, fuori dalla portata di sospensione e rendezvous. I chiamanti
- * MIGRATI (conteso != NULL: l'operando VMX nested) ricevono, dopo
- * gla2gpa_restart_max ripartenze, l'esito interno CONTESO: ritorno 0,
- * nessun fault, nessuna pagina tenuta; gli A/D gia' scritti restano (sono
- * legittimi). Gli altri chiamanti (conteso == NULL) restano come prima.
- * 0 = nessun limite anche per i chiamanti migrati.
- */
-static u_int gla2gpa_restart_max = 64;
-SYSCTL_UINT(_hw_vmm, OID_AUTO, gla2gpa_restart_max, CTLFLAG_RDTUN,
-    &gla2gpa_restart_max, 0,
-    "P3: ripartenze del walk oltre le quali un chiamante migrato riceve CONTESO (0 = nessun limite)");
-static u_long gla2gpa_restart_capped;
-SYSCTL_ULONG(_hw_vmm, OID_AUTO, gla2gpa_restart_capped, CTLFLAG_RD,
-    &gla2gpa_restart_capped, 0,
-    "P3: walk interrotti al limite delle ripartenze (esito CONTESO)");
-
 static int
 _vm_gla2gpa(struct vcpu *vcpu, struct vm_guest_paging *paging,
-    uint64_t gla, int prot, uint64_t *gpa, int *guest_fault, bool check_only,
-    bool *conteso)
+    uint64_t gla, int prot, uint64_t *gpa, int *guest_fault, bool check_only)
 {
 	int ad, herr, laflags, leaf, ngflags, nlevels, npend, pfcode, ptpshift;
 	int ptpindex, retval, usermode, writable;
@@ -2286,19 +2265,8 @@ _vm_gla2gpa(struct vcpu *vcpu, struct vm_guest_paging *paging,
 restart:
 	ptpphys = paging->cr3;		/* root of the page tables */
 	ptp_release(&cookie);
-	if (retries++ > 0) {
-		/* P3: le ripartenze vengono solo dal commit di A/D, mai in check_only */
-		KASSERT(!check_only, ("%s: ripartenza in check_only", __func__));
-		/* retries - 1 e' la ripartenza richiesta: si concedono le prime gla2gpa_restart_max */
-		if (conteso != NULL && gla2gpa_restart_max != 0 &&
-		    retries - 1 > gla2gpa_restart_max) {
-			atomic_add_long(&gla2gpa_restart_capped, 1);
-			*conteso = true;
-			retval = 0;
-			goto done;
-		}
+	if (retries++ > 0)
 		maybe_yield();
-	}
 	npend = 0;			/* H2-AD: nessuna scrittura annotata */
 	/*
 	 * Bit 9-11 della qualificazione di una violation sull'indirizzo
@@ -2572,17 +2540,7 @@ vm_gla2gpa(struct vcpu *vcpu, struct vm_guest_paging *paging,
 {
 
 	return (_vm_gla2gpa(vcpu, paging, gla, prot, gpa, guest_fault,
-	    false, NULL));
-}
-
-int
-vm_gla2gpa_budget(struct vcpu *vcpu, struct vm_guest_paging *paging,
-    uint64_t gla, int prot, uint64_t *gpa, int *guest_fault, bool *conteso)
-{
-
-	*conteso = false;
-	return (_vm_gla2gpa(vcpu, paging, gla, prot, gpa, guest_fault,
-	    false, conteso));
+	    false));
 }
 
 int
@@ -2591,7 +2549,7 @@ vm_gla2gpa_nofault(struct vcpu *vcpu, struct vm_guest_paging *paging,
 {
 
 	return (_vm_gla2gpa(vcpu, paging, gla, prot, gpa, guest_fault,
-	    true, NULL));
+	    true));
 }
 
 int

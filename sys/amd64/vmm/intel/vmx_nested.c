@@ -678,7 +678,6 @@ enum nested_opnd {
 	NOPND_OK,		/* operando copiato per intero */
 	NOPND_INIETTATO,	/* #GP/#SS/#PF gia' iniettato all'L1: riparte */
 	NOPND_HOST_FATALE,	/* L0 non completa l'accesso: nessun byte copiato */
-	NOPND_CONTESO,		/* P3: walk conteso oltre il limite: nessun effetto, riparte servita */
 };
 
 /*
@@ -761,7 +760,6 @@ nested_operand_copy(struct vmx_vcpu *vcpu, int prot, void *buf, size_t len)
 	enum vm_reg_name seg;
 	size_t fatto;
 	int scaling, addrsize, fault, error, i, k, npg, npz;
-	bool conteso;			/* P3: walk conteso oltre il limite */
 
 	KASSERT(len == 4 || len == 8 || len == 16, ("%s: len %zu", __func__,
 	    len));
@@ -851,10 +849,8 @@ nested_operand_copy(struct vmx_vcpu *vcpu, int prot, void *buf, size_t len)
 		for (i = 0; i < npg; i++) {
 			pga = i == 0 ? pz[k].gla :
 			    (pz[k].gla & ~(uint64_t)PAGE_MASK) + i * PAGE_SIZE;
-			error = vm_gla2gpa_budget(vcpu->vcpu, &paging, pga, prot,
-			    &gpa, &fault, &conteso);
-			if (error == 0 && !fault && conteso)	/* P3 */
-				return (NOPND_CONTESO);
+			error = vm_gla2gpa(vcpu->vcpu, &paging, pga, prot, &gpa,
+			    &fault);
 			if (error != 0) {
 				(void)nested_operand_latch(vcpu, error,
 				    VM_FATAL_NESTED_OPERAND, pga, VM_FATAL_V_GLA);
@@ -865,12 +861,8 @@ nested_operand_copy(struct vmx_vcpu *vcpu, int prot, void *buf, size_t len)
 		}
 	}
 	for (k = 0; k < npz; k++) {
-		error = vm_copy_setup_budget(vcpu->vcpu, &paging, pz[k].gla,
-		    pz[k].len, prot, &ci[2 * k], 2, &fault, &conteso);
-		if (error == 0 && !fault && conteso) {	/* P3: nulla copiato */
-			vm_copy_teardown(ci, nitems(ci));	/* i pezzi gia' tenuti */
-			return (NOPND_CONTESO);
-		}
+		error = vm_copy_setup(vcpu->vcpu, &paging, pz[k].gla, pz[k].len,
+		    prot, &ci[2 * k], 2, &fault);
 		if (error != 0) {
 			vm_copy_teardown(ci, nitems(ci));	/* i pezzi gia' tenuti */
 			(void)nested_operand_latch(vcpu, error,
@@ -917,20 +909,6 @@ nested_operand_fatale(struct vmx_vcpu *vcpu)
 {
 	(void)vcpu;
 	return (ENOTRECOVERABLE);
-}
-
-/*
- * P3 (stadio 11): esito NOPND_CONTESO nel gestore. La copia dell'operando non
- * ha avuto effetti (nessun byte copiato, nessuna pagina tenuta, nessuna
- * eccezione): l'istruzione riparte e l'uscita e' segnalata a vm_run, che la
- * serve invece di rientrare dal ciclo nested stretto.
- */
-static int
-nested_operand_conteso(struct vmx_vcpu *vcpu)
-{
-	vm_restart_instruction(vcpu->vcpu);
-	vm_segnala_conteso(vcpu->vcpu);
-	return (0);
 }
 
 /*
@@ -1006,8 +984,6 @@ nested_vmxon(struct vmx_vcpu *vcpu)
 		return (0);
 	case NOPND_HOST_FATALE:
 		return (nested_operand_fatale(vcpu));
-	case NOPND_CONTESO:
-		return (nested_operand_conteso(vcpu));
 	}
 	/* VMXON region: allineata a 4K, entro MAXPHYADDR, revisione giusta. */
 	if ((ptr & PAGE_MASK) != 0 || (ptr >> cpu_maxphyaddr) != 0) {
@@ -1271,8 +1247,6 @@ nested_vmclear(struct vmx_vcpu *vcpu)
 		return (0);
 	case NOPND_HOST_FATALE:
 		return (nested_operand_fatale(vcpu));
-	case NOPND_CONTESO:
-		return (nested_operand_conteso(vcpu));
 	}
 	if ((vmcs12 & PAGE_MASK) != 0 || (vmcs12 >> cpu_maxphyaddr) != 0) {
 		nested_vmx_result(vcpu, VMXERR_VMCLEAR_INVALID_ADDRESS);
@@ -1327,8 +1301,6 @@ nested_vmptrld(struct vmx_vcpu *vcpu)
 		return (0);
 	case NOPND_HOST_FATALE:
 		return (nested_operand_fatale(vcpu));
-	case NOPND_CONTESO:
-		return (nested_operand_conteso(vcpu));
 	}
 	if ((vmcs12 & PAGE_MASK) != 0 || (vmcs12 >> cpu_maxphyaddr) != 0) {
 		nested_vmx_result(vcpu, VMXERR_VMPTRLD_INVALID_ADDRESS);
@@ -1432,8 +1404,6 @@ nested_vmptrst(struct vmx_vcpu *vcpu)
 		return (0);
 	case NOPND_HOST_FATALE:
 		return (nested_operand_fatale(vcpu));
-	case NOPND_CONTESO:
-		return (nested_operand_conteso(vcpu));
 	}
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
 	nested_advance_rip(vcpu);
@@ -2290,8 +2260,6 @@ nested_vmread(struct vmx_vcpu *vcpu)
 			return (0);
 		case NOPND_HOST_FATALE:
 			return (nested_operand_fatale(vcpu));
-		case NOPND_CONTESO:
-			return (nested_operand_conteso(vcpu));
 		}
 	}
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
@@ -2333,8 +2301,6 @@ nested_vmwrite(struct vmx_vcpu *vcpu)
 			return (0);
 		case NOPND_HOST_FATALE:
 			return (nested_operand_fatale(vcpu));
-		case NOPND_CONTESO:
-			return (nested_operand_conteso(vcpu));
 		}
 	}
 	/*
@@ -4445,8 +4411,6 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 		return (0);
 	case NOPND_HOST_FATALE:
 		return (nested_operand_fatale(vcpu));
-	case NOPND_CONTESO:
-		return (nested_operand_conteso(vcpu));
 	}
 	if ((q[0] >> 16) != 0 ||				/* riservati */
 	    (type != 2 && (q[0] & 0xffff) == 0) ||		/* VPID 0 */
@@ -4510,8 +4474,6 @@ nested_invept(struct vmx_vcpu *vcpu)
 		return (0);
 	case NOPND_HOST_FATALE:
 		return (nested_operand_fatale(vcpu));
-	case NOPND_CONTESO:
-		return (nested_operand_conteso(vcpu));
 	}
 	if (type == 1) {
 		eptp = desc[0];

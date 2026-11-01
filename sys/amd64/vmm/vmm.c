@@ -259,7 +259,6 @@ vcpu_init(struct vcpu *vcpu)
 	vmm_stat_init(vcpu->stats);
 	/* #135 K2: il latch si azzera solo qui, nella stessa operazione che reinizializza il vCPU */
 	memset(&vcpu->fatal, 0, sizeof(vcpu->fatal));
-	vcpu->gla2gpa_conteso = false;		/* P3: nessun residuo da un'istanza precedente */
 }
 
 /*
@@ -1342,7 +1341,6 @@ vm_run(struct vcpu *vcpu)
 	pmap_t pmap;
 	int vmexit_count = 0;
 	u_int nested_loops = 0;		/* restart nested consecutivi (anti-freeze) */
-	bool conteso;			/* P3: uscita nested ripartita per contesa */
 
 	vcpuid = vcpu->vcpuid;
 
@@ -1482,25 +1480,6 @@ restart:
 		error = vm_handle_ipi(vcpu, vme, &retu);
 
 	/*
-	 * P3 (stadio 11, parere #158 R1): un gestore nested ha ricevuto CONTESO
-	 * dal walk (contesa persistente su A/D o EPT12) e ha fatto ripartire
-	 * l'istruzione senza effetti. Il flag si legge e si AZZERA qui, una volta
-	 * per uscita, qualunque sia l'esito (nessun residuo puo' esonerare un'uscita
-	 * successiva). Un'uscita nested cosi' segnalata NON rientra dal ciclo
-	 * stretto: diventa BOGUS senza lunghezza e prende il percorso servito
-	 * (yield, ritorno a userland ogni 4096, sospensione e rendezvous al
-	 * rientro). Il conteggio dei cicli nested VERI non si azzera: un ciclo
-	 * nested non conteso arriva ancora al panic diagnostico.
-	 */
-	conteso = vcpu->gla2gpa_conteso;
-	vcpu->gla2gpa_conteso = false;
-	if (conteso && error == 0 && vme->exitcode == VM_EXITCODE_NESTED) {
-		vme->exitcode = VM_EXITCODE_BOGUS;
-		vme->inst_length = 0;
-	} else
-		conteso = false;
-
-	/*
 	 * Il nested rientra SUBITO, senza contare nel limite dei 4096 e
 	 * senza mai arrivare a userland (§6.1).
 	 */
@@ -1522,8 +1501,7 @@ restart:
 			    (u_long)vme->rip, nested_loops);
 		goto restart;
 	}
-	if (!conteso)
-		nested_loops = 0;	/* progresso: uscita non-nested */
+	nested_loops = 0;		/* progresso: uscita non-nested */
 
 	if (error == 0 && retu == false) {
 		/*
@@ -2182,10 +2160,10 @@ vm_copy_teardown(struct vm_copyinfo *copyinfo, int num_copyinfo)
 	bzero(copyinfo, num_copyinfo * sizeof(struct vm_copyinfo));
 }
 
-static int
-_vm_copy_setup(struct vcpu *vcpu, struct vm_guest_paging *paging,
+int
+vm_copy_setup(struct vcpu *vcpu, struct vm_guest_paging *paging,
     uint64_t gla, size_t len, int prot, struct vm_copyinfo *copyinfo,
-    int num_copyinfo, int *fault, bool *conteso)
+    int num_copyinfo, int *fault)
 {
 	int error, idx, nused;
 	size_t n, off, remaining;
@@ -2199,14 +2177,7 @@ _vm_copy_setup(struct vcpu *vcpu, struct vm_guest_paging *paging,
 	while (remaining > 0) {
 		if (nused >= num_copyinfo)
 			return (EFAULT);
-		if (conteso != NULL) {
-			error = vm_gla2gpa_budget(vcpu, paging, gla, prot, &gpa,
-			    fault, conteso);
-			/* P3: CONTESO prima di tenere qualunque pagina */
-			if (error == 0 && *fault == 0 && *conteso)
-				return (0);
-		} else
-			error = vm_gla2gpa(vcpu, paging, gla, prot, &gpa, fault);
+		error = vm_gla2gpa(vcpu, paging, gla, prot, &gpa, fault);
 		if (error || *fault)
 			return (error);
 		off = gpa & PAGE_MASK;
@@ -2234,42 +2205,6 @@ _vm_copy_setup(struct vcpu *vcpu, struct vm_guest_paging *paging,
 		*fault = 0;
 		return (0);
 	}
-}
-
-int
-vm_copy_setup(struct vcpu *vcpu, struct vm_guest_paging *paging,
-    uint64_t gla, size_t len, int prot, struct vm_copyinfo *copyinfo,
-    int num_copyinfo, int *fault)
-{
-
-	return (_vm_copy_setup(vcpu, paging, gla, len, prot, copyinfo,
-	    num_copyinfo, fault, NULL));
-}
-
-int
-vm_copy_setup_budget(struct vcpu *vcpu, struct vm_guest_paging *paging,
-    uint64_t gla, size_t len, int prot, struct vm_copyinfo *copyinfo,
-    int num_copyinfo, int *fault, bool *conteso)
-{
-
-	*conteso = false;
-	return (_vm_copy_setup(vcpu, paging, gla, len, prot, copyinfo,
-	    num_copyinfo, fault, conteso));
-}
-
-/*
- * P3 (stadio 11, parere #158 R1): il gestore di un'istruzione VMX dell'L1 ha
- * ricevuto CONTESO e fa ripartire l'istruzione senza effetti. vm_run legge e
- * AZZERA il flag subito dopo la gestione dell'uscita: un'uscita nested cosi'
- * segnalata prende il percorso servito (yield, ritorno a userland, controllo di
- * sospensione e rendezvous) invece del ciclo nested stretto, senza azzerare il
- * conteggio dei cicli nested veri.
- */
-void
-vm_segnala_conteso(struct vcpu *vcpu)
-{
-
-	vcpu->gla2gpa_conteso = true;
 }
 
 void
