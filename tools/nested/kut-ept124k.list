@@ -1,0 +1,2 @@
+# sonda forzata 4K nel guest
+ept12_remap_4k | vmxc.flat | ept12_remap_4k | -cpu max | 1 | 1024 | 120

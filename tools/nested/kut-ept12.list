@@ -1,0 +1,5 @@
+# EPT12: baseline conservativa (parere #55 §8). Il test ept di kvm-unit-tests esercita remap EPT12 GPA->GPA,
+# INVEPT di L1, violazione di permesso e misconfig. Con INVEPT incondizionato (opt=0) deve passare.
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+EPT_A_D_disabled                            | vmxc.flat | EPT_A/D_disabled                            | -cpu max | 1 | 1024 | 180
+EPT_A_D_enabled                             | vmxc.flat | EPT_A/D_enabled                             | -cpu max | 1 | 1024 | 180

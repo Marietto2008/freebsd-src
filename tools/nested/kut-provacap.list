@@ -1,0 +1,2 @@
+# prova log-cap
+c_vmx_pf_exception_test | vmxc.flat | vmx_pf_exception_test | -cpu max,-pku | 1 | 1024 | 120

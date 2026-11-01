@@ -1,0 +1,2 @@
+# 26/10 notte: ept12_remap_np con vept_keep=1 (binario vmxc-plain.flat, kut f4a29d65). 1 VM.
+ept12_remap_np | vmxc-plain.flat | ept12_remap_np | -cpu max | 1 | 1024 | 120

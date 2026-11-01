@@ -12,9 +12,9 @@ session="${vm##*/}"
 echo $vms
 echo $vncs
 echo $session
-bhyvectl --vm=vm0:12 --destroy
+sh /mnt/linuxulator2/vm/nested-work/freebsd-nested/tools/nested/vm-propria.sh vm0:12 || exit 1	# claude 29/10: solo la PROPRIA VM, e solo se e' un residuo
 
-bhyvectl --vm=vm2 --destroy
+# claude 29/10: tolto "bhyvectl --vm=vm2 --destroy": vm2 e' la VM di QEMU (KUT), non di questo script
 #kldunload vmm-restore
 #kldload vmm-restore
 
@@ -73,17 +73,7 @@ if [ -z "$recdev" ]; then
 fi
 echo "audio: play=/dev/dsp (default, unit $(sysctl -n hw.snd.default_unit)) rec=$recdev"
 
-for vm in $vms; do
-                session="${vm##*/}"   
-                echo "bhyve session = $session"
-                echo "vnc session = $vncs"           
-                                if ! printf '%s\n' "${vncs}" | grep "${session#vm}"; then
-                                printf 'VNC session not found,destroying ghost vms\n'
-                                bhyvectl --vm=$session --destroy
-                else
-                                printf 'Found VNC session %s\n' "${session},no ghost vms found,not destroying them"
-                fi
-done
+# claude 29/10: tolto il ciclo "destroying ghost vms": distruggeva OGNI VM senza un vncviewer, anche quelle vive
 
 #if ! pciconf -l pci0:1:0:0 | grep -q "^ppt"; then
 #echo "gtx 1060 slot 1/0/0 is not attached to ppt,attaching..."
@@ -144,17 +134,7 @@ fi
 
 echo "rtx 2080ti is fully attached to ppt"
 
-for vm in $vms; do
-                session="${vm##*/}"   
-                echo "bhyve session = $session"
-                echo "vnc session = $vncs"           
-                                if ! printf '%s\n' "${vncs}" | grep "${session#vm}"; then
-                                printf 'VNC session not found,destroying ghost vms\n'
-                                bhyvectl --vm=$session --destroy                                
-                else
-                                printf 'Found VNC session %s\n' "${session},no ghost vms found,not destroying them"
-                fi
-done
+# claude 29/10: tolto il ciclo "destroying ghost vms": distruggeva OGNI VM senza un vncviewer, anche quelle vive
 
 vmdisk0=`geom disk list | awk '/^Geom name: /{d=$NF} /^ *ident: (NM13N4CZ)/ && d{print d}'`
 echo "Seagate M3 Portable 1.8 TB UFS ; $vmdisk0"

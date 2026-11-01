@@ -1,0 +1,259 @@
+#!/usr/local/bin/python3
+# ptpad-drive.py -- Claude 27/10/2026, parere #106. Driver HOST del test ptpad sotto QEMU
+# `-accel bhyve`. Sostituisce ptpad_assembla per le corse vere (quello leggeva il contatore a VM
+# FINITA: delta 0 ovunque). NON si lancia senza consenso: avvia la VM data dopo `--`.
+#
+# Protocollo con L1 (ptpad_test.c.inc, sulla COM1 = stdin/stdout di QEMU con -serial stdio):
+#   L1 "PTPAD WAIT piano"        -> host invia "<piano>\n"
+#   L1 "PTPAD PLAN cases=<p>"    -> host verifica p == piano richiesto, altrimenti STOP
+#   L1 "PTPAD CASE <n>"          -> host legge il contatore (CTR before), segna "ack-<n>", invia 'g'
+#   L1 "PTPAD L1 ..."            -> host segna "l1-<n>", legge il contatore (CTR after), TERM alive
+# L1 e' FERMO fra CASE e 'g', e fra la riga L1 e il CASE successivo non esegue L2: le due letture
+# del contatore racchiudono esattamente il movsq del caso.
+#
+# H2 sotto QEMU (parere #106 D3): un errore di VM_RUN NON termina QEMU; stampa "Error running vm"
+# su stderr e rientra in vm_run in un anello caldo. Il driver lo vede su stderr, chiude il caso
+# aperto con TERM bhyve_died (= VM_RUN ha restituito errore al processo utente) e uccide QEMU.
+#
+# Uscite in --out: combinato.txt (per ptpad_an.py, scritto via via; le righe FBT inserite alla
+# fine), seriale.txt e qemu-stderr.txt con istante host, fbt.txt/fbt.err se --fbt, driver.txt.
+# Codice d'uscita: 0 corsa completata o caso D chiuso con errore di VM_RUN; 2 STOP del protocollo;
+# 3 timeout; 4 dtrace non pronto (nessuna VM avviata).
+#
+# Uso: ptpad-drive.py --piano B,C,A,A_D --out DIR [--fbt ptpad-fbt.d] [--timeout 120]
+#                     [--ctr-cmd '...'] [--dtrace-cmd '...'] -- <comando QEMU...>
+import argparse, os, queue, re, shlex, signal, subprocess, sys, threading, time
+
+MARK = '/nonexistent/ptpad-mark/'
+CASI = ('B', 'C', 'A', 'A_D', 'D_DATA', 'D_PTP')
+
+
+def piano_valido(p):
+	"""Stesse regole di ptpad_leggi_piano in L1: nomi noti, nessun duplicato, B primo, al piu'
+	UN caso D e per ultimo."""
+	c = p.split(',')
+	if not c or c[0] != 'B' or len(set(c)) != len(c) or any(x not in CASI for x in c):
+		return False
+	d = [i for i, x in enumerate(c) if x in ('D_DATA', 'D_PTP')]
+	return len(d) <= 1 and (not d or d[0] == len(c) - 1)
+
+
+def segna(etichetta):
+	"""Confine di caso per ptpad-fbt.d: un fstatat del driver su un percorso inesistente."""
+	try:
+		os.stat(MARK + etichetta)
+	except OSError:
+		pass
+
+
+def fbt_per_caso(testo):
+	"""Dalla traccia FBT (righe FBTEV, ordinate per timestamp) conta mmio/walk nella finestra di
+	ogni caso: da mark ack-<n> a mark l1-<n>, o a mark fine se il caso non ha risposto.
+	Ritorna {caso: (mmio, walk)} oppure None se la traccia non e' utilizzabile."""
+	if '== FBT PRONTA ==' not in testo or '== FBT CHIUSA ==' not in testo:
+		return None
+	ev = []
+	for r in testo.splitlines():
+		m = re.match(r'FBTEV t=(\d+) tid=\d+ k=(mmio|walk|mark)(?: m=(\S+))?$', r.strip())
+		if m:
+			ev.append((int(m.group(1)), m.group(2), m.group(3)))
+	ev.sort(key=lambda e: e[0])
+	out = {}
+	cur = None
+	for t, k, m in ev:
+		if k == 'mark':
+			if m.startswith('ack-'):
+				cur = m[4:]
+				out[cur] = [0, 0]
+			elif m.startswith('l1-') or m == 'fine':
+				cur = None
+			continue
+		if cur is not None:
+			out[cur][0 if k == 'mmio' else 1] += 1
+	return {c: tuple(v) for c, v in out.items()}
+
+
+def inserisci_fbt(combinato, conte):
+	"""Aggiunge 'FBT mmio=<0|1> ptp=<0|1>' dopo la riga CASE di ogni caso con finestra FBT."""
+	righe = []
+	for r in combinato.splitlines():
+		righe.append(r)
+		m = re.match(r'CASE (\S+)$', r)
+		if m and conte is not None and m.group(1) in conte:
+			mm, ww = conte[m.group(1)]
+			righe.append('FBT mmio=%d ptp=%d' % (mm > 0, ww > 0))
+	return '\n'.join(righe) + '\n'
+
+
+def lettore(flusso, q, tag):
+	for b in iter(flusso.readline, b''):
+		q.put((tag, time.monotonic_ns(), b.decode('utf-8', 'replace').rstrip('\r\n')))
+	q.put((tag, time.monotonic_ns(), None))
+
+
+def main():
+	ap = argparse.ArgumentParser()
+	ap.add_argument('--piano', required=True)
+	ap.add_argument('--out', required=True)
+	ap.add_argument('--fbt')
+	ap.add_argument('--timeout', type=int, default=120)
+	ap.add_argument('--ctr-cmd', default='/sbin/sysctl -n hw.vmm.vmx.nested_ept_mmio_emulated')
+	ap.add_argument('--dtrace-cmd', default='sudo -n /usr/sbin/dtrace')
+	ap.add_argument('--kill-cmd', default='sudo -n kill -TERM')
+	ap.add_argument('vm', nargs=argparse.REMAINDER)
+	a = ap.parse_args()
+	vm = a.vm[1:] if a.vm[:1] == ['--'] else a.vm
+	if not vm or not piano_valido(a.piano):
+		print('STOP: piano non valido o comando VM assente', file=sys.stderr)
+		return 2
+	os.makedirs(a.out, exist_ok=True)
+	comb = open(os.path.join(a.out, 'combinato.txt'), 'w', buffering=1)
+	ser = open(os.path.join(a.out, 'seriale.txt'), 'w', buffering=1)
+	err = open(os.path.join(a.out, 'qemu-stderr.txt'), 'w', buffering=1)
+	log = open(os.path.join(a.out, 'driver.txt'), 'w', buffering=1)
+
+	def dice(s):
+		log.write('%d %s\n' % (time.monotonic_ns(), s))
+
+	def ctr():
+		return subprocess.run(shlex.split(a.ctr_cmd), capture_output=True, text=True,
+		    check=True).stdout.strip()
+
+	dice('piano %s; vm: %s' % (a.piano, ' '.join(vm)))
+	dt = None
+	if a.fbt:
+		fo = os.path.join(a.out, 'fbt.txt')
+		open(fo, 'w').close()
+		dt = subprocess.Popen(shlex.split(a.dtrace_cmd) + ['-s', a.fbt, '-o', fo, str(os.getpid())],
+		    stdout=subprocess.DEVNULL, stderr=open(os.path.join(a.out, 'fbt.err'), 'w'))
+		for _ in range(60):
+			if '== FBT PRONTA ==' in open(fo).read():
+				break
+			if dt.poll() is not None:
+				break
+			time.sleep(0.25)
+		if '== FBT PRONTA ==' not in open(fo).read():
+			dice('STOP: dtrace non pronto, nessuna VM avviata')
+			subprocess.run(shlex.split(a.kill_cmd) + [str(dt.pid)])
+			dt.wait()
+			return 4
+		dice('FBT pronta')
+
+	p = subprocess.Popen(vm, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	dice('vm pid %d' % p.pid)
+	q = queue.Queue()
+	threading.Thread(target=lettore, args=(p.stdout, q, 'out'), daemon=True).start()
+	threading.Thread(target=lettore, args=(p.stderr, q, 'err'), daemon=True).start()
+
+	def invia(b):
+		try:
+			p.stdin.write(b)
+			p.stdin.flush()
+		except BrokenPipeError:
+			dice('invio fallito: L1 non legge piu\' (VM uscita)')
+
+	esito, uscita = None, 0
+	aperto = None			# caso con ack inviato e senza riga L1
+	visti = []			# casi aperti, in ordine
+	fine = {'out': False, 'err': False}
+	scadenza = time.monotonic() + a.timeout
+	while not (fine['out'] and fine['err']):
+		try:
+			tag, t, riga = q.get(timeout=0.2)
+		except queue.Empty:
+			if time.monotonic() > scadenza:
+				esito, uscita = 'TIMEOUT', 3
+				break
+			continue
+		if riga is None:
+			fine[tag] = True
+			continue
+		if tag == 'err':
+			err.write('%d %s\n' % (t, riga))
+			if riga.startswith('Error running vm'):
+				if aperto is None:
+					esito, uscita = 'STOP errore di VM_RUN fuori da un caso', 2
+				else:
+					segna('fine')
+					comb.write('CTR after=%s\n' % ctr())
+					comb.write('TERM bhyve_died\n')
+					comb.write('DEATH qemu_vmrun_error caso=%s riga=%s\n' % (aperto, riga))
+					esito = 'VMRUN_ERROR caso %s' % aperto
+					if not aperto.startswith('D_'):
+						uscita = 2	# atteso solo nei casi D: anomalia
+				break
+			continue
+		ser.write('%d %s\n' % (t, riga))
+		if riga == 'PTPAD WAIT piano':
+			invia((a.piano + '\n').encode())
+		elif riga.startswith('PTPAD PLAN '):
+			m = re.match(r'PTPAD PLAN cases=(\S+)$', riga)
+			if not m or m.group(1) != a.piano:
+				esito, uscita = 'STOP piano di L1 diverso da quello richiesto: %s' % riga, 2
+				break
+			comb.write('PLAN cases=%s\n' % m.group(1))
+		elif riga.startswith('PTPAD CASE '):
+			n = riga[len('PTPAD CASE '):]
+			if aperto is not None or n not in a.piano.split(','):
+				esito, uscita = 'STOP CASE %s inatteso (aperto=%s)' % (n, aperto), 2
+				break
+			comb.write('CASE %s\n' % n)
+			comb.write('CTR before=%s\n' % ctr())
+			segna('ack-' + n)
+			aperto = n
+			visti.append(n)
+			invia(b'g')
+		elif riga.startswith('PTPAD L1 '):
+			if aperto is None:
+				esito, uscita = 'STOP riga L1 senza caso aperto', 2
+				break
+			segna('l1-' + aperto)
+			comb.write('%s\n' % riga[len('PTPAD '):])
+			comb.write('CTR after=%s\n' % ctr())
+			comb.write('TERM alive\n')
+			aperto = None
+		elif riga.startswith('PTPAD NOACK') or riga.startswith('PTPAD PLAN rifiutato'):
+			esito, uscita = 'STOP %s' % riga, 2
+			break
+
+	segna('fine')
+	if p.poll() is None:
+		p.terminate()
+		try:
+			p.wait(5)
+		except subprocess.TimeoutExpired:
+			p.kill()
+	rc = p.wait()
+	if esito is None:
+		if aperto is not None:
+			esito, uscita = 'STOP caso %s senza risposta ne\' errore' % aperto, 2
+		elif visti != a.piano.split(','):
+			# compreso L1 senza piano (report_skip): nessun caso, sessione NON completata
+			esito, uscita = 'STOP casi eseguiti %s invece del piano %s' % (','.join(visti) or 'nessuno', a.piano), 2
+		else:
+			esito = 'COMPLETA'
+	dice('vm rc=%d; esito %s' % (rc, esito))
+	comb.close()
+	if dt is not None:
+		time.sleep(0.5)			# switchrate 10hz: lascia uscire gli ultimi record
+		subprocess.run(shlex.split(a.kill_cmd) + [str(dt.pid)])
+		dt.wait()
+		ftesto = open(os.path.join(a.out, 'fbt.txt')).read()
+		ferr = open(os.path.join(a.out, 'fbt.err')).read()
+		conte = fbt_per_caso(ftesto)
+		if conte is None or 'drop' in ferr.lower():
+			# fail-closed: nessuna riga FBT -> H2 diventa INCONCLUSIVE_PATH_UNPROVEN
+			dice('FBT NON utilizzabile (traccia incompleta o perdite): nessuna riga FBT')
+		else:
+			cp = os.path.join(a.out, 'combinato.txt')
+			testo = open(cp).read()
+			open(os.path.join(a.out, 'combinato-senza-fbt.txt'), 'w').write(testo)
+			open(cp, 'w').write(inserisci_fbt(testo, conte))
+			dice('FBT per caso: %s' % conte)
+	print('ESITO=%s VM_RC=%d USCITA=%d' % (esito, rc, uscita))
+	dice('ESITO=%s USCITA=%d' % (esito, uscita))
+	return uscita
+
+
+if __name__ == '__main__':
+	sys.exit(main())

@@ -1,0 +1,6 @@
+# Parere #49 §6: test nuovi (vmxc.flat = kvm-unit-tests 45d77ef5 + vmx_vpid_ctx_test e
+# vmx_vpid_crossvm_test, compilati su FreeBSD con gcc14 + ld.bfd in nested-work/kut-src-claude).
+# vmx_pf_exception_test e' il controllo che la build locale si comporta come quella di Ubuntu.
+# crossvm ripetuto: ogni riga e' una VM nuova.
+# nome | file.flat | args | qemu_params | smp | mem | timeout
+vmx_vpid_ctx_test                           | vmxc.flat | vmx_vpid_ctx_test                           | -cpu max,-pku | 1 | 1024 | 600

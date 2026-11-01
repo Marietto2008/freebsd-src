@@ -1,0 +1,408 @@
+#!/usr/local/bin/python3
+# ptpad-finta-vm.py -- Claude 27/10/2026, parere #106. L1 FINTO per collaudare ptpad-drive.py
+# senza VM: parla il protocollo di ptpad_test.c.inc su stdin/stdout e simula il contatore host
+# in un file. Nessun kernel, nessun vmm.
+#   ptpad-finta-vm.py <file contatore> <modo>
+# modi: ok (risposte plausibili, delta 1), eco_sbagliata, noack, muore_d (errore di VM_RUN nel caso
+# D: stampa "Error running vm" su stderr e resta in un anello che fa salire il contatore, come QEMU),
+# muore_b (errore di VM_RUN nel caso B), silenzio (non risponde dopo CASE), senza_runner (attende
+# il piano 2 s, poi "skip" senza eseguire casi).
+# Parere #107: b_errato (B risponde senza scrivere A/D, poi L1 stampa CASE C e ATTENDE: il driver non
+# deve mandare l'ACK), delta2 (il caso A fa salire il contatore di 2), fuori_seq (dopo B stampa
+# CASE A invece di C). Ogni byte ricevuto come ACK e' annotato in <file contatore>.acks.
+# Caso H (dopo la sessione 1c): stampa PTPAD MAP con pteaddr; i casi H/H_D NON fanno salire il
+# contatore mmio ma quello delle riflessioni (<file contatore>.rfl) se c'e' violazione. Modi: h1 (A e
+# A_D riproducono H1, H/H_D violano: attribuzione all'emulatore), h_noviol (A/A_D H1 e H/H_D passano
+# SENZA violazione), h_gpa (H viola su un gpa che non e' la PTE di D), h_emul (H fa salire mmio).
+# Correzione di H1: corretto (A/A_D ricevono dall'emulatore la stessa violazione di H/H_D e fanno
+# salire anche <file contatore>.rfe, le riflessioni dell'emulatore). Parere #111: prima di ogni risposta
+# con violazione stampa PTPAD XINFO (GLA e RIP); xinfo_rip (A con RIP avanzato), retry (RTR sale in A).
+# H2 (29/10, parere #119): h2ok (D_DATA/D_PTP ricevono dall'emulatore la violazione ESATTA che
+# HD_DATA/HD_PTP ricevono dall'hardware; salgono mmio, RFE e H2F/H2P in <file contatore>.h2/),
+# h2qual (D_DATA con il bit 9 diverso da HD_DATA), h2loop (caso D: nessuna risposta, l'emulazione si
+# ripete), h2spento (caso D: ENC sale e la VM esce da sola), h2nessuna (D_DATA scrive D senza violazione).
+# H2-AD (30/10, parere #123): casi _PDE/_ALL e riga PTPAD LIV (quattro livelli prima>dopo) nei modi h2ad_*:
+# h2ad_ok (emulatore e hardware lasciano tutto com'era), h2ad_sup (l'hardware accende A nei livelli superiori,
+# l'emulatore no), h2ad_sporco (nel controllo hardware la PDE parte gia' con A=1).
+# G1 (30/10, parere #124): casi _CONFLICT; h2ad_prec_tab = l'hardware da' la precedenza alla TABELLA (violazione sulla
+# PTE o sulla PDE), l'emulatore al DATO.
+# G1b (30/10, parere #126): H_PDE e riga PTPAD EPT nei modi h2ad_*/g1b_*; g1b_ok (controlli positivi, conflitti
+# DATO), g1b_pde_inefficace (H_PDE senza violazione), g1b_ept_diverso (la PD non e' R-only nel conflitto).
+# H2_MMIO (#131): modi hm_* (HM_RAM/HM_PTP: hm_fab violazione inventata, hm_l0 servito da L0, hm_silent silenzio,
+# hm_loop rientri ripetuti, hm_bar_y una BAR copre Y) e dm_* (DM_PTP: dm_hot ciclo caldo, dm_single un errore,
+# dm_exit QEMU esce dopo l'errore, dm_timeout silenzio).
+# #132: mutanti della raccolta (hm_tronca senza PCI_SCAN_COMPLETE, hm_senza_pcidev, hm_manca_bar, hm_barbad,
+# hm_ram, hm_yp_y, hm_bar_parziale, hm_bar_bordo, hm_overflow, hm_rom_y, hm_bridge_y, hm_bridge_alto, hm_bridge_senza),
+# dell'EPT12 (hm_eptbad L1 si ferma, hm_ept_perm T senza W, hm_ept_verso T verso un'altra pagina, hm_remap
+# T cambia durante il caso), della forma (hm_fab_emul, hm_fab_rip, hm_fab_2rfl) e degli errori di DM (dm_err3 tre
+# errori senza emulazioni, dm_fuori errore in HM_RAM, dm_progresso L1 scrive dopo l'errore, dm_vivo_kill un
+# errore e QEMU che ignora SIGTERM).
+# #142 (modulo RIPFIX nested, QEMU con la porta e QMP): dm_porta_qmp_rf (DM: un'emulazione, latch EMUL -> il primo
+# VM_RUN fallito restituisce 95, FTL +1, RIP del registro = l'istruzione), dm_porta_qmp_rf2 (il movsq rientra
+# nell'emulatore: due emulazioni), hm_porta_qmp_rf (HM_PTP: Fase C, nessuna riflessione, FTL e VMU +1, errno 95),
+# hm_porta_qmp_rf_refl (come sopra ma con una riflessione a L1). FTL/VMU in <file contatore>.h2/ se esistono.
+import os, sys, time, select
+
+ctr, modo = sys.argv[1], sys.argv[2]
+# #143 §4: prefisso 'qmp+' = qualunque modo dietro la QEMU protetta (-S e QMP): socket <ctr>.qmp.sock, ferma fino a
+# 'cont'. A fine sessione (isa-debug-exit) QEMU esce senza SHUTDOWN: il socket si chiude con il processo.
+QMP_FORZATO = modo.startswith('qmp+')
+if QMP_FORZATO:
+	modo = modo[4:]
+L1 = {
+	'B': 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1',
+	'C': 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=67 pte1=67 dwr=1 ripadv=1',
+	'A': 'viol=1 reason=48 qual=82 gpa=9000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'A_D': 'viol=1 reason=48 qual=82 gpa=9000 paddr=0 pte0=47 pte1=47 dwr=0 ripadv=0',
+	'D_DATA': 'viol=1 reason=48 qual=102 gpa=5000 paddr=1 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'D_PTP': 'viol=1 reason=48 qual=80 gpa=9000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'H': 'viol=1 reason=48 qual=8b gpa=fec6000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'H_D': 'viol=1 reason=48 qual=8b gpa=fec6000 paddr=0 pte0=47 pte1=47 dwr=0 ripadv=0',
+	'HD_DATA': 'viol=1 reason=48 qual=782 gpa=fec3000 paddr=1 pte0=27 pte1=27 dwr=0 ripadv=0',
+	'HD_PTP': 'viol=1 reason=48 qual=681 gpa=fec6000 paddr=0 pte0=27 pte1=27 dwr=0 ripadv=0',
+}
+for x in ('_PDE', '_ALL'):
+	L1['HD_DATA' + x] = L1['HD_DATA']
+L1['HD_PTP_ALL'] = L1['HD_PTP']
+L1['HD_CONFLICT'] = L1['HD_CONFLICT_PDE'] = L1['HD_DATA']
+L1['H_PDE'] = 'viol=1 reason=48 qual=68b gpa=fec5ff0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=0 ripadv=0'
+if modo == 'g1b_pde_inefficace':
+	L1['H_PDE'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=1 ripadv=1'
+if modo == 'h2ad_prec_tab':
+	L1['HD_CONFLICT'] = 'viol=1 reason=48 qual=68b gpa=fec6000 paddr=0 pte0=fec3007 pte1=fec3007 dwr=0 ripadv=0'
+	L1['HD_CONFLICT_PDE'] = 'viol=1 reason=48 qual=68b gpa=fec5ff0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=0 ripadv=0'
+if modo.startswith('h2'):
+	L1['D_DATA'] = L1['HD_DATA']
+	L1['D_PTP'] = L1['HD_PTP'].replace('qual=681', 'qual=81')	# bit 9-11 indefiniti con bit8=0
+if modo == 'h2qual':
+	L1['D_DATA'] = L1['HD_DATA'].replace('qual=782', 'qual=582')
+for x in ('_PDE', '_ALL'):
+	L1['D_DATA' + x] = L1['D_DATA']
+L1['D_PTP_ALL'] = L1['D_PTP']
+L1['D_CONFLICT'] = L1['D_CONFLICT_PDE'] = L1['D_DATA']
+L1['HM_RAM'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=1 ripadv=1'
+L1['HM_PTP'] = ('viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=1 ripadv=1' if modo == 'hm_l0' else
+    'viol=1 reason=48 qual=81 gpa=fec6000 paddr=0 pte0=fec3067 pte1=fec3067 dwr=0 ripadv=0')
+L1['DM_PTP'] = L1['HM_PTP']
+if modo == 'dm_salta':		# DM reale 30/10: un errore, poi L2 prosegue oltre il movsq senza scrivere D
+	L1['DM_PTP'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=fec3067 pte1=fec3067 dwr=0 ripadv=1'
+if modo == 'h2nessuna':
+	L1['D_DATA'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1'
+if modo in ('h1', 'h_noviol'):
+	L1['A'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1'
+	L1['A_D'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=47 pte1=67 dwr=1 ripadv=1'
+if modo == 'h_noviol':
+	L1['H'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=27 pte1=67 dwr=1 ripadv=1'
+	L1['H_D'] = 'viol=0 reason=18 qual=0 gpa=0 paddr=0 pte0=47 pte1=67 dwr=1 ripadv=1'
+if modo in ('corretto', 'stale', 'xinfo_rip', 'retry'):
+	L1['A'] = L1['H'].replace('qual=8b', 'qual=68b')	# bit 9-10 indefiniti: diversi apposta
+	L1['A_D'] = L1['H_D']
+if modo == 'h_gpa':
+	L1['H'] = L1['H'].replace('gpa=fec6000', 'gpa=fec3000')
+
+
+def scrivi(s):
+	sys.stdout.write(s + '\r\n')		# la COM1 di KUT manda CRLF
+	sys.stdout.flush()
+
+
+def sali(f=None):
+	# scrittura ATOMICA (file temporaneo + rename): il driver legge il contatore mentre la VM finta gira, e una
+	# scrittura sul posto gli faceva leggere un file vuoto (ValueError nel collaudo del 30/10, modo muore_d)
+	f = f or ctr
+	v = int(open(f).read())
+	t = f + '.tmp'
+	open(t, 'w').write(str(v + 1))
+	os.replace(t, f)
+
+
+def leggi_byte(attesa, caso):
+	r, _, _ = select.select([sys.stdin], [], [], attesa)
+	b = sys.stdin.buffer.read(1) if r else b''
+	with open(ctr + '.acks', 'a') as f:
+		f.write('%s %r\n' % (caso, b))
+	return b
+
+
+# #141 §3.1: QEMU con -S e QMP. La VM finta apre il socket <ctr>.qmp.sock e resta FERMA finche' non riceve 'cont':
+# nessuna riga di L1 (nessun VM_RUN) prima. Varianti: _rifiuta (capabilities rifiutate: mai partita), _panic
+# (SHUTDOWN con un'altra causa), _muto (EOF senza SHUTDOWN).
+QS = None
+if QMP_FORZATO or modo.startswith('dm_porta_qmp') or modo.startswith('hm_porta_qmp'):
+	import socket as _so
+	_srv = _so.socket(_so.AF_UNIX, _so.SOCK_STREAM)
+	# #152 §5: percorso dato dal collaudo (cartella breve), lunghezza in BYTE controllata prima del bind: sun_path e'
+	# di 104 byte compreso il NUL, quindi al massimo 103 byte di percorso
+	_qp = os.environ.get('PTPAD_QMP_SOCK', ctr + '.qmp.sock')
+	if len(_qp.encode()) > 103:
+		sys.stderr.write('PATH_TOO_LONG_PRECHECK %d byte: %s\n' % (len(_qp.encode()), _qp))
+		sys.stderr.flush()
+		sys.exit(9)
+	_srv.bind(_qp)
+	_srv.listen(1)
+	_srv.settimeout(10)
+	QS, _ = _srv.accept()
+	_fq = QS.makefile('rb')
+	QS.sendall(b'{"QMP": {"version": {}, "capabilities": []}}\n')
+	_fq.readline()
+	if modo == 'dm_porta_qmp_rifiuta':
+		QS.sendall(b'{"error": {"class": "GenericError", "desc": "finto"}}\n')
+		time.sleep(3600)
+	QS.sendall(b'{"return": {}}\n')
+	if b'cont' not in _fq.readline():
+		sys.exit(7)
+	QS.sendall(b'{"return": {}}\n')
+	QS.sendall(b'{"timestamp": {"seconds": 1, "microseconds": 0}, "event": "RESUME"}\n')
+
+scrivi('PTPAD MAP va_d=ffffffffffc00000 d=fec3000 T=fec6000 pte=fec3007 livelli_codice=3 pdeaddr=fec5ff0 pteaddr=fec6000')
+if modo.startswith('hm') or modo.startswith('dm'):
+	# la sessione della .flat #132: i0440fx, PIIX3, pci-testdev (BAR 0 mem), chiusa dal marcatore
+	scrivi('PTPAD MEM ram=%s y=40000000 yp=%s' % ('20000000' if modo == 'hm_ram' else '10000000',
+	    '40000000' if modo == 'hm_yp_y' else '3f00000'))
+	scrivi('PTPAD FIXMMIO ioapic=fec00000+1000 hpet=fed00000+400 lapic=fee00000+1000 pctestdev=ff000000+10000 bios=fffc0000+40000')
+	dev, bar, rom = 2, 1, 0
+	scrivi('PTPAD PCIDEV bdf=0 id=12378086 hdr=0')
+	scrivi('PTPAD PCIDEV bdf=8 id=70008086 hdr=80')
+	if modo != 'hm_senza_pcidev':
+		scrivi('PTPAD PCIDEV bdf=10 id=e1b36 hdr=0')
+		dev += 1
+	scrivi('PTPAD BAR bdf=10 n=0 mem=1 addr=febf1000 size=1000')
+	if modo == 'hm_manca_bar':
+		bar += 1		# il marcatore conta una BAR che non e' arrivata
+	extra = {'hm_bar_y': 'PTPAD BAR bdf=10 n=1 mem=1 addr=40000000 size=100000',
+	    'hm_bar_parziale': 'PTPAD BAR bdf=10 n=1 mem=1 addr=40000800 size=800',
+	    'hm_bar_bordo': 'PTPAD BAR bdf=10 n=1 mem=1 addr=3ffff000 size=1000',
+	    'hm_overflow': 'PTPAD BAR bdf=10 n=1 mem=1 addr=fffffffffffff000 size=2000'}
+	if modo in extra:
+		scrivi(extra[modo])
+		bar += 1
+	# hm_bar_parziale copre la seconda meta' della pagina Y; hm_bar_bordo finisce esattamente a Y: NON la copre
+	if modo == 'hm_barbad':
+		scrivi('PTPAD BARBAD bdf=10 n=5 motivo=64bit_senza_parte_alta')
+	if modo == 'hm_rom_y':
+		scrivi('PTPAD ROM bdf=10 addr=40000000 size=40000 en=0')
+		rom += 1
+	if modo in ('hm_bridge_y', 'hm_bridge_alto', 'hm_bridge_senza'):
+		scrivi('PTPAD PCIDEV bdf=18 id=1b36 hdr=1')
+		dev += 1
+		if modo == 'hm_bridge_y':		# prefetch a 64 bit 0x40000000-0x400fffff, parte alta 0
+			scrivi('PTPAD BRIDGE bdf=18 mem=fff0 pref=40014001 prefhi=0 preflimhi=0')
+		elif modo == 'hm_bridge_alto':		# stessa parte bassa ma sopra i 4 GiB: NON copre Y
+			scrivi('PTPAD BRIDGE bdf=18 mem=fff0 pref=40014001 prefhi=1 preflimhi=1')
+	if modo != 'hm_tronca':
+		scrivi('PTPAD PCI_SCAN_COMPLETE n=%d bars=%d roms=%d' % (dev, bar, rom))
+scrivi('PTPAD WAIT piano')
+if modo == 'senza_runner':
+	time.sleep(2)
+	scrivi('SKIP vmx_ptpad_fidelity_test: nessun piano')
+	sys.exit(1)
+piano = sys.stdin.buffer.readline().decode().strip()
+scrivi('PTPAD PLAN cases=%s' % (piano + ',C' if modo == 'eco_sbagliata' else piano))
+open(ctr + '.acks', 'w').close()
+def porta_95(rip):
+	"""#142: QEMU con la porta davanti al modulo RIPFIX: errore 95 (ENOTRECOVERABLE), porta del vCPU e della VM,
+	SHUTDOWN host-error via QMP, uscita 1."""
+	sys.stderr.write('Error running vm: State not recoverable (errno=95, error=-1)\n')
+	sys.stderr.write('bhyve: vCPU 0: VM_RUN State not recoverable (errno=95): errore non transitorio; porta chiusa, '
+	    'nessun nuovo VM_RUN; RIP del registro %s\n' % rip)
+	sys.stderr.write('bhyve: porta della VM chiusa dal vCPU 0: nessun vCPU rientra; arresto della VM '
+	    'richiesto (VM_RUN non recuperabile)\n')
+	sys.stderr.flush()
+	if QS is not None:
+		QS.sendall(b'{"timestamp": {"seconds": 2, "microseconds": 0}, "event": "SHUTDOWN", '
+		    b'"data": {"guest": false, "reason": "host-error"}}\n')
+		QS.close()
+	time.sleep(0.05)
+	sys.exit(1)
+
+sequenza = piano.split(',')
+if modo == 'fuori_seq':
+	sequenza = ['B', 'A'] + [x for x in sequenza if x not in ('B', 'A')]
+for caso in sequenza:
+	scrivi('PTPAD CASE %s' % caso)
+	if modo == 'noack':
+		scrivi('PTPAD NOACK %s' % caso)
+		sys.exit(3)
+	if leggi_byte(10, caso) != b'g':
+		scrivi('PTPAD NOACK %s' % caso)
+		sys.exit(3)
+	if caso.startswith('H'):	# scrittura hardware: nessuna emulazione
+		if 'viol=1' in L1[caso] and not (modo.startswith('hm_porta') and caso == 'HM_PTP'):
+			sali(ctr + '.rfl')	# violazione riflessa a L1 (col RIPFIX, in HM_PTP, nessuna: Fase C)
+		if modo == 'h_emul':
+			sali()
+	else:
+		sali()				# il movsq emulato del caso
+		if modo in ('corretto', 'stale', 'xinfo_rip', 'retry') and caso in ('A', 'A_D'):
+			sali(ctr + '.rfe')	# violazione riflessa DALL'EMULATORE
+		if modo == 'stale' and caso == 'A':
+			sali(ctr + '.est')	# una violazione dell'emulatore trovata fuori da L2
+		if (modo in ('h2ok', 'h2qual') or modo.startswith('h2ad')) and caso.startswith('D_'):
+			sali(ctr + '.rfe')
+			h2 = os.path.join(ctr + '.h2', 'H2F' if (caso.startswith('D_DATA') or 'CONFLICT' in caso) else 'H2P')
+			if os.path.exists(h2):		# modulo senza H2: contatore assente, non sale
+				sali(h2)
+		if modo == 'h2loop' and caso.startswith('D_'):
+			while True:		# l'istruzione riparte senza violazione: emulazioni a ripetizione
+				sali()
+				time.sleep(0.01)
+		if modo == 'h2spento' and caso.startswith('D_'):
+			sali(ctr + '.enc')
+			sys.exit(0)		# VM spenta da L0: QEMU esce da solo
+	if modo == 'delta2' and caso == 'A':
+		sali()
+	if (modo == 'muore_d' and caso.startswith('D_')) or (modo == 'muore_b' and caso == 'B'):
+		sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+		sys.stderr.flush()
+		while True:			# QEMU rientra in vm_run: anello caldo
+			sali()
+			time.sleep(0.01)
+	if modo == 'silenzio':
+		time.sleep(3600)
+	if modo.startswith('hm') or modo.startswith('dm'):
+		t = 0x3f00007 if caso == 'HM_RAM' else 0x40000007 if caso in ('HM_PTP', 'DM_PTP') else 0xfec6007
+		if modo == 'hm_ept_perm' and caso == 'HM_PTP':
+			t = 0x40000005
+		if modo.startswith('dm_eptw_tardi') and caso == 'DM_PTP':
+			# #143: la corsa fra i due tubi resa deterministica: l'errore arriva PRIMA delle righe pre-ingresso
+			# (il movsq e' gia' contato dal ramo dei casi non-H)
+			sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+			sys.stderr.flush()
+			time.sleep(0.05)
+		scrivi('PTPAD EPT t=%x pd=fec5007 d=fec3007' % t)
+		if caso in ('HM_RAM', 'HM_PTP', 'DM_PTP'):
+			v = t & ~0xfff
+			if modo == 'hm_ept_verso' and caso == 'HM_PTP':
+				v = 0x40001000
+			ok = 0 if (modo == 'hm_eptbad' and caso == 'HM_PTP') else 1
+			scrivi('PTPAD EPTW %s t=%x/%d l4=fec4000/7 l3=fec5000/7 l2=fec2000/7 d=fec3000/7 ok=%d' % (caso, v, t & 7, ok))
+			if not ok:
+				scrivi('PTPAD EPTBAD %s' % caso)
+				scrivi('FAIL vmx_ptpad_fidelity_test')
+				sys.exit(1)
+		if modo == 'dm_eptw_tardi_dup' and caso == 'DM_PTP':	# #144: una EPTW in PIU' (anomala)
+			scrivi('PTPAD EPTW %s t=%x/%d l4=fec4000/7 l3=fec5000/7 l2=fec2000/7 d=fec3000/7 ok=1' % (caso, t & ~0xfff, t & 7))
+		if modo == 'dm_eptw_tardi_altro' and caso == 'DM_PTP':	# #144: una EPTW di un ALTRO caso
+			scrivi('PTPAD EPTW HM_RAM t=3f00000/7 l4=fec4000/7 l3=fec5000/7 l2=fec2000/7 d=fec3000/7 ok=1')
+		if modo == 'dm_eptw_tardi_malf' and caso == 'DM_PTP':	# #144: una EPT malformata
+			scrivi('PTPAD EPT t=zz')
+		if modo.startswith('dm_eptw_tardi') and caso == 'DM_PTP':
+			time.sleep(3600)
+		if modo == 'dm_fuori' and caso == 'HM_RAM':
+			sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+			sys.stderr.flush()
+			time.sleep(3600)
+		if caso == 'HM_PTP' and modo.startswith('hm_porta_qmp_rf'):
+			# #142: Fase C. Nessuna emulazione; latch NESTED_VEPT; il PRIMO VM_RUN fallito restituisce 95
+			for x in ('FTL', 'VMU'):
+				if os.path.exists(os.path.join(ctr + '.h2', x)):
+					sali(os.path.join(ctr + '.h2', x))
+			if modo == 'hm_porta_qmp_rf_refl':
+				sali(ctr + '.rfl')
+			porta_95('0x406f4e')
+		if caso == 'HM_PTP' and modo == 'hm_fab_emul':
+			sali()
+		if caso == 'HM_PTP' and modo == 'hm_fab_2rfl':
+			sali(ctr + '.rfl')
+		if caso == 'HM_PTP' and modo == 'hm_silent':
+			time.sleep(3600)
+		if caso == 'HM_PTP' and modo == 'hm_loop':
+			while True:
+				sali(ctr + '.rfl')
+				time.sleep(0.01)
+		if caso == 'DM_PTP' and (modo in ('dm_hot', 'dm_single', 'dm_exit', 'dm_timeout', 'dm_err3', 'dm_progresso',
+		    'dm_vivo_kill', 'dm_salta') or modo.startswith('dm_porta')):
+			# il movsq e' gia' contato una volta dal ramo dei casi non-H (sopra): qui NESSUN secondo sali()
+			if modo == 'dm_timeout':
+				time.sleep(3600)
+			if not modo.startswith('dm_porta_qmp_rf'):
+				sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+				sys.stderr.flush()
+			if modo == 'dm_exit':
+				sys.exit(1)
+			if modo.startswith('dm_porta_qmp_rf'):
+				# #142: latch EMUL e nextrip ripristinato: il primo VM_RUN fallito restituisce 95
+				if modo == 'dm_porta_qmp_rf2':
+					sali()			# il movsq rientrato nell'emulatore: seconda emulazione
+				if os.path.exists(os.path.join(ctr + '.h2', 'FTL')):
+					sali(os.path.join(ctr + '.h2', 'FTL'))
+				porta_95('0x406f40')
+			if modo.startswith('dm_porta'):
+				# #136 §6.1: QEMU con la porta di VM_RUN: chiude, chiede l'arresto ed esce (nessun nuovo VM_RUN)
+				sys.stderr.write('bhyve: vCPU 0: VM_RUN Bad address (errno=14): errore non transitorio; porta chiusa, '
+				    'nessun nuovo VM_RUN; RIP del registro 0x406f43\n')
+				sys.stderr.write('bhyve: porta della VM chiusa dal vCPU 0: nessun vCPU rientra; arresto della VM '
+				    'richiesto (VM_RUN non recuperabile)\n')
+				sys.stderr.flush()
+				if QS is not None and modo != 'dm_porta_qmp_muto':
+					causa = b'guest-panic' if modo == 'dm_porta_qmp_panic' else b'host-error'
+					QS.sendall(b'{"timestamp": {"seconds": 2, "microseconds": 0}, "event": "SHUTDOWN", '
+					    b'"data": {"guest": false, "reason": "' + causa + b'"}}\n')
+				if QS is not None:
+					QS.close()
+				time.sleep(0.05)
+				sys.exit(1)	# #139 §3: causa host-error, stato d'uscita EXIT_FAILURE
+			if modo == 'dm_single':
+				time.sleep(3600)
+			if modo == 'dm_vivo_kill':
+				import signal
+				signal.signal(signal.SIGTERM, signal.SIG_IGN)	# QEMU sorda al TERM: serve il KILL
+				time.sleep(3600)
+			if modo == 'dm_progresso':
+				# DOPO l'errore: stdout e stderr sono due tubi letti da due thread, righe nello stesso istante
+				# non hanno un ordine (limite documentato); la progressione vera viene dopo
+				time.sleep(0.1)
+				scrivi('PTPAD DVAL DM_PTP d=0 sent=0')	# L1 scrive ancora: il guest e' andato avanti
+				time.sleep(3600)
+			if modo == 'dm_err3':
+				for _ in range(2):	# tre errori subito, nessuna nuova emulazione
+					sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+					sys.stderr.flush()
+				time.sleep(3600)
+			if modo == 'dm_salta':
+				# nella sessione reale L1 riprende ~1 ms (EPTPOST) e ~7 ms (riga L1) DOPO l'errore; righe nello
+				# stesso istante su due tubi non hanno ordine (limite documentato del driver)
+				time.sleep(0.05)
+			while modo != 'dm_salta':	# dm_hot: QEMU rientra in vm_run e l'errore si ripete
+				sali()
+				sys.stderr.write('Error running vm: Bad address (errno=14, error=-1)\n')
+				sys.stderr.flush()
+				time.sleep(0.05)
+	if modo.startswith('g1b') or modo.startswith('h2ad'):
+		tro = caso in ('H', 'HD_CONFLICT', 'D_CONFLICT')	# T senza W
+		pdro = caso in ('H_PDE', 'HD_CONFLICT_PDE', 'D_CONFLICT_PDE')	# PD senza W
+		if modo == 'g1b_ept_diverso' and caso == 'HD_CONFLICT_PDE':
+			pdro = False
+		dass = caso.startswith('HD_') or caso.startswith('D_')	# D non presente
+		scrivi('PTPAD EPT t=%x pd=%x d=%x' % (0xfec6031 if tro else 0xfec6037, 0xfec5031 if pdro else 0xfec5037,
+		    0xfec3030 if dass else 0xfec3037))
+	if modo.startswith('g1b'):
+		pde0 = 0xfec6007 if caso.endswith('_PDE') else 0xfec6027
+		scrivi('PTPAD LIV pml4=fec4027>fec4027 pdpt=fec5027>fec5027 pde=%x>%x pte=fec3067>fec3067' % (pde0, pde0))
+	if modo.startswith('h2ad'):
+		az = ('pde',) if caso.endswith('_PDE') else ('pml4', 'pdpt', 'pde') if caso.endswith('_ALL') else ()
+		liv = []
+		for nm in ('pml4', 'pdpt', 'pde', 'pte'):
+			v0 = 0x7 if (nm in az or nm == 'pte') else 0x27
+			if modo == 'h2ad_sporco' and caso.startswith('H') and nm == 'pde':
+				v0 = 0x27
+			v1 = v0 | 0x20 if (modo == 'h2ad_sup' and caso.startswith('H') and nm != 'pte') else v0
+			liv.append('%s=%x>%x' % (nm, v0, v1))
+		scrivi('PTPAD LIV ' + ' '.join(liv))
+	if (modo.startswith('hm') or modo.startswith('dm')) and caso in ('HM_RAM', 'HM_PTP', 'DM_PTP'):
+		post = 0x3f00000 if caso == 'HM_RAM' else 0x40000000
+		if modo == 'hm_remap' and caso == 'HM_PTP':
+			post = 0xfec6000
+		scrivi('PTPAD EPTPOST t=%x/7' % post)
+	if 'viol=1' in L1[caso]:
+		rip = '406f4e' if caso.startswith('H') else '406f40'
+		got = '406f42' if ((modo == 'xinfo_rip' and caso == 'A') or (modo == 'hm_fab_rip' and caso == 'HM_PTP')) else rip
+		scrivi('PTPAD XINFO gla=ffffffffffc00000 rip=%s rip_atteso=%s va_d=ffffffffffc00000' % (got, rip))
+	if modo == 'retry' and caso == 'A':
+		sali(ctr + '.rtr')
+	if modo == 'b_errato' and caso == 'B':
+		scrivi('PTPAD L1 %s' % L1[caso].replace('pte1=67', 'pte1=27'))
+		continue
+	scrivi('PTPAD L1 %s' % L1[caso])
+scrivi('SUMMARY: 1 tests')
+sys.exit(1)

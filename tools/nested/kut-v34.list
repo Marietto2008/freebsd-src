@@ -1,0 +1,2 @@
+ept12_remap_sentinel | vmxc.flat | ept12_remap_sentinel | -cpu max | 1 | 1024 | 120
+ept12_remap_newgva   | vmxc.flat | ept12_remap_newgva   | -cpu max | 1 | 1024 | 120
