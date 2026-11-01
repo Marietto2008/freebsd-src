@@ -252,6 +252,67 @@ vcpu_init(struct vcpu *vcpu)
 	vcpu->guest_xcr0 = XFEATURE_ENABLED_X87;
 	fpu_save_area_reset(vcpu->guestfpu);
 	vmm_stat_init(vcpu->stats);
+	/* #135 K2: il latch si azzera solo qui, nella stessa operazione che reinizializza il vCPU */
+	memset(&vcpu->fatal, 0, sizeof(vcpu->fatal));
+}
+
+/*
+ * #135 K2: chiude il latch fatale del vCPU (una volta: il primo errore conserva la diagnosi) e restituisce
+ * ENOTRECOVERABLE. Registra rip, nextrip e lunghezza PRIMA che il chiamante li ripristini. Una riga di log al
+ * secondo al massimo, piu' il contatore hw.vmm.fatal_latches e la sonda SDT vmm:::fatal-latch.
+ */
+static u_long vm_fatal_latches;
+SYSCTL_ULONG(_hw_vmm, OID_AUTO, fatal_latches, CTLFLAG_RD, &vm_fatal_latches, 0,
+    "vCPU fermati dal latch fatale di VM_RUN (istruzione non completabile)");
+SDT_PROBE_DEFINE6(vmm, , , fatal__latch, "int", "int", "int", "uint64_t",
+    "uint64_t", "uint64_t");
+/*
+ * #142 §4.1.5: misura INDIPENDENTE del ripristino, senza rientrare nel guest. Scatta in vm_run quando restituisce
+ * l'errore che ha appena chiuso il latch (mai sul ritorno immediato di K3): vcpuid, nextrip, vme->rip,
+ * vme->inst_length, fatal.rip. Atteso: nextrip == rip == fatal.rip e inst_length == 0.
+ */
+SDT_PROBE_DEFINE5(vmm, , , fatal__ritorno, "int", "uint64_t", "uint64_t", "int",
+    "uint64_t");
+
+int
+vm_fatal_latch(struct vcpu *vcpu, int err, int stadio, uint64_t rip,
+    uint64_t gpa, uint64_t gla, const uint8_t *inst, int ninst, int valide)
+{
+	static struct timeval last;
+	static int curpps;
+	struct vm_fatal *f = &vcpu->fatal;
+
+	if (f->errno_orig != 0)
+		return (ENOTRECOVERABLE);
+	f->errno_orig = err != 0 ? err : EFAULT;
+	f->stadio = stadio;
+	f->rip = rip;
+	f->nextrip_old = vcpu->nextrip;
+	f->inst_length = vcpu->exitinfo.inst_length;
+	/* #139 §7: un campo non valido resta a zero e non e' dichiarato valido */
+	f->valide = valide & (VM_FATAL_V_GPA | VM_FATAL_V_GLA);
+	f->gpa = (valide & VM_FATAL_V_GPA) ? gpa : 0;
+	f->gla = (valide & VM_FATAL_V_GLA) ? gla : 0;
+	f->ninst = 0;
+	if ((valide & VM_FATAL_V_INST) && inst != NULL && ninst > 0) {
+		f->ninst = ninst > (int)sizeof(f->inst) ? (int)sizeof(f->inst) :
+		    ninst;
+		memcpy(f->inst, inst, f->ninst);
+		f->valide |= VM_FATAL_V_INST;
+	}
+	atomic_add_long(&vm_fatal_latches, 1);
+	SDT_PROBE6(vmm, , , fatal__latch, vcpu->vcpuid, f->errno_orig, stadio,
+	    rip, gpa, gla);
+	if (ppsratecheck(&last, &curpps, 1))
+		printf("vmm: %s vcpu %d: istruzione non completabile (stadio %d, "
+		    "errno %d) rip %#lx nextrip %#lx len %d %s %#lx%s gla %#lx%s "
+		    "byte %d: il vCPU non rientra piu' nel guest\n", vm_name(vcpu->vm),
+		    vcpu->vcpuid, stadio, f->errno_orig, (u_long)rip,
+		    (u_long)f->nextrip_old, f->inst_length,
+		    stadio == VM_FATAL_NESTED_VEPT ? "l2gpa" : "gpa", (u_long)f->gpa,
+		    (f->valide & VM_FATAL_V_GPA) ? "" : "(n.d.)", (u_long)f->gla,
+		    (f->valide & VM_FATAL_V_GLA) ? "" : "(n.d.)", f->ninst);
+	return (ENOTRECOVERABLE);
 }
 
 int
@@ -1010,8 +1071,16 @@ vm_handle_inst_emul(struct vcpu *vcpu, bool *retu)
 		 */
 		error = fault = 0;
 	}
-	if (error || fault)
+	if (error || fault) {
+		if (error != 0) {
+			/* #135 K1/K2: fetch fallito, nessun avanzamento ancora: si chiude il latch */
+			error = vm_fatal_latch(vcpu, error, VM_FATAL_FETCH, vme->rip,
+			    gpa, gla, NULL, 0, VM_FATAL_V_GPA |
+			    (gla != VIE_INVALID_GLA ? VM_FATAL_V_GLA : 0));
+			vcpu->nextrip = vme->rip;
+		}
 		return (error);
+	}
 
 	if (vmm_decode_instruction(vcpu, gla, cpu_mode, cs_d, vie) != 0) {
 		VMM_CTR1(vcpu, "Error decoding instruction at %#lx",
@@ -1054,6 +1123,19 @@ vm_handle_inst_emul(struct vcpu *vcpu, bool *retu)
 
 	error = vmm_emulate_instruction(vcpu, gpa, vie, paging, mread, mwrite,
 	    retu);
+	if (error != 0) {
+		/*
+		 * #135 K1/K2: l'emulazione e' fallita DOPO l'avanzamento di nextrip: riprendere da nextrip salterebbe
+		 * l'istruzione (sessione DM del 30/10, movsq perso). Gli emulatori aggiornano i registri solo dopo il
+		 * successo, e su errore nessuno ha chiamato vm_restart_instruction: si registra (prima!) e si torna
+		 * sull'istruzione, e il latch impedisce di rieseguirla (effetti MMIO gia' prodotti, REP parziale).
+		 */
+		error = vm_fatal_latch(vcpu, error, VM_FATAL_EMUL, vme->rip, gpa,
+		    gla, vie->inst, vie->num_valid, VM_FATAL_V_GPA | VM_FATAL_V_INST |
+		    (gla != VIE_INVALID_GLA ? VM_FATAL_V_GLA : 0));
+		vcpu->nextrip = vme->rip;
+		vme->inst_length = 0;
+	}
 
 	return (error);
 }
@@ -1239,6 +1321,14 @@ vm_run(struct vcpu *vcpu)
 
 	vcpuid = vcpu->vcpuid;
 
+	/*
+	 * #135 K3: latch fatale chiuso -> nessun ingresso nel guest, mai. Il latch si chiude solo dentro un gestore
+	 * che poi restituisce errore (niente "goto restart"), quindi basta il controllo qui. Nessuna pausa: il
+	 * rate-limit nel kernel richiede prima l'audit del contesto di sonno (#135 §4).
+	 */
+	if (vcpu->fatal.errno_orig != 0)
+		return (ENOTRECOVERABLE);
+
 	if (!CPU_ISSET(vcpuid, &vm->active_cpus))
 		return (EINVAL);
 
@@ -1390,6 +1480,9 @@ restart:
 		}
 	}
 
+	if (error == ENOTRECOVERABLE && vcpu->fatal.errno_orig != 0)
+		SDT_PROBE5(vmm, , , fatal__ritorno, vcpu->vcpuid, vcpu->nextrip,
+		    vme->rip, vme->inst_length, vcpu->fatal.rip);
 	vmm_stat_incr(vcpu, VMEXIT_USERSPACE, 1);
 	VMM_CTR2(vcpu, "retu %d/%d", error, vme->exitcode);
 

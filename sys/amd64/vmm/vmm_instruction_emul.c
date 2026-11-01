@@ -1891,7 +1891,7 @@ vie_calculate_gla(enum vm_cpu_mode cpu_mode, enum vm_reg_name seg,
     struct seg_desc *desc, uint64_t offset, int length, int addrsize,
     int prot, uint64_t *gla)
 {
-	uint64_t firstoff, low_limit, high_limit, segbase;
+	uint64_t firstoff, first, last, top, segbase;
 	int glasize, type;
 
 	KASSERT(seg >= VM_REG_GUEST_ES && seg <= VM_REG_GUEST_GS,
@@ -1955,24 +1955,28 @@ vie_calculate_gla(enum vm_cpu_mode cpu_mode, enum vm_reg_name seg,
 		/*
 		 * 'desc->limit' is fully expanded taking granularity into
 		 * account.
+		 *
+		 * R9 (parere #165, SDM vol. 3A 6.3): the bytes of the access
+		 * are at offsets EA .. EA + length - 1, with only the EA
+		 * truncated to the address size. The loop used to truncate the
+		 * offset of every byte: with 16-bit addressing a word at 0xffff
+		 * passed a 0xffff limit, and an expand-down segment with B=1
+		 * rejected a valid dword at 0xfffe. With an effective limit of
+		 * FFFFFFFFH the check is implementation-specific; project rule
+		 * (as KVM and the nested 09 unit): only a flat segment (base 0,
+		 * limit 0xffffffff, code or expand-up data) is exempt.
 		 */
+		first = offset & vie_size2mask(addrsize);
+		last = first + length - 1;		/* 64 bit: no carry lost */
 		if ((type & 0xC) == 0x4) {
 			/* expand-down data segment */
-			low_limit = desc->limit + 1;
-			high_limit = SEG_DESC_DEF32(desc->access) ?
-			    0xffffffff : 0xffff;
-		} else {
-			/* code segment or expand-up data segment */
-			low_limit = 0;
-			high_limit = desc->limit;
-		}
-
-		while (length > 0) {
-			offset &= vie_size2mask(addrsize);
-			if (offset < low_limit || offset > high_limit)
+			top = SEG_DESC_DEF32(desc->access) ? 0xffffffff : 0xffff;
+			if (first <= desc->limit || last > top)
 				return (-1);
-			offset++;
-			length--;
+		} else if (!(desc->base == 0 && desc->limit == 0xffffffff) &&
+		    last > desc->limit) {
+			/* code segment or expand-up data segment */
+			return (-1);
 		}
 	}
 

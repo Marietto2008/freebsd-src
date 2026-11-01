@@ -687,7 +687,7 @@ vm_loop(struct vmctx *ctx, struct vcpu *vcpu)
 {
 	struct vm_exit vme;
 	struct vm_run vmrun;
-	int error, rc;
+	int error, rc, err;
 	enum vm_exitcode exitcode;
 	cpuset_t active_cpus, dmask;
 
@@ -721,7 +721,18 @@ vm_loop(struct vmctx *ctx, struct vcpu *vcpu)
 			exit(BHYVE_EXIT_ERROR);
 		}
 	}
-	EPRINTLN("vm_run error %d, errno %d", error, errno);
+	err = errno;
+	EPRINTLN("vm_run error %d, errno %d", error, err);
+	/*
+	 * #135 §5.2: un errore non transitorio di VM_RUN (ENOTRECOVERABLE: latch fatale del kernel; EFAULT, EIO:
+	 * emulazione, paging o I/O in kernel falliti) lascia lo stato di ripresa del vCPU indefinito. Prima usciva
+	 * solo questo thread e gli altri vCPU continuavano: ora la VM termina, come per ogni gestore d'uscita fallito.
+	 */
+	if (err == ENOTRECOVERABLE || err == EFAULT || err == EIO) {
+		EPRINTLN("vm_loop: vCPU %d non recuperabile (%s): la VM termina",
+		    vcpu_id(vcpu), strerror(err));
+		exit(BHYVE_EXIT_ERROR);
+	}
 }
 
 static int

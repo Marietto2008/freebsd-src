@@ -131,6 +131,43 @@ enum x2apic_state {
  */
 #define VM_OP_F_QEMU (1 << 0)
 #ifdef _KERNEL
+/*
+ * #135 K2: latch fatale di VM_RUN. Un'istruzione che il kernel non riesce a completare (emulazione o fetch falliti
+ * dopo la decodifica; nel nested anche VEPT_MMIO non emulabile) NON viene saltata: nextrip torna sull'istruzione e
+ * il vCPU non rientra piu' nel guest; ogni VM_RUN successivo restituisce ENOTRECOVERABLE. Scritto UNA volta (il
+ * primo errore conserva la diagnosi); azzerato solo da vcpu_init, cioe' alla creazione e in vm_reinit insieme al
+ * ripristino dello stato del vCPU (vmmops_vcpu_init).
+ */
+struct vm_fatal {
+	int		errno_orig;	/* 0 = libero; altrimenti l'errore originale */
+	int		stadio;		/* VM_FATAL_* */
+	uint64_t	rip;		/* vme->rip: l'istruzione NON completata */
+	uint64_t	nextrip_old;	/* nextrip prima del ripristino */
+	int		inst_length;	/* lunghezza decodificata prima del ripristino */
+	uint64_t	gpa;
+	uint64_t	gla;
+	int		ninst;
+	uint8_t		inst[15];	/* VIE_INST_SIZE */
+	int		valide;		/* VM_FATAL_V_*: quali campi sono validi (#136 §2.2, #139 §7) */
+};
+/*
+ * #140 §5, invarianti:
+ *  - V_GPA: gpa e' quello dell'uscita. Per lo stadio NESTED_VEPT e' l'L2-GPA (il GPA del guest annidato, prima di
+ *    EPT12), NON l'L1-GPA ne' il GPA di backing di L0; per FETCH/EMUL e' il GPA del guest che e' uscito.
+ *  - V_GLA: gla e' un indirizzo lineare acquisito (non VIE_INVALID_GLA). Un campo non valido vale 0 e il bit e'
+ *    spento: uno zero con il bit spento NON e' un indirizzo.
+ *  - V_INST: i byte sono quelli EFFETTIVAMENTE acquisiti dal fetch (vie->num_valid), copiati al piu' 15; fetch
+ *    fallito o percorso nested senza decodifica -> bit spento e ninst = 0.
+ */
+#define	VM_FATAL_V_GPA		0x1	/* gpa valido (L2-GPA per NESTED_VEPT) */
+#define	VM_FATAL_V_GLA		0x2	/* gla valido (non VIE_INVALID_GLA) */
+#define	VM_FATAL_V_INST		0x4	/* byte dell'istruzione acquisiti (ninst <= 15) */
+#define	VM_FATAL_FETCH		1	/* fetch dell'istruzione fallito */
+#define	VM_FATAL_EMUL		2	/* emulazione fallita dopo la decodifica */
+#define	VM_FATAL_NESTED_VEPT	3	/* nested: backing di L0 assente, accesso non emulabile */
+int	vm_fatal_latch(struct vcpu *vcpu, int err, int stadio, uint64_t rip,
+	    uint64_t gpa, uint64_t gla, const uint8_t *inst, int ninst, int valide);
+
 #define	VMM_VCPU_MD_FIELDS						\
 	struct vlapic	*vlapic;	/* (i) APIC device model */	\
 	enum x2apic_state x2apic_state;	/* (i) APIC mode */		\
@@ -146,6 +183,7 @@ enum x2apic_state {
 	struct vm_exit	exitinfo;	/* (x) exit reason and collateral */ \
 	cpuset_t	exitinfo_cpuset; /* (x) storage for vmexit handlers */ \
 	uint64_t	nextrip;	/* (x) next instruction to execute */ \
+	struct vm_fatal	fatal;		/* (i) latch fatale di VM_RUN (#135) */ \
 	uint64_t	tsc_offset	/* (o) TSC offsetting */
 
 #define	VMM_VM_MD_FIELDS						\
