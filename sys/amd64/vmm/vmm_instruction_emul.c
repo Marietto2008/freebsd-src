@@ -2057,26 +2057,78 @@ ptp_release(void **cookie)
 	}
 }
 
+/*
+ * H2 (parere #119): 'entgpa' e' il GPA dell'L2 della voce che il walk sta per
+ * leggere in questa pagina; se l'EPT dell'L1 non concede di leggerla, con
+ * VM_NGPA_RECORD in 'ngflags' L0 registra la EPT violation che avrebbe visto
+ * l'L1 (GPA = la voce, come il walk hardware) e *herr = EJUSTRETURN: chi
+ * chiama fa ripartire l'istruzione come per un fault. Altrimenti *herr =
+ * EFAULT (vm_gla2gpa_nofault, o pagina dell'L1 che non e' memoria).
+ */
 static void *
-ptp_hold(struct vcpu *vcpu, vm_paddr_t ptpphys, size_t len, void **cookie)
+ptp_hold(struct vcpu *vcpu, vm_paddr_t ptpphys, size_t len, void **cookie,
+    vm_paddr_t *l1held, uint64_t entgpa, uint64_t gla, int ngflags, int *herr)
 {
 	void *ptr;
+	uint64_t l1;
+	int error;
 
 	ptp_release(cookie);
-	/* nested: le tabelle dell'L2 stanno a GPA dell'L2 (identita' per l'L1) */
-	if (vm_nested_gpa(vcpu, ptpphys, VM_PROT_READ, &ptpphys) != 0)
+	*herr = EFAULT;
+	/* nested: le tabelle dell'L2 stanno a GPA dell'L2 (identita' per l'L1).
+	 * La voce sta nella stessa pagina della base (PAE: base allineata a 32
+	 * byte, non a pagina): pagina dalla traduzione, scostamento dalla base */
+	error = vm_nested_gpa(vcpu, entgpa, VM_PROT_READ, gla, ngflags, &l1);
+	if (error != 0) {
+		*herr = error;
 		return (NULL);
+	}
+	ptpphys = (l1 & ~(uint64_t)PAGE_MASK) | (ptpphys & PAGE_MASK);
+	*l1held = ptpphys;	/* la pagina dell'L1 effettivamente tenuta */
 	ptr = vm_gpa_hold(vcpu, ptpphys, len, VM_PROT_RW, cookie);
 	return (ptr);
+}
+
+/*
+ * Nested (sessione 1d, parere di Astra sul caso H): ptp_hold traduce la pagina
+ * di tabelle dell'L2 con il solo permesso R, che basta a LEGGERE le voci (caso
+ * C: A/D gia' impostati, nessuna scrittura, nessuna violazione). Prima di ogni
+ * scrittura di A o D nella voce al GPA (dell'L2) 'ptegpa' l'EPT dell'L1 deve
+ * concedere W, come per il walker hardware (caso H). 0: si scrive; 1: l'EPT
+ * dell'L1 nega, la violazione per l'L1 e' registrata, l'istruzione riparte e
+ * non si scrive nulla (fault, come un #PF); 2: la traduzione della pagina e'
+ * cambiata dopo la lettura, oppure punta a un'altra pagina dell'L1 rispetto a
+ * quella tenuta in 'l1held': il walk riparte dalla radice (pareri #109 §4,
+ * #110 §2: il permesso si giudica sulla pagina in cui si scrive);
+ * EFAULT: errore inatteso. Rifatto prima di OGNI tentativo: un cmpset fallito
+ * riparte dalla radice.
+ */
+static int
+ptp_ad_write_check(struct vcpu *vcpu, uint64_t ptegpa, uint64_t l1held,
+    uint64_t gla)
+{
+	bool denied;
+	int error;
+
+	error = vm_nested_ptp_write(vcpu, ptegpa, l1held, gla, &denied);
+	if (error == EAGAIN)
+		return (2);
+	if (error != 0)
+		return (EFAULT);
+	if (!denied)
+		return (0);
+	vm_restart_instruction(vcpu);
+	return (1);
 }
 
 static int
 _vm_gla2gpa(struct vcpu *vcpu, struct vm_guest_paging *paging,
     uint64_t gla, int prot, uint64_t *gpa, int *guest_fault, bool check_only)
 {
-	int nlevels, pfcode, ptpshift, ptpindex, retval, usermode, writable;
+	int ad, herr, laflags, ngflags, nlevels, pfcode, ptpshift, ptpindex;
+	int retval, usermode, writable;
 	u_int retries;
-	uint64_t *ptpbase, ptpphys, pte, pgsize;
+	uint64_t *ptpbase, ptpgpa, ptpl1, ptpphys, pte, pgsize;
 	uint32_t *ptpbase32, pte32;
 	void *cookie;
 
@@ -2087,11 +2139,20 @@ _vm_gla2gpa(struct vcpu *vcpu, struct vm_guest_paging *paging,
 	cookie = NULL;
 	retval = 0;
 	retries = 0;
+	ptpgpa = ptpl1 = 0;
+	/* H2: senza fault (nofault) nessuna violazione si registra */
+	ngflags = check_only ? 0 : VM_NGPA_RECORD;
 restart:
 	ptpphys = paging->cr3;		/* root of the page tables */
 	ptp_release(&cookie);
 	if (retries++ > 0)
 		maybe_yield();
+	/*
+	 * Bit 9-11 della qualificazione di una violation sull'indirizzo
+	 * finale: AND di U/S e R/W, OR di XD sulle voci del walk; senza
+	 * paginazione l'indirizzo e' utente, scrivibile, eseguibile (SDM).
+	 */
+	laflags = VM_NGPA_LA_US | VM_NGPA_LA_RW;
 
 	if (vie_canonical_check(paging->cpu_mode, gla)) {
 		/*
@@ -2113,16 +2174,18 @@ restart:
 		while (--nlevels >= 0) {
 			/* Zero out the lower 12 bits. */
 			ptpphys &= ~0xfff;
-
-			ptpbase32 = ptp_hold(vcpu, ptpphys, PAGE_SIZE,
-			    &cookie);
-
-			if (ptpbase32 == NULL)
-				goto error;
+			ptpgpa = ptpphys;	/* GPA dell'L2: per A/D */
 
 			ptpshift = PAGE_SHIFT + nlevels * 10;
 			ptpindex = (gla >> ptpshift) & 0x3FF;
 			pgsize = 1UL << ptpshift;
+
+			ptpbase32 = ptp_hold(vcpu, ptpphys, PAGE_SIZE,
+			    &cookie, &ptpl1, ptpgpa + ptpindex * sizeof(pte32),
+			    gla, ngflags, &herr);
+
+			if (ptpbase32 == NULL)
+				goto hold_failed;
 
 			pte32 = ptpbase32[ptpindex];
 
@@ -2136,6 +2199,10 @@ restart:
 				}
 				goto fault;
 			}
+			if ((pte32 & PG_U) == 0)
+				laflags &= ~VM_NGPA_LA_US;
+			if ((pte32 & PG_RW) == 0)
+				laflags &= ~VM_NGPA_LA_RW;
 
 			/*
 			 * Emulate the x86 MMU's management of the accessed
@@ -2145,6 +2212,14 @@ restart:
 			 * physical address.
 			 */
 			if (!check_only && (pte32 & PG_A) == 0) {
+				ad = ptp_ad_write_check(vcpu, ptpgpa +
+				    ptpindex * sizeof(pte32), ptpl1, gla);
+				if (ad == 1)
+					goto fault;
+				if (ad == 2)
+					goto restart;
+				if (ad != 0)
+					goto error;
 				if (atomic_cmpset_32(&ptpbase32[ptpindex],
 				    pte32, pte32 | PG_A) == 0) {
 					goto restart;
@@ -2160,6 +2235,14 @@ restart:
 
 		/* Set the dirty bit in the page table entry if necessary */
 		if (!check_only && writable && (pte32 & PG_M) == 0) {
+			ad = ptp_ad_write_check(vcpu, ptpgpa +
+			    ptpindex * sizeof(pte32), ptpl1, gla);
+			if (ad == 1)
+				goto fault;
+			if (ad == 2)
+				goto restart;
+			if (ad != 0)
+				goto error;
 			if (atomic_cmpset_32(&ptpbase32[ptpindex],
 			    pte32, pte32 | PG_M) == 0) {
 				goto restart;
@@ -2169,19 +2252,22 @@ restart:
 		/* Zero out the lower 'ptpshift' bits */
 		pte32 >>= ptpshift; pte32 <<= ptpshift;
 		*gpa = pte32 | (gla & (pgsize - 1));
-		goto done;
+		/* H2b: anche in modo 32 bit il GPA e' dell'L2 (prima 'done'
+		 * saltava la traduzione EPT12) */
+		goto translate;
 	}
 
 	if (paging->paging_mode == PAGING_MODE_PAE) {
 		/* Zero out the lower 5 bits and the upper 32 bits */
 		ptpphys &= 0xffffffe0UL;
 
-		ptpbase = ptp_hold(vcpu, ptpphys, sizeof(*ptpbase) * 4,
-		    &cookie);
-		if (ptpbase == NULL)
-			goto error;
-
 		ptpindex = (gla >> 30) & 0x3;
+
+		ptpbase = ptp_hold(vcpu, ptpphys, sizeof(*ptpbase) * 4,
+		    &cookie, &ptpl1, ptpphys + ptpindex * sizeof(*ptpbase),
+		    gla, ngflags, &herr);  /* PDPTE: nessun A/D da scrivere */
+		if (ptpbase == NULL)
+			goto hold_failed;
 
 		pte = ptpbase[ptpindex];
 
@@ -2205,14 +2291,16 @@ restart:
 	while (--nlevels >= 0) {
 		/* Zero out the lower 12 bits and the upper 12 bits */
 		ptpphys >>= 12; ptpphys <<= 24; ptpphys >>= 12;
-
-		ptpbase = ptp_hold(vcpu, ptpphys, PAGE_SIZE, &cookie);
-		if (ptpbase == NULL)
-			goto error;
+		ptpgpa = ptpphys;		/* GPA dell'L2: per A/D */
 
 		ptpshift = PAGE_SHIFT + nlevels * 9;
 		ptpindex = (gla >> ptpshift) & 0x1FF;
 		pgsize = 1UL << ptpshift;
+
+		ptpbase = ptp_hold(vcpu, ptpphys, PAGE_SIZE, &cookie, &ptpl1,
+		    ptpgpa + ptpindex * sizeof(pte), gla, ngflags, &herr);
+		if (ptpbase == NULL)
+			goto hold_failed;
 
 		pte = ptpbase[ptpindex];
 
@@ -2225,9 +2313,23 @@ restart:
 			}
 			goto fault;
 		}
+		if ((pte & PG_U) == 0)
+			laflags &= ~VM_NGPA_LA_US;
+		if ((pte & PG_RW) == 0)
+			laflags &= ~VM_NGPA_LA_RW;
+		if ((pte & PG_NX) != 0)
+			laflags |= VM_NGPA_LA_XD;
 
 		/* Set the accessed bit in the page table entry */
 		if (!check_only && (pte & PG_A) == 0) {
+			ad = ptp_ad_write_check(vcpu, ptpgpa +
+			    ptpindex * sizeof(pte), ptpl1, gla);
+			if (ad == 1)
+				goto fault;
+			if (ad == 2)
+				goto restart;
+			if (ad != 0)
+				goto error;
 			if (atomic_cmpset_64(&ptpbase[ptpindex],
 			    pte, pte | PG_A) == 0) {
 				goto restart;
@@ -2251,6 +2353,14 @@ restart:
 
 	/* Set the dirty bit in the page table entry if necessary */
 	if (!check_only && writable && (pte & PG_M) == 0) {
+		ad = ptp_ad_write_check(vcpu, ptpgpa + ptpindex * sizeof(pte),
+		    ptpl1, gla);
+		if (ad == 1)
+			goto fault;
+		if (ad == 2)
+			goto restart;
+		if (ad != 0)
+			goto error;
 		if (atomic_cmpset_64(&ptpbase[ptpindex], pte, pte | PG_M) == 0)
 			goto restart;
 	}
@@ -2260,14 +2370,28 @@ restart:
 	*gpa = pte | (gla & (pgsize - 1));
 translate:
 	/* nested: il risultato e' un GPA dell'L2, chi lo usa vuole quello
-	 * dell'L1 (vm_copy_setup -> vm_gpa_hold). Identita' fuori da un L2. */
-	if (vm_nested_gpa(vcpu, *gpa, prot, gpa) != 0)
+	 * dell'L1 (vm_copy_setup -> vm_gpa_hold). Identita' fuori da un L2.
+	 * H2: se l'EPT dell'L1 lo nega, violation per l'L1 e fault (sopra). */
+	herr = vm_nested_gpa(vcpu, *gpa, prot, gla,
+	    ngflags | VM_NGPA_FINAL | laflags, gpa);
+	if (herr == EJUSTRETURN)
+		goto nested_fault;
+	if (herr != 0)
 		retval = EFAULT;
 done:
 	ptp_release(&cookie);
 	KASSERT(retval == 0 || retval == EFAULT, ("%s: unexpected retval %d",
 	    __func__, retval));
 	return (retval);
+hold_failed:
+	if (herr != EJUSTRETURN)
+		goto error;
+nested_fault:
+	/* H2: EPT violation (o misconfiguration) registrata per l'L1, che la
+	 * ricevera' prima del prossimo ingresso in L2: niente eccezione al
+	 * guest, niente errore di vm_run; l'istruzione riparte */
+	vm_restart_instruction(vcpu);
+	goto fault;
 error:
 	retval = EFAULT;
 	goto done;

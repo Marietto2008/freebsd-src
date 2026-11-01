@@ -209,7 +209,9 @@ DECLARE_VMMOPS_FUNC(int, getcap, (void *vcpui, int num, int *retval));
 DECLARE_VMMOPS_FUNC(int, setcap, (void *vcpui, int num, int val));
 DECLARE_VMMOPS_FUNC(int, nested_exit, (void *vcpui));
 DECLARE_VMMOPS_FUNC(int, nested_gpa, (void *vcpui, uint64_t gpa, int prot,
-    uint64_t *l1gpa));
+    uint64_t gla, int flags, uint64_t *l1gpa));
+DECLARE_VMMOPS_FUNC(int, nested_ptp_write, (void *vcpui, uint64_t ptegpa,
+    uint64_t l1held, uint64_t gla, bool *denied));
 DECLARE_VMMOPS_FUNC(struct vmspace *, vmspace_alloc,
     (vm_offset_t min, vm_offset_t max));
 DECLARE_VMMOPS_FUNC(void, vmspace_free, (struct vmspace *vmspace));
@@ -238,6 +240,8 @@ struct vmm_ops {
 	vmmops_setcap_t		setcap;
 	vmmops_nested_exit_t	nested_exit;	/* slow path nested (T1.6) */
 	vmmops_nested_gpa_t	nested_gpa;	/* GPA dell'L2 -> GPA dell'L1 */
+	vmmops_nested_ptp_write_t nested_ptp_write; /* A/D in una tabella
+						     * dell'L2: EPT12 concede W? */
 	vmmops_vmspace_alloc_t	vmspace_alloc;
 	vmmops_vmspace_free_t	vmspace_free;
 	vmmops_vlapic_init_t	vlapic_init;
@@ -268,8 +272,38 @@ int vm_reset_pptdev(struct vm *vm, int bus, int slot, int func);
  * Nested: traduce un GPA "come lo vede il vCPU" nel GPA dell'L1, l'unico che
  * vm_gpa_hold conosce. Identita' se il vCPU non e' in un L2 con EPT. 0 ok;
  * EFAULT se l'EPT dell'L1 non lo concede con i permessi 'prot'.
+ * H2 (parere #119): con VM_NGPA_RECORD, se l'EPT dell'L1 nega (voce non
+ * presente, permesso mancante, tabella dell'L1 illeggibile) o e' malformata,
+ * L0 registra per l'L1 la EPT violation (o misconfiguration) che avrebbe
+ * prodotto il walk hardware e ritorna EJUSTRETURN: chi chiama tratta la
+ * traduzione come un fault (istruzione ripartita, nessuna eccezione al
+ * guest); la consegna avviene prima del prossimo ingresso in L2. 'gla' e'
+ * l'indirizzo lineare che si traduceva; VM_NGPA_FINAL distingue l'accesso
+ * finale (qualificazione bit 8 = 1) dalla lettura di una voce di tabella
+ * dell'L2 (bit 8 = 0); VM_NGPA_LA_* sono i bit 9-11 dell'accesso finale.
  */
-int vm_nested_gpa(struct vcpu *vcpu, uint64_t gpa, int prot, uint64_t *l1gpa);
+#define	VM_NGPA_RECORD	0x01	/* registra la violazione per l'L1 */
+#define	VM_NGPA_FINAL	0x02	/* indirizzo finale, non voce di tabella */
+#define	VM_NGPA_LA_US	0x04	/* qual bit 9: indirizzo lineare utente */
+#define	VM_NGPA_LA_RW	0x08	/* qual bit 10: scrivibile */
+#define	VM_NGPA_LA_XD	0x10	/* qual bit 11: non eseguibile */
+int vm_nested_gpa(struct vcpu *vcpu, uint64_t gpa, int prot, uint64_t gla,
+    int flags, uint64_t *l1gpa);
+/*
+ * Nested (sessione 1d): l'emulatore sta per scrivere A/D nella voce di tabella
+ * dell'L2 al GPA (dell'L2) 'ptegpa', traducendo 'gla', nella pagina che tiene
+ * all'L1-GPA 'l1held' (da ptp_hold). Parere #110 §2: il permesso si giudica
+ * sulla STESSA pagina in cui si scrivera'. *denied = false se il
+ * vCPU non e' in un L2 con EPT o se l'EPT dell'L1 concede la scrittura: si puo'
+ * scrivere. *denied = true se la nega: L0 ha registrato una EPT violation per
+ * l'L1 (consegnata prima del prossimo ingresso in L2), la scrittura NON va
+ * fatta e l'istruzione riparte. EAGAIN se EPT12 e' cambiata dopo la lettura
+ * (l'L1, da un altro vCPU): traduzione non piu' valida, oppure valida verso
+ * un'ALTRA pagina dell'L1 (rimappata). Nessuna scrittura e nessuna violazione:
+ * il walk riparte dalla radice e rilegge la pagina di adesso.
+ */
+int vm_nested_ptp_write(struct vcpu *vcpu, uint64_t ptegpa, uint64_t l1held,
+    uint64_t gla, bool *denied);
 int vm_get_register(struct vcpu *vcpu, int reg, uint64_t *retval);
 int vm_set_register(struct vcpu *vcpu, int reg, uint64_t val);
 int vm_get_seg_desc(struct vcpu *vcpu, int reg,
