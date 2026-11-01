@@ -135,6 +135,8 @@ int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
 	    uint64_t *out);
+int	vmx_vept_ptp_write(struct vmx_vcpu *vcpu, uint64_t ptegpa,
+	    uint64_t l1held, uint64_t gla, bool *denied); /* A/D dall'emulatore */
 void	vmx_vept_flush(struct vmx_nested *n);
 int	vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp,
 	    int *kept);
@@ -399,6 +401,16 @@ struct vmx_nested {
 	struct vm_exit	ept_emul;	/* paging dell'L2 per un'eventuale
 					 * emulazione MMIO (vmexit_inst_emul,
 					 * col VMCS02 ancora caricato) */
+	bool		emu_viol;	/* sessione 1d: EPT violation trovata
+					 * dall'EMULATORE (A/D in una tabella
+					 * dell'L2 su una pagina senza W in
+					 * EPT12), da riflettere all'L1 prima
+					 * del prossimo ingresso in L2 */
+	uint64_t	emu_viol_gpa;	/* GPA dell'L2 della voce di tabella */
+	uint64_t	emu_viol_gla;	/* indirizzo lineare che si traduceva */
+	uint64_t	emu_viol_qual;	/* qualificazione per il VMCS12 */
+	uint64_t	emu_viol_vmcs12; /* VMCS12 corrente alla produzione:
+					  * la riflessione va a QUELLO (#110 §3) */
 	bool		slow_reflect;	/* riflessione chiamata dallo slow path:
 					 * MSR del guest in guest_msrs[], NON nei
 					 * registri hardware */

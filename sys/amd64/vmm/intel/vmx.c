@@ -3947,6 +3947,20 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			break;
 		}
 		/*
+		 * Sessione 1d: l'emulatore ha trovato che l'EPT dell'L1 nega la
+		 * scrittura di A/D in una tabella dell'L2 (vmx_vept_ptp_write) e
+		 * ha fatto ripartire l'istruzione (rip). Non si rientra in L2:
+		 * si esce verso lo slow path, che riflette la EPT violation
+		 * all'L1 (nested_ept_emul_reflect). Prima di ogni iniezione.
+		 */
+		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
+		    vcpu->nested->emu_viol) {
+			vmexit->rip = rip;
+			vmexit->inst_length = 0;
+			vmexit->exitcode = VM_EXITCODE_NESTED;
+			break;
+		}
+		/*
 		 * Interrupts are disabled from this point on until the
 		 * guest starts executing. This is done for the following
 		 * reasons:
@@ -5474,6 +5488,13 @@ vmx_nested_gpa(void *vcpui, uint64_t gpa, int prot, uint64_t *l1gpa)
 	return (vmx_vept_l1gpa(vcpui, gpa, prot, l1gpa));
 }
 
+static int
+vmx_nested_ptp_write(void *vcpui, uint64_t ptegpa, uint64_t l1held,
+    uint64_t gla, bool *denied)
+{
+	return (vmx_vept_ptp_write(vcpui, ptegpa, l1held, gla, denied));
+}
+
 const struct vmm_ops vmm_ops_intel = {
 	.modinit	= vmx_modinit,
 	.modcleanup	= vmx_modcleanup,
@@ -5492,6 +5513,7 @@ const struct vmm_ops vmm_ops_intel = {
 	.setcap		= vmx_setcap,
 	.nested_exit	= vmx_nested_exit,
 	.nested_gpa	= vmx_nested_gpa,
+	.nested_ptp_write = vmx_nested_ptp_write,
 	.vmspace_alloc	= vmx_vmspace_alloc,
 	.vmspace_free	= vmx_vmspace_free,
 	.vlapic_init	= vmx_vlapic_init,

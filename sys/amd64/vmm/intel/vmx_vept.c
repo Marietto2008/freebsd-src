@@ -129,6 +129,10 @@ VEPT_CTR(vept_keep_verify_checked, "B1: foglie riverificate");
 VEPT_CTR(vept_keep_verify_mismatch, "B1: foglie riverificate DISCORDANTI");
 VEPT_CTR(vept_memgen_changes_detected,
     "B1: generazioni dei mapping cambiate viste da un vCPU");
+VEPT_CTR(vept_ptp_write_retry_xlate,
+    "H1: walk ripartiti, EPT12 della tabella non piu' valida (parere #110)");
+VEPT_CTR(vept_ptp_write_retry_remap,
+    "H1: walk ripartiti, tabella rimappata su un'altra pagina dell'L1");
 VEPT_CTR(vept_memgen_roots_invalidated,
     "B1: radici svuotate per generazione cambiata");
 VEPT_CTR(vept_stale_root_enters,
@@ -1935,6 +1939,70 @@ vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot, uint64_t *out)
 	if (ept12_translate(vcpu, vmcs12_read_field(c, VMCS_EPTP), gpa, out,
 	    &perm, NULL) != VEPT_OK || (prot & ~perm & EPT_RWX) != 0)
 		return (EFAULT);
+	return (0);
+}
+
+/*
+ * vmmops nested_ptp_write (sessione 1d, parere di Astra sul caso H): prima che
+ * l'emulatore di L0 scriva A/D nella voce di tabella dell'L2 al GPA 'ptegpa'.
+ * Il walk hardware fa lo stesso aggiornamento come accesso in SCRITTURA alla
+ * pagina di tabelle (con EPTP12[6]=0 gli A/D di EPT non c'entrano): se l'EPT
+ * dell'L1 non concede W, l'L1 vede una EPT violation (casi H/H_D della 1d,
+ * qualificazione RD|WR|permessi|GLA valido, bit 8 = 0, GPA = la voce). Qui la
+ * si registra soltanto: la riflette lo slow path (nested_ept_emul_reflect),
+ * prima di qualunque nuovo ingresso in L2. Fuori da un L2 con EPT (anche
+ * quando L0 emula un'istruzione dell'L1) non c'e' nulla da controllare.
+ */
+int
+vmx_vept_ptp_write(struct vmx_vcpu *vcpu, uint64_t ptegpa, uint64_t l1held,
+    uint64_t gla, bool *denied)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	uint64_t l1gpa, perm;
+
+	*denied = false;
+	if (n == NULL || !n->in_l2 || (c = nested_current_cache(n)) == NULL ||
+	    (vmcs12_proc2(c) & PROCBASED2_ENABLE_EPT) == 0)
+		return (0);
+	/*
+	 * La pagina e' appena stata letta con R (ptp_hold). VEPT_VIOL (non
+	 * presente), VEPT_MISCONF o tabella dell'L1 illeggibile (<0) qui vogliono
+	 * dire che l'L1 ha cambiato EPT12 nel frattempo: il walk riparte dalla
+	 * radice (EAGAIN). Nessuna di queste diventa una violazione qui (parere
+	 * #109 §3: solo "W negato con traduzione valida"), e nessuna diventa un
+	 * errore fatale nuovo (§4): al giro dopo decide ptp_hold, come prima.
+	 */
+	if (ept12_translate(vcpu, vmcs12_read_field(c, VMCS_EPTP), ptegpa,
+	    &l1gpa, &perm, NULL) != VEPT_OK) {
+		atomic_add_long(&vept_ptp_write_retry_xlate, 1);
+		return (EAGAIN);
+	}
+	/*
+	 * Parere #110 §2: il permesso vale per la pagina in cui si scrive. Il
+	 * cmpset scrivera' nella pagina tenuta da ptp_hold (L1-GPA 'l1held');
+	 * se ora EPT12 manda la stessa GPA dell'L2 su un'altra pagina dell'L1,
+	 * ne' il permesso vecchio ne' quello nuovo autorizzano a scrivere nella
+	 * pagina tenuta: niente scrittura, niente violazione, il walk riparte.
+	 * Basta l'L1-GPA: la memoria dell'L1 cambia mappa (L1-GPA -> HPA) solo
+	 * con tutti i vCPU IDLE (vmx_vept_memgen_sync), mai con questo vCPU
+	 * FROZEN nell'emulazione; quindi stesso L1-GPA = stessa pagina host.
+	 * EPTP12 e' lo stesso di ptp_hold: lo cambia solo l'L1 con VMWRITE e
+	 * VMRESUME su questo vCPU, che durante l'emulazione non gira.
+	 */
+	if ((l1gpa & ~(uint64_t)PAGE_MASK) != (l1held & ~(uint64_t)PAGE_MASK)) {
+		atomic_add_long(&vept_ptp_write_retry_remap, 1);
+		return (EAGAIN);
+	}
+	if ((perm & EPT_PG_WRITE) != 0)
+		return (0);
+	*denied = true;
+	n->emu_viol = true;
+	n->emu_viol_gpa = ptegpa;
+	n->emu_viol_gla = gla;
+	n->emu_viol_vmcs12 = n->current_vmcs12;
+	n->emu_viol_qual = EPT_VIOLATION_DATA_READ | EPT_VIOLATION_DATA_WRITE |
+	    ((perm & EPT_RWX) << 3) | EPT_VIOLATION_GLA_VALID;
 	return (0);
 }
 
