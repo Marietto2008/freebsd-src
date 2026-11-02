@@ -112,6 +112,8 @@ int vlapic_icrlo_write_handler(struct vlapic *vlapic, bool *retu);
 void vlapic_icrtmr_write_handler(struct vlapic *vlapic);
 void vlapic_dcr_write_handler(struct vlapic *vlapic);
 void vlapic_lvt_write_handler(struct vlapic *vlapic, uint32_t offset);
+bool vlapic_isr_valid(const uint32_t isr[8]);
+void vlapic_set_state_sync(struct vlapic *vlapic);
 void vlapic_self_ipi_handler(struct vlapic *vlapic, uint64_t val);
 
 #ifdef BHYVE_SNAPSHOT

@@ -119,6 +119,19 @@ int
 lapic_set_state(struct vcpu *vcpu, struct vm_lapic_state *lapic_state)
 {
     struct LAPIC *klapic = vlapic_page(vm_lapic(vcpu));
+    uint32_t isr[8];
+    int i;
+
+    /*
+     * claude 02/11/2026: lo stato arriva dallo spazio utente. Un ISR che
+     * non puo' stare sulla pila isrvec_stk manderebbe in panic l'host in
+     * vlapic_update_ppr(): si rifiuta PRIMA di toccare la pagina.
+     */
+    for (i = 0; i < 8; i++)
+        isr[i] = lapic_state->fields[LAPIC_ISR0 + i].data;
+    if (!vlapic_isr_valid(isr))
+        return (EINVAL);
+
     #define COPY_FIELD(name, index) \
         klapic->name = lapic_state->fields[index].data;
 
@@ -179,6 +192,9 @@ lapic_set_state(struct vcpu *vcpu, struct vm_lapic_state *lapic_state)
 
     #undef COPY_FIELD
     #undef RANGE_COPY_FIELD
+
+    /* lvt_last, isrvec_stk/PPR, svr_last, timer: vedi vlapic_set_state_sync() */
+    vlapic_set_state_sync(vm_lapic(vcpu));
     return 0;
 }
 

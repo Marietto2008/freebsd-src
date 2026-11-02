@@ -1880,7 +1880,10 @@ vlapic_set_tmr_level(struct vlapic *vlapic, uint32_t dest, bool phys,
 	vlapic_set_tmr(vlapic, vector, true);
 }
 
-#ifdef BHYVE_SNAPSHOT
+/*
+ * claude 02/11/2026: fuori da BHYVE_SNAPSHOT, la usa anche
+ * vlapic_set_state_sync() (VM_LAPIC_SET_STATE di QEMU).
+ */
 static void
 vlapic_reset_callout(struct vlapic *vlapic, uint32_t ccr)
 {
@@ -1917,6 +1920,81 @@ vlapic_reset_callout(struct vlapic *vlapic, uint32_t ccr)
 	VLAPIC_TIMER_UNLOCK(vlapic);
 }
 
+/*
+ * claude 02/11/2026 -- VM_LAPIC_SET_STATE (lapic_set_state(), chiamata da
+ * QEMU a ogni reset della LAPIC: reset della macchina, INIT) scrive i
+ * registri direttamente nella pagina APIC.  vlapic pero' tiene una parte
+ * dello stato FUORI dalla pagina, e senza riallinearla:
+ *  - lvt_last resta vecchio: vlapic_fire_lvt() consegna secondo l'LVT
+ *    precedente, e vlapic_read() fa scattare il KASSERT "inconsistent lvt
+ *    value" (panic dell'host il 02/11 con q35+OVMF: LINT0 0x10700/0x10000);
+ *  - isrvec_stk non corrisponde piu' all'ISR: PPR sbagliata, e i controlli
+ *    di vlapic_update_ppr() vanno in panic;
+ *  - svr_last, frequenza/periodo e callout del timer restano quelli di prima.
+ * Si ricostruisce tutto dalla pagina, come fa KVM in kvm_apic_set_state().
+ * L'ISR deve gia' essere stato validato (vlapic_isr_valid()).
+ */
+static const uint32_t vlapic_lvt_offsets[] = {
+	APIC_OFFSET_CMCI_LVT, APIC_OFFSET_TIMER_LVT, APIC_OFFSET_THERM_LVT,
+	APIC_OFFSET_PERF_LVT, APIC_OFFSET_LINT0_LVT, APIC_OFFSET_LINT1_LVT,
+	APIC_OFFSET_ERROR_LVT,
+};
+
+bool
+vlapic_isr_valid(const uint32_t isr[8])
+{
+	int vector, lastprio;
+
+	/* al piu' un vettore per classe di priorita': vedi vlapic_update_ppr() */
+	lastprio = -1;
+	for (vector = 0; vector < 256; vector++) {
+		if ((isr[vector / 32] & (1U << (vector % 32))) == 0)
+			continue;
+		if (PRIO(vector) <= lastprio)
+			return (false);
+		lastprio = PRIO(vector);
+	}
+	return (true);
+}
+
+void
+vlapic_set_state_sync(struct vlapic *vlapic)
+{
+	struct LAPIC *lapic;
+	uint32_t *isrptr;
+	u_int i;
+	int vector;
+
+	lapic = vlapic->apic_page;
+
+	for (i = 0; i < nitems(vlapic_lvt_offsets); i++) {
+		atomic_store_rel_32(&vlapic->lvt_last[lvt_off_to_idx(
+		    vlapic_lvt_offsets[i])],
+		    *vlapic_get_lvtptr(vlapic, vlapic_lvt_offsets[i]));
+	}
+
+	vlapic->svr_last = lapic->svr;
+	vlapic->esr_pending = 0;
+
+	bzero(vlapic->isrvec_stk, sizeof(vlapic->isrvec_stk));
+	vlapic->isrvec_stk_top = 0;
+	isrptr = &lapic->isr0;
+	for (vector = 0; vector < 256; vector++) {
+		if (isrptr[(vector / 32) * 4] & (1U << (vector % 32)))
+			vlapic->isrvec_stk[++vlapic->isrvec_stk_top] = vector;
+	}
+	vlapic_update_ppr(vlapic);
+
+	/* frequenza e periodo dal DCR e dall'ICR appena scritti */
+	vlapic_dcr_write_handler(vlapic);
+	VLAPIC_TIMER_LOCK(vlapic);
+	callout_stop(&vlapic->callout);
+	VLAPIC_TIMER_UNLOCK(vlapic);
+	if (vlapic_enabled(vlapic) && lapic->icr_timer != 0)
+		vlapic_reset_callout(vlapic, lapic->ccr_timer);
+}
+
+#ifdef BHYVE_SNAPSHOT
 int
 vlapic_snapshot(struct vm *vm, struct vm_snapshot_meta *meta)
 {
