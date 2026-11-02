@@ -1309,6 +1309,16 @@ vm_handle_ipi(struct vcpu *vcpu, struct vm_exit *vme, bool *retu)
 		}
 
 		break;
+	case APIC_DELMODE_FIXED:
+		/*
+		 * claude 02/11/2026: "solo sveglia" in modalita' QEMU (vettore 0,
+		 * vedi vlapic_ipi_sveglia_qemu): il vettore e' gia' nell'IRR dei
+		 * bersagli, qui non c'e' niente da fare; i bersagli fermi in
+		 * userland li sveglia QEMU.  Senza questo caso il default qui
+		 * sotto mandava in panic l'host (02/11 09:36, nessun dump).
+		 */
+		KASSERT(vec == 0, ("vm_handle_ipi: IPI FIXED con vettore %d", vec));
+		break;
 	default:
 		__assert_unreachable();
 	}
