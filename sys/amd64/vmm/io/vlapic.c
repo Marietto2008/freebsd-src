@@ -215,7 +215,8 @@ vlapic_dump_lvt(uint32_t offset, uint32_t *lvt)
 }
 #endif
 
-static uint32_t
+/* claude 02/11/2026: esportata per lapic_get_state() (VM_LAPIC_GET_STATE) */
+uint32_t
 vlapic_get_ccr(struct vlapic *vlapic)
 {
 	struct bintime bt_now, bt_rem;

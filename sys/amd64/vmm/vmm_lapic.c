@@ -108,6 +108,14 @@ lapic_get_state(struct vcpu *vcpu, struct vm_lapic_state *lapic_state)
     COPY_FIELD(lvt_error, LAPIC_LVT_ERROR);
     COPY_FIELD(icr_timer, LAPIC_ICR_TIMER);
     COPY_FIELD(ccr_timer, LAPIC_CCR_TIMER);
+    /*
+     * claude 02/11/2026: il CCR nella pagina APIC non lo aggiorna nessuno
+     * (vlapic lo calcola a richiesta, vlapic_get_ccr): restava 0.  QEMU lo
+     * legge all'uscita per HLT per armare la sveglia alla scadenza del timer
+     * e, con 0, ripiegava sempre su 5 ms: ogni timer breve dell'ospite
+     * costava 5 ms (44% dei rientri in vm_run, Windows sotto QEMU lentissima).
+     */
+    lapic_state->fields[LAPIC_CCR_TIMER].data = vlapic_get_ccr(vm_lapic(vcpu));
     COPY_FIELD(dcr_timer, LAPIC_DCR_TIMER);
 
     #undef COPY_FIELD
