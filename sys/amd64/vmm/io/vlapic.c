@@ -1067,6 +1067,33 @@ vlapic_is_icr_valid(uint64_t icrval)
 	return (false);
 }
 
+/*
+ * claude 02/11/2026 -- in modalita' QEMU (VM_OP_F_QEMU) il vCPU che esegue HLT
+ * torna in userland (VM_CAP_HALT_EXIT) e aspetta li': lapic_intr_edge() mette
+ * il vettore nell'IRR e vcpu_notify_lapic() non lo sveglia, perche' non e' in
+ * vm_run (stato VCPU_IDLE).  QEMU lo svegliava solo col suo timer di poll (fino
+ * a 5 ms): ogni IPI FIXED (flush del TLB, chiamate fra CPU di Windows/Hyper-V)
+ * costava millisecondi e il mittente girava a vuoto in attesa -> Windows
+ * lentissimo.  Qui si raccolgono i bersagli fermi in userland: il chiamante
+ * produce un'uscita VM_EXITCODE_IPI col vettore 0 = "solo sveglia".
+ * bhyve(8) nativo (HLT nel kernel) non passa di qui.
+ */
+static void
+vlapic_ipi_sveglia_qemu(struct vlapic *vlapic, struct vcpu *target, int i,
+    cpuset_t *ipimask)
+{
+	int hostcpu, vmflags;
+
+	if (!vlapic->ipi_exit || i == vlapic->vcpuid)
+		return;
+	vmflags = 0;
+	vm_get_flags(vlapic->vm, &vmflags);
+	if ((vmflags & VM_OP_F_QEMU) == 0)
+		return;
+	if (vcpu_get_state(target, &hostcpu) == VCPU_IDLE)
+		CPU_SET(i, ipimask);
+}
+
 int
 vlapic_icrlo_write_handler(struct vlapic *vlapic, bool *retu)
 {
@@ -1142,7 +1169,15 @@ vlapic_icrlo_write_handler(struct vlapic *vlapic, bool *retu)
 			vmm_stat_incr(vcpu, VLAPIC_IPI_RECV, 1);
 			VLAPIC_CTR2(vlapic,
 			    "vlapic sending ipi %d to vcpuid %d", vec, i);
+			vlapic_ipi_sveglia_qemu(vlapic, vcpu, i, &ipimask);
 		}
+		/*
+		 * Il vettore e' gia' consegnato: l'uscita verso QEMU (se c'e')
+		 * serve solo a svegliare, e lo dice il vettore 0 (illegale per un
+		 * IPI FIXED, vedi sopra).
+		 */
+		if (!CPU_EMPTY(&ipimask))
+			vec = 0;
 
 		break;
 	case APIC_DELMODE_NMI:
