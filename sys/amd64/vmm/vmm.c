@@ -172,6 +172,10 @@ SYSCTL_DECL(_hw_vmm);
  * Halt the guest if all vcpus are executing a HLT instruction with
  * interrupts disabled.
  */
+/* claude 02/11/2026: questo modulo sa gestire l'HLT nel kernel anche per QEMU (VM_OP_F_QEMU_HLTK) */
+static int qemu_hlt_kernel = 1;
+SYSCTL_INT(_hw_vmm, OID_AUTO, qemu_hlt_kernel, CTLFLAG_RD, &qemu_hlt_kernel, 0,
+    "il modulo gestisce l'HLT nel kernel per le VM QEMU con VM_OP_F_QEMU_HLTK");
 static int halt_detection_enabled = 1;
 SYSCTL_INT(_hw_vmm, OID_AUTO, halt_detection, CTLFLAG_RDTUN,
     &halt_detection_enabled, 0,
@@ -1413,7 +1417,8 @@ restart:
 			 * ottobre l'aveva persa, perche' il ramo di giugno
 			 * non la conteneva ancora.
 			 */
-			if (vm->flags & VM_OP_F_QEMU) {
+			if ((vm->flags & (VM_OP_F_QEMU | VM_OP_F_QEMU_HLTK)) ==
+			    VM_OP_F_QEMU) {
 				/*
 				 * Return HLT to userspace so QEMU can handle
 				 * timer ticks and re-inject interrupts.

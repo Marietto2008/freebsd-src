@@ -140,6 +140,14 @@ enum x2apic_state {
  * conoscono restano invariati.
  */
 #define VM_OP_F_KIOAPIC (1 << 1)
+/*
+ * claude 02/11/2026: con VM_OP_F_QEMU l'HLT del guest torna di norma a QEMU.
+ * Con anche VM_OP_F_QEMU_HLTK lo gestisce il kernel come in bhyve nativo
+ * (vm_handle_hlt, svegliato da vcpu_notify; QEMU fa uscire il vCPU con
+ * vm_suspend_cpu). Il modulo che lo supporta lo dichiara con il sysctl
+ * hw.vmm.qemu_hlt_kernel=1: vm_set_flags accetta qualsiasi bit.
+ */
+#define VM_OP_F_QEMU_HLTK (1 << 2)
 #ifdef _KERNEL
 /*
  * #135 K2: latch fatale di VM_RUN. Un'istruzione che il kernel non riesce a completare (emulazione o fetch falliti
