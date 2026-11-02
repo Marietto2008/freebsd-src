@@ -1077,7 +1077,11 @@ vlapic_is_icr_valid(uint64_t icrval)
  * costava millisecondi e il mittente girava a vuoto in attesa -> Windows
  * lentissimo.  Qui si raccolgono i bersagli fermi in userland: il chiamante
  * produce un'uscita VM_EXITCODE_IPI col vettore 0 = "solo sveglia".
- * bhyve(8) nativo (HLT nel kernel) non passa di qui.
+ * bhyve(8) nativo (HLT nel kernel) non passa di qui, e nemmeno QEMU con
+ * VM_OP_F_QEMU_HLTK: li' il vCPU fermo dorme in vm_handle_hlt e vcpu_notify lo
+ * sveglia; un vCPU in VCPU_IDLE e' solo di passaggio in userland (un MMIO, una
+ * ioctl) e rientrando vede l'IRR.  L'uscita del mittente sarebbe un costo senza
+ * scopo (parere Opus 02/11, sez. 3).
  */
 static void
 vlapic_ipi_sveglia_qemu(struct vlapic *vlapic, struct vcpu *target, int i,
@@ -1089,7 +1093,7 @@ vlapic_ipi_sveglia_qemu(struct vlapic *vlapic, struct vcpu *target, int i,
 		return;
 	vmflags = 0;
 	vm_get_flags(vlapic->vm, &vmflags);
-	if ((vmflags & VM_OP_F_QEMU) == 0)
+	if ((vmflags & (VM_OP_F_QEMU | VM_OP_F_QEMU_HLTK)) != VM_OP_F_QEMU)
 		return;
 	if (vcpu_get_state(target, &hostcpu) == VCPU_IDLE)
 		CPU_SET(i, ipimask);
