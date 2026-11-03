@@ -1694,6 +1694,16 @@ vmbus_pcib_alloc_resource(device_t dev, device_t child, int type, int *rid,
 		/* Make sure a 32-bit BAR gets a 32-bit address */
 		if (!(hpdev->probed_bar[bar_no] & PCIM_BAR_MEM_64))
 			end = ulmin(end, 0xFFFFFFFF);
+
+		/*
+		 * claude 03/11/2026, SOLO DIAGNOSI: BAR allineate a 1 MB, lontane
+		 * dalla finestra di configurazione del bus (FreeBSD metteva la
+		 * prima BAR nella pagina subito dopo).
+		 */
+		flags = (flags & ~RF_ALIGNMENT_MASK) | RF_ALIGNMENT_LOG2(20);
+		if (bootverbose)
+			device_printf(dev, "claude: BAR %u di %s allineata a 1 MB\n",
+			    bar_no, device_get_nameunit(child));
 	}
 
 	res = bus_generic_alloc_resource(dev, child, type, rid,
