@@ -1788,6 +1788,33 @@ vmbus_pcib_read_config(device_t dev, u_int bus, u_int slot, u_int func,
 	return (data);
 }
 
+/*
+ * Return true if every memory BAR the host reported for the device has been
+ * assigned an address.
+ */
+static bool
+vmbus_pcib_mem_bars_assigned(struct hv_pci_dev *hpdev)
+{
+	uint32_t lo, hi;
+	int i;
+
+	for (i = 0; i < MAX_NUM_BARS; i++) {
+		if (hpdev->probed_bar[i] == 0 ||
+		    (hpdev->probed_bar[i] & PCIM_BAR_SPACE) != PCIM_BAR_MEM_SPACE)
+			continue;
+		lo = hi = 0;
+		_hv_pcifront_read_config(hpdev, PCIR_BAR(i), 4, &lo);
+		if ((hpdev->probed_bar[i] & PCIM_BAR_MEM_TYPE) == PCIM_BAR_MEM_64 &&
+		    i + 1 < MAX_NUM_BARS) {
+			i++;
+			_hv_pcifront_read_config(hpdev, PCIR_BAR(i), 4, &hi);
+		}
+		if ((lo & PCIM_BAR_MEM_BASE) == 0 && hi == 0)
+			return (false);
+	}
+	return (true);
+}
+
 static void
 vmbus_pcib_write_config(device_t dev, u_int bus, u_int slot, u_int func,
     u_int reg, uint32_t data, int bytes)
@@ -1801,6 +1828,24 @@ vmbus_pcib_write_config(device_t dev, u_int bus, u_int slot, u_int func,
 	hpdev = get_pcichild_wslot(sc->hbus, devfn_to_wslot(devfn));
 	if (!hpdev)
 		return;
+
+	/*
+	 * Hyper-V maps a device's BARs when memory decoding is enabled, and
+	 * only if all of them hold valid addresses: otherwise it leaves the
+	 * device unmapped, every MMIO read returns all ones, and enabling
+	 * decoding again later does not help.  The PCI bus assigns BARs
+	 * lazily and enables decoding as soon as the first one is activated,
+	 * so a device with several memory BARs never became accessible (the
+	 * virtio console that WSL2 attaches over vPCI: virtio_pci read its
+	 * status as 0xff and vtpci_modern_reset() spun forever).  Linux
+	 * assigns all BARs before enabling decoding (prepopulate_bars()).
+	 * Keep decoding disabled until every memory BAR has an address; the
+	 * PCI bus requests it again as each further BAR is activated.
+	 */
+	if (reg == PCIR_COMMAND && bytes >= 2 &&
+	    (data & PCIM_CMD_MEMEN) != 0 &&
+	    !vmbus_pcib_mem_bars_assigned(hpdev))
+		data &= ~PCIM_CMD_MEMEN;
 
 	_hv_pcifront_write_config(hpdev, reg, bytes, data);
 }
