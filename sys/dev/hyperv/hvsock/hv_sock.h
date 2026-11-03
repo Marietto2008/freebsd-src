@@ -83,6 +83,8 @@ struct hvs_pcb {
 	/* offset in the packet */
 	uint32_t			recv_data_off;
 	bool				rb_init;
+	/* A FIN (zero-length packet) has been sent to the peer */
+	bool				fin_sent;
 	/* Link lists for global bound and connected sockets */
 	LIST_ENTRY(hvs_pcb)		bound_next;
 	LIST_ENTRY(hvs_pcb)		connected_next;

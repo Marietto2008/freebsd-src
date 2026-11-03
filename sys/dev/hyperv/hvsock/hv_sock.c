@@ -922,11 +922,12 @@ hvs_trans_close(struct socket *so)
 		return;
 	}
 
-	if (so->so_state & SS_ISCONNECTED) {
-		/* Send a FIN to peer */
+	if ((so->so_state & SS_ISCONNECTED) && !pcb->fin_sent) {
+		/* Send a FIN to peer, unless shutdown() already did */
 		HVSOCK_DBG(HVSOCK_DBG_VERBOSE,
 		    "%s: hvs_trans_close sending a FIN to host\n", __func__);
 		(void) hvsock_send_data(pcb->chan, NULL, 0, NULL);
+		pcb->fin_sent = true;
 	}
 
 	if (so->so_state &
@@ -1002,16 +1003,23 @@ hvs_trans_shutdown(struct socket *so, enum shutdown_how how)
 		break;
 	case SHUT_RDWR:
 		socantrcvmore(so);
-		if (so->so_state & SS_ISCONNECTED) {
-			/* Send a FIN to peer */
+		/* FALLTHROUGH */
+	case SHUT_WR:
+		/*
+		 * Send a FIN to peer for SHUT_WR as well: the peer only learns
+		 * about the end of our stream from it.  Without it a half-close
+		 * (shutdown(SHUT_WR), then keep reading) was never seen by the
+		 * host, which kept waiting for more data.
+		 */
+		if ((so->so_state & SS_ISCONNECTED) && !pcb->fin_sent) {
 			SOCK_SENDBUF_LOCK(so);
 			(void) hvsock_send_data(pcb->chan, NULL, 0,
 			    &so->so_snd);
 			SOCK_SENDBUF_UNLOCK(so);
-			soisdisconnecting(so);
+			pcb->fin_sent = true;
 		}
-		/* FALLTHROUGH */
-	case SHUT_WR:
+		if (how == SHUT_RDWR && (so->so_state & SS_ISCONNECTED))
+			soisdisconnecting(so);
 		socantsendmore(so);
 	}
 	wakeup(&so->so_timeo);
