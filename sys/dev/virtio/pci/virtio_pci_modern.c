@@ -151,6 +151,7 @@ static void	vtpci_modern_select_virtqueue(struct vtpci_modern_softc *, int);
 static uint8_t	vtpci_modern_get_status(struct vtpci_modern_softc *);
 static void	vtpci_modern_set_status(struct vtpci_modern_softc *, uint8_t);
 static void	vtpci_modern_reset(struct vtpci_modern_softc *);
+static int	vtpci_modern_reset_dbg(struct vtpci_modern_softc *);
 static void	vtpci_modern_enable_virtqueues(struct vtpci_modern_softc *);
 
 static uint8_t	vtpci_modern_read_common_1(struct vtpci_modern_softc *,
@@ -294,14 +295,21 @@ vtpci_modern_attach(device_t dev)
 		sc->vtpci_devid = pci_get_device(dev) -
 		    VIRTIO_PCI_DEVICEID_MODERN_MIN;
 
+	device_printf(dev, "claude: map_configs...\n");
 	error = vtpci_modern_map_configs(sc);
 	if (error) {
 		device_printf(dev, "cannot map configs\n");
 		vtpci_modern_unmap_configs(sc);
 		return (error);
 	}
+	device_printf(dev, "claude: map_configs ok, reset...\n");
 
-	vtpci_modern_reset(sc);
+	if (vtpci_modern_reset_dbg(sc) != 0) {
+		device_printf(dev, "claude: reset NON completato, rinuncio\n");
+		vtpci_modern_unmap_configs(sc);
+		return (ENXIO);
+	}
+	device_printf(dev, "claude: reset ok\n");
 
 	/* Tell the host we've noticed this device. */
 	vtpci_modern_set_status(sc, VIRTIO_CONFIG_STATUS_ACK);
@@ -886,18 +894,22 @@ vtpci_modern_map_configs(struct vtpci_modern_softc *sc)
 {
 	int error;
 
+	device_printf(sc->vtpci_dev, "claude: map common\n");
 	error = vtpci_modern_map_common_config(sc);
 	if (error)
 		return (error);
 
+	device_printf(sc->vtpci_dev, "claude: map notify\n");
 	error = vtpci_modern_map_notify_config(sc);
 	if (error)
 		return (error);
 
+	device_printf(sc->vtpci_dev, "claude: map isr\n");
 	error = vtpci_modern_map_isr_config(sc);
 	if (error)
 		return (error);
 
+	device_printf(sc->vtpci_dev, "claude: map device\n");
 	error = vtpci_modern_map_device_config(sc);
 	if (error)
 		return (error);
@@ -1202,6 +1214,36 @@ vtpci_modern_register_vq_msix(device_t dev, int idx,
 	}
 
 	return (0);
+}
+
+/*
+ * claude 03/11/2026, SOLO DIAGNOSI (ramo wsf/guest-dbg): il reset di vtpci_modern_reset() con un limite di tempo e
+ * la stampa dei valori letti. Sotto il vPCI di Hyper-V (WSL2) l'attach si ferma dopo l'allocazione delle BAR.
+ */
+static int
+vtpci_modern_reset_dbg(struct vtpci_modern_softc *sc)
+{
+	device_t dev = sc->vtpci_dev;
+	uint8_t st, prev;
+	int i, cambi = 0;
+
+	device_printf(dev, "claude: stato prima del reset 0x%02x, cmdreg 0x%04x\n",
+	    vtpci_modern_get_status(sc), pci_read_config(dev, PCIR_COMMAND, 2));
+	vtpci_modern_set_status(sc, VIRTIO_CONFIG_STATUS_RESET);
+	prev = 0xaa;
+	for (i = 0; i < 2000; i++) {
+		st = vtpci_modern_get_status(sc);
+		if (st == VIRTIO_CONFIG_STATUS_RESET) {
+			device_printf(dev, "claude: reset dopo %d ms\n", i);
+			return (0);
+		}
+		if (st != prev && cambi++ < 8)
+			device_printf(dev, "claude: stato 0x%02x a %d ms\n", st, i);
+		prev = st;
+		DELAY(1000);
+	}
+	device_printf(dev, "claude: dopo 2 s lo stato e' ancora 0x%02x\n", st);
+	return (ETIMEDOUT);
 }
 
 static void
