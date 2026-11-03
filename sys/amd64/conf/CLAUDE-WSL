@@ -1,0 +1,6 @@
+# CLAUDE-WSL -- Claude 03/11/2026. SOLO DIAGNOSI per FreeBSD nella VM di WSL2 (blocco di virtio_pci sul vPCI di
+# Hyper-V): GENERIC + DDB, con l'ingresso nel debugger dalla seriale (CR ~ ^B).
+include GENERIC
+ident	CLAUDE-WSL
+options 	DDB
+options 	ALT_BREAK_TO_DEBUGGER
