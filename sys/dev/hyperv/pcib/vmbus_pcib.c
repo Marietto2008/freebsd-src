@@ -1849,6 +1849,23 @@ vmbus_pcib_write_config(device_t dev, u_int bus, u_int slot, u_int func,
 	 * vtpci_modern_reset() spun forever).  Disable decoding around the
 	 * BAR write so that Hyper-V maps the new address.
 	 */
+	/*
+	 * claude 03/11/2026, PROVA: le scritture di una BAR di memoria portano
+	 * i bit di tipo (64 bit, prefetchable) che la BAR dichiara, come fa
+	 * Linux; il bus PCI di FreeBSD scrive solo l'indirizzo, coi bit bassi
+	 * a 0 (= BAR a 32 bit).
+	 */
+	if (bytes == 4 && reg >= PCIR_BAR(0) && reg < PCIR_BAR(PCIR_MAX_BAR_0 + 1) &&
+	    data != 0xffffffff) {
+		uint32_t pb = hpdev->probed_bar[(reg - PCIR_BAR(0)) / 4];
+
+		if ((pb & PCIM_BAR_SPACE) == PCIM_BAR_MEM_SPACE &&
+		    (reg == PCIR_BAR(0) ||
+		    (hpdev->probed_bar[(reg - PCIR_BAR(0)) / 4 - 1] & PCIM_BAR_MEM_TYPE) !=
+		    PCIM_BAR_MEM_64))
+			data = (data & ~0xfU) | (pb & 0xfU);
+	}
+
 	if (reg >= PCIR_BAR(0) && reg < PCIR_BAR(PCIR_MAX_BAR_0 + 1)) {
 		uint32_t cmd = 0;
 
