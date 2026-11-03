@@ -1825,6 +1825,8 @@ vmbus_pcib_read_config(device_t dev, u_int bus, u_int slot, u_int func,
 	return (data);
 }
 
+static bool vmbus_pcib_bars_assigned(struct hv_pci_dev *);
+
 static void
 vmbus_pcib_write_config(device_t dev, u_int bus, u_int slot, u_int func,
     u_int reg, uint32_t data, int bytes)
