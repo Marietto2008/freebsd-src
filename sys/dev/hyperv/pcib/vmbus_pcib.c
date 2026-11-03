@@ -1506,9 +1506,22 @@ vmbus_pcib_attach(device_t dev)
 	TAILQ_INIT(&hbus->children);
 	TAILQ_INIT(&hbus->dr_list);
 
+	/*
+	 * claude 03/11/2026, SOLO DIAGNOSI: la finestra di configurazione
+	 * nell'intervallo MMIO BASSO, come Linux (vmbus_allocate_mmio scorre
+	 * gli intervalli in ordine crescente); FreeBSD la prendeva in quello
+	 * alto, dove Linux mette le BAR.
+	 */
 	hbus->cfg_res = bus_alloc_resource(dev, SYS_RES_MEMORY, &rid,
-	    0, RM_MAX_END, PCI_CONFIG_MMIO_LENGTH,
+	    0, 0xffffffff, PCI_CONFIG_MMIO_LENGTH,
 	    RF_ACTIVE | rman_make_alignment_flags(PAGE_SIZE));
+	if (hbus->cfg_res != NULL && bootverbose)
+		device_printf(dev, "claude: finestra di configurazione %#jx\n",
+		    (uintmax_t)rman_get_start(hbus->cfg_res));
+	if (hbus->cfg_res == NULL)
+		hbus->cfg_res = bus_alloc_resource(dev, SYS_RES_MEMORY, &rid,
+		    0, RM_MAX_END, PCI_CONFIG_MMIO_LENGTH,
+		    RF_ACTIVE | rman_make_alignment_flags(PAGE_SIZE));
 
 	if (!hbus->cfg_res) {
 		device_printf(dev, "failed to get resource for cfg window\n");
