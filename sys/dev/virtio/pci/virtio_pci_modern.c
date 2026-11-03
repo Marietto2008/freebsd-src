@@ -1243,6 +1243,24 @@ vtpci_modern_reset_dbg(struct vtpci_modern_softc *sc)
 		DELAY(1000);
 	}
 	device_printf(dev, "claude: dopo 2 s lo stato e' ancora 0x%02x\n", st);
+	for (i = 0; i < 6; i++)
+		device_printf(dev, "claude: BAR%d = 0x%08x\n", i,
+		    pci_read_config(dev, PCIR_BAR(i), 4));
+	device_printf(dev, "claude: cmdreg 0x%04x\n", pci_read_config(dev, PCIR_COMMAND, 2));
+	{
+		struct vtpci_modern_resource_map *m[4] = { &sc->vtpci_common_res_map,
+		    &sc->vtpci_notify_res_map, &sc->vtpci_isr_res_map, &sc->vtpci_device_res_map };
+		const char *n[4] = { "common", "notify", "isr", "device" };
+		struct resource *r;
+
+		for (i = 0; i < 4; i++) {
+			r = vtpci_modern_get_bar_resource(sc, m[i]->vtrm_bar, m[i]->vtrm_type);
+			device_printf(dev, "claude: %s bar %d off 0x%x len 0x%x tipo %d, risorsa %#jx-%#jx, map %p\n",
+			    n[i], m[i]->vtrm_bar, m[i]->vtrm_offset, m[i]->vtrm_length, m[i]->vtrm_type,
+			    r ? (uintmax_t)rman_get_start(r) : 0, r ? (uintmax_t)rman_get_end(r) : 0,
+			    (void *)m[i]->vtrm_map.r_vaddr);
+		}
+	}
 	return (ETIMEDOUT);
 }
 
