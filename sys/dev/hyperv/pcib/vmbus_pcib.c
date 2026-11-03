@@ -1363,6 +1363,16 @@ _hv_pcifront_write_config(struct hv_pci_dev *hpdev, int where, int size,
 	if (where >= PCIR_SUBVEND_0 && where + size <= PCIR_CAP_PTR)
 		return;
 
+	/*
+	 * So are the revision ID, class code, interrupt pin, MIN_GNT and
+	 * MAX_LAT.  The PCI bus writes them back when it restores a saved
+	 * configuration (pci_cfg_restore()); Linux never writes them and
+	 * reads them from the device description sent by the host.
+	 */
+	if ((where >= PCIR_REVID && where + size <= PCIR_CACHELNSZ) ||
+	    (where >= PCIR_INTPIN && where + size <= PCIR_MAXLAT + 1))
+		return;
+
 	if (where >= PCIR_COMMAND && where + size <= CFG_PAGE_SIZE) {
 		mtx_lock(&hbus->config_lock);
 
