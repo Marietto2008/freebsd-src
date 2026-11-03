@@ -1883,6 +1883,20 @@ vmbus_pcib_write_config(device_t dev, u_int bus, u_int slot, u_int func,
 	}
 
 	/*
+	 * claude 03/11/2026, PROVA: Linux accende la decodifica della memoria
+	 * una volta sola, con tutte le BAR gia' assegnate; FreeBSD la accende
+	 * alla prima BAR attivata, con le altre ancora a 0. Qui la si rimanda
+	 * finche' tutte le BAR di memoria non hanno un indirizzo.
+	 */
+	if (reg == PCIR_COMMAND && bytes == 2 && (data & PCIM_CMD_MEMEN) &&
+	    !vmbus_pcib_bars_assigned(hpdev)) {
+		if (bootverbose)
+			printf("vmbus_pcib: claude: MEMEN rimandato (BAR non tutte "
+			    "assegnate), comando 0x%04x\n", data);
+		data &= ~PCIM_CMD_MEMEN;
+	}
+
+	/*
 	 * claude 03/11/2026, SOLO DIAGNOSI: l'ordine di Linux nell'accensione
 	 * (comando 0 -> MEMEN -> MEMEN|BUSMASTER). FreeBSD accende il bus
 	 * master prima (vtpci_init) e poi la memoria (0x4 -> 0x6).
@@ -1909,6 +1923,33 @@ vmbus_pcib_write_config(device_t dev, u_int bus, u_int slot, u_int func,
 	}
 
 	_hv_pcifront_write_config(hpdev, reg, bytes, data);
+}
+
+/*
+ * claude 03/11/2026, PROVA: vero se ogni BAR di memoria che il dispositivo
+ * dichiara (probed_bar) ha gia' un indirizzo diverso da zero.
+ */
+static bool
+vmbus_pcib_bars_assigned(struct hv_pci_dev *hpdev)
+{
+	uint32_t lo, hi;
+	int i;
+
+	for (i = 0; i < MAX_NUM_BARS; i++) {
+		if (hpdev->probed_bar[i] == 0 ||
+		    (hpdev->probed_bar[i] & PCIM_BAR_SPACE) != PCIM_BAR_MEM_SPACE)
+			continue;
+		lo = hi = 0;
+		_hv_pcifront_read_config(hpdev, PCIR_BAR(i), 4, &lo);
+		if ((hpdev->probed_bar[i] & PCIM_BAR_MEM_TYPE) == PCIM_BAR_MEM_64 &&
+		    i + 1 < MAX_NUM_BARS) {
+			_hv_pcifront_read_config(hpdev, PCIR_BAR(i + 1), 4, &hi);
+			i++;
+		}
+		if ((lo & ~0xfU) == 0 && hi == 0)
+			return (false);
+	}
+	return (true);
 }
 
 static int
