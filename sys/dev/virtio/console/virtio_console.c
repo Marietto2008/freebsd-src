@@ -151,6 +151,7 @@ static void	 vtcon_drain_all(void);
 
 static int	 vtcon_probe(device_t);
 static int	 vtcon_attach(device_t);
+static int	 vtcon_attach_completed(device_t);
 static int	 vtcon_detach(device_t);
 static int	 vtcon_config_change(device_t);
 
@@ -248,6 +249,7 @@ static device_method_t vtcon_methods[] = {
 	DEVMETHOD(device_detach,	vtcon_detach),
 
 	/* VirtIO methods. */
+	DEVMETHOD(virtio_attach_completed, vtcon_attach_completed),
 	DEVMETHOD(virtio_config_change,	vtcon_config_change),
 
 	DEVMETHOD_END
@@ -369,14 +371,31 @@ vtcon_attach(device_t dev)
 
 	vtcon_enable_interrupts(sc);
 
-	vtcon_ctrl_send_control(sc, VIRTIO_CONSOLE_BAD_ID,
-	    VIRTIO_CONSOLE_DEVICE_READY, 1);
-
 fail:
 	if (error)
 		vtcon_detach(dev);
 
 	return (error);
+}
+
+static int
+vtcon_attach_completed(device_t dev)
+{
+	struct vtcon_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	/*
+	 * Tell the host we are ready only once it has been told
+	 * VIRTIO_CONFIG_STATUS_DRIVER_OK: a device may not process the
+	 * control virtqueue before that, and vtcon_ctrl_poll() would then
+	 * spin forever.  The virtio console that Hyper-V attaches to the WSL2
+	 * utility VM does exactly that.
+	 */
+	vtcon_ctrl_send_control(sc, VIRTIO_CONSOLE_BAD_ID,
+	    VIRTIO_CONSOLE_DEVICE_READY, 1);
+
+	return (0);
 }
 
 static int
