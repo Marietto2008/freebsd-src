@@ -700,8 +700,10 @@ vtpci_set_host_msix_vectors(struct vtpci_common *cn)
 
 	intr = &cn->vtpci_device_interrupt;
 	error = vtpci_register_cfg_msix(cn, intr);
-	if (error)
+	if (error) {
+		device_printf(cn->vtpci_dev, "claude: register_cfg_msix %d\n", error);
 		return (error);
+	}
 
 	intr = cn->vtpci_msix_vq_interrupts;
 	for (idx = 0; idx < cn->vtpci_nvqs; idx++) {
@@ -711,8 +713,11 @@ vtpci_set_host_msix_vectors(struct vtpci_common *cn)
 			tintr = intr;
 
 		error = vtpci_register_vq_msix(cn, idx, tintr);
-		if (error)
+		if (error) {
+			device_printf(cn->vtpci_dev, "claude: register_vq_msix(%d) %d\n",
+			    idx, error);
 			break;
+		}
 
 		/*
 		 * For shared MSIX, all the virtqueues share the first
@@ -761,8 +766,10 @@ vtpci_setup_intrs(struct vtpci_common *cn, enum intr_type type)
 	    ("%s: no interrupt type selected %#x", __func__, cn->vtpci_flags));
 
 	error = vtpci_alloc_intr_resources(cn);
-	if (error)
+	if (error) {
+		device_printf(cn->vtpci_dev, "claude: alloc_intr_resources %d\n", error);
 		return (error);
+	}
 
 	if (cn->vtpci_flags & VTPCI_FLAG_INTX)
 		error = vtpci_setup_intx_interrupt(cn, type);
@@ -806,8 +813,16 @@ vtpci_setup_interrupts(struct vtpci_common *cn, enum intr_type type)
 			return (ENXIO);
 		}
 
-		if (error == 0 && vtpci_setup_intrs(cn, type) == 0)
-			break;
+		if (error == 0) {
+			int e2 = vtpci_setup_intrs(cn, type);
+			device_printf(dev, "claude: interrupt, tentativo %d: setup %d\n",
+			    attempt, e2);
+			if (e2 == 0)
+				break;
+		} else
+			device_printf(dev, "claude: interrupt, tentativo %d: alloc %d "
+			    "(msix_count %d msi_count %d)\n", attempt, error,
+			    pci_msix_count(dev), pci_msi_count(dev));
 
 		vtpci_cleanup_setup_intr_attempt(cn);
 	}
