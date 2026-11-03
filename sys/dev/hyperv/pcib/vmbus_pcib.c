@@ -1801,6 +1801,29 @@ vmbus_pcib_write_config(device_t dev, u_int bus, u_int slot, u_int func,
 	if (!hpdev)
 		return;
 
+	/*
+	 * Hyper-V silently ignores BAR writes while memory decoding is
+	 * enabled (see also prepopulate_bars() in Linux pci-hyperv): the BAR
+	 * is left unmapped and every MMIO read returns all ones.  The PCI
+	 * bus assigns BARs lazily, one at a time, and enables decoding when
+	 * the first one is activated, so the BARs assigned after it were
+	 * lost (virtio_pci of the WSL2 console read its status as 0xff and
+	 * vtpci_modern_reset() spun forever).  Disable decoding around the
+	 * BAR write so that Hyper-V maps the new address.
+	 */
+	if (reg >= PCIR_BAR(0) && reg < PCIR_BAR(PCIR_MAX_BAR_0 + 1)) {
+		uint32_t cmd = 0;
+
+		_hv_pcifront_read_config(hpdev, PCIR_COMMAND, 2, &cmd);
+		if (cmd & PCIM_CMD_MEMEN) {
+			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2,
+			    cmd & ~PCIM_CMD_MEMEN);
+			_hv_pcifront_write_config(hpdev, reg, bytes, data);
+			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2, cmd);
+			return;
+		}
+	}
+
 	_hv_pcifront_write_config(hpdev, reg, bytes, data);
 }
 
