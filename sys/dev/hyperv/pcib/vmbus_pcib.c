@@ -1354,6 +1354,11 @@ _hv_pcifront_write_config(struct hv_pci_dev *hpdev, int where, int size,
 	struct hv_pcibus *hbus = hpdev->hbus;
 	bus_size_t addr = CFG_PAGE_OFFSET + where;
 
+	/* claude 03/11/2026, SOLO DIAGNOSI: ogni scrittura di configurazione */
+	if (bootverbose)
+		printf("vmbus_pcib: claude: cfgw where=%d size=%d val=0x%x\n",
+		    where, size, val);
+
 	/* SSIDs and ROM BARs are read-only */
 	if (where >= PCIR_SUBVEND_0 && where + size <= PCIR_CAP_PTR)
 		return;
