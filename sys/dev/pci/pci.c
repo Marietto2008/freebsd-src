@@ -2602,6 +2602,15 @@ pci_msi_blacklisted(void)
 			if (dev != NULL)
 				return (!pci_has_quirk(pci_get_devid(dev),
 					PCI_QUIRK_ENABLE_MSI_VM));
+
+			/*
+			 * No host bridge at all: the only PCI buses are
+			 * provided by the hypervisor, as in a Hyper-V
+			 * generation 2 VM or the WSL2 utility VM, whose vPCI
+			 * buses support MSI and MSI-X only.  There is no old
+			 * chipset to distrust.
+			 */
+			return (0);
 		}
 		return (1);
 	}
