@@ -1229,6 +1229,15 @@ vtpci_modern_reset_dbg(struct vtpci_modern_softc *sc)
 
 	device_printf(dev, "claude: stato prima del reset 0x%02x, cmdreg 0x%04x\n",
 	    vtpci_modern_get_status(sc), pci_read_config(dev, PCIR_COMMAND, 2));
+	for (i = 0; i < 0x38; i += 4)
+		device_printf(dev, "claude: common[0x%02x] = 0x%08x\n", i,
+		    vtpci_modern_read_common_4(sc, i));
+	for (i = 0; i < 0x10; i += 4)
+		device_printf(dev, "claude: device[0x%02x] = 0x%08x\n", i,
+		    vtpci_modern_read_device_4(sc, i));
+	device_printf(dev, "claude: stato a 8 bit 0x%02x, parola 0x14 a 32 bit 0x%08x\n",
+	    vtpci_modern_read_common_1(sc, VIRTIO_PCI_COMMON_STATUS),
+	    vtpci_modern_read_common_4(sc, 0x14));
 	vtpci_modern_set_status(sc, VIRTIO_CONFIG_STATUS_RESET);
 	prev = 0xaa;
 	for (i = 0; i < 2000; i++) {
