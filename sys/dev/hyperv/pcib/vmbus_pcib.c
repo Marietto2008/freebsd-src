@@ -1827,9 +1827,38 @@ vmbus_pcib_write_config(device_t dev, u_int bus, u_int slot, u_int func,
 		_hv_pcifront_read_config(hpdev, PCIR_COMMAND, 2, &cmd);
 		if (cmd & PCIM_CMD_MEMEN) {
 			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2,
-			    cmd & ~PCIM_CMD_MEMEN);
+			    cmd & ~(PCIM_CMD_MEMEN | PCIM_CMD_BUSMASTEREN));
 			_hv_pcifront_write_config(hpdev, reg, bytes, data);
+			/* claude, DIAGNOSI: prima la memoria, poi il bus master */
+			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2,
+			    cmd & ~PCIM_CMD_BUSMASTEREN);
 			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2, cmd);
+			return;
+		}
+	}
+
+	/*
+	 * claude 03/11/2026, SOLO DIAGNOSI: l'ordine di Linux nell'accensione
+	 * (comando 0 -> MEMEN -> MEMEN|BUSMASTER). FreeBSD accende il bus
+	 * master prima (vtpci_init) e poi la memoria (0x4 -> 0x6).
+	 */
+	if (reg == PCIR_COMMAND && bytes == 2 &&
+	    (data & (PCIM_CMD_MEMEN | PCIM_CMD_BUSMASTEREN)) ==
+	    (PCIM_CMD_MEMEN | PCIM_CMD_BUSMASTEREN)) {
+		uint32_t cmd = 0;
+
+		_hv_pcifront_read_config(hpdev, PCIR_COMMAND, 2, &cmd);
+		if ((cmd & PCIM_CMD_MEMEN) == 0) {
+			if (bootverbose)
+				printf("vmbus_pcib: claude: comando 0x%04x -> 0x%04x "
+				    "in due passi\n", cmd, data);
+			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2,
+			    data & ~(PCIM_CMD_BUSMASTEREN));
+			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2,
+			    (data & ~(PCIM_CMD_BUSMASTEREN | PCIM_CMD_MEMEN)));
+			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2,
+			    (data & ~PCIM_CMD_BUSMASTEREN) | PCIM_CMD_MEMEN);
+			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2, data);
 			return;
 		}
 	}
