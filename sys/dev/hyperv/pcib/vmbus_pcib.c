@@ -1408,11 +1408,26 @@ static void
 vmbus_pcib_prepopulate_bars(struct hv_pcibus *hbus)
 {
 	struct hv_pci_dev *hpdev;
-	struct resource *res;
+	struct resource *res, **held;
 	uint64_t base, size, mask;
 	uint32_t probed, bar_val, cmd;
 	bool is64, all_assigned;
-	int i, rid, flags;
+	int i, rid, flags, nheld, maxheld;
+
+	/*
+	 * The ranges picked for the BARs stay reserved until every BAR of
+	 * every device on this bus has one: releasing each range at once let
+	 * the next BAR get the very same address.
+	 */
+	maxheld = 0;
+	mtx_lock(&hbus->device_list_lock);
+	TAILQ_FOREACH(hpdev, &hbus->children, link)
+		maxheld += MAX_NUM_BARS;
+	mtx_unlock(&hbus->device_list_lock);
+	held = malloc(sizeof(*held) * (maxheld + 1), M_DEVBUF,
+	    M_WAITOK | M_ZERO);
+	nheld = 0;
+	rid = 0x100;
 
 	mtx_lock(&hbus->device_list_lock);
 	TAILQ_FOREACH(hpdev, &hbus->children, link) {
@@ -1449,12 +1464,12 @@ vmbus_pcib_prepopulate_bars(struct hv_pcibus *hbus)
 		 * virtio-fs device, which virtio_pci never maps) stayed 0,
 		 * decoding was never enabled, the driver read all ones and
 		 * virtio's reset loop spun forever.  Each range is reserved
-		 * from our parent only to pick a free, aligned address, then
-		 * released: pci_add_map() finds the BAR programmed and
-		 * decoding enabled, and reserves exactly that range.
+		 * from our parent only to pick a free, aligned address, and
+		 * released once all BARs have one: pci_add_map() then finds
+		 * the BARs programmed and decoding enabled, and reserves
+		 * exactly those ranges.
 		 */
 		all_assigned = true;
-		rid = 0x100;
 		for (i = 0; i < MAX_NUM_BARS; i++) {
 			probed = hpdev->probed_bar[i];
 			if (probed == 0 ||
@@ -1510,8 +1525,8 @@ vmbus_pcib_prepopulate_bars(struct hv_pcibus *hbus)
 				continue;
 			}
 			base = rman_get_start(res);
-			bus_release_resource(hbus->pcib, SYS_RES_MEMORY, rid,
-			    res);
+			if (nheld < maxheld)
+				held[nheld++] = res;
 			rid++;
 
 			_hv_pcifront_write_config(hpdev, PCIR_BAR(i), 4,
@@ -1535,6 +1550,12 @@ vmbus_pcib_prepopulate_bars(struct hv_pcibus *hbus)
 		}
 	}
 	mtx_unlock(&hbus->device_list_lock);
+
+	/* pci_add_map() reserves these ranges again, at the programmed BARs. */
+	for (i = 0; i < nheld; i++)
+		bus_release_resource(hbus->pcib, SYS_RES_MEMORY,
+		    rman_get_rid(held[i]), held[i]);
+	free(held, M_DEVBUF);
 }
 
 static void
