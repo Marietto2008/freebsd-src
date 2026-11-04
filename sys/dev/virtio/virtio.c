@@ -319,6 +319,15 @@ virtio_config_generation(device_t dev)
 	return (VIRTIO_BUS_CONFIG_GENERATION(device_get_parent(dev)));
 }
 
+int
+virtio_get_shm_region(device_t dev, uint8_t id, vm_paddr_t *paddr,
+    uint64_t *len)
+{
+
+	return (VIRTIO_BUS_GET_SHM_REGION(device_get_parent(dev), id, paddr,
+	    len));
+}
+
 void
 virtio_read_device_config(device_t dev, bus_size_t offset, void *dst, int len)
 {

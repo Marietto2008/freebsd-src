@@ -111,6 +111,8 @@ int	 virtio_setup_intr(device_t dev, enum intr_type type);
 bool	 virtio_with_feature(device_t dev, uint64_t feature);
 void	 virtio_stop(device_t dev);
 int	 virtio_config_generation(device_t dev);
+int	 virtio_get_shm_region(device_t dev, uint8_t id, vm_paddr_t *paddr,
+	     uint64_t *len);
 int	 virtio_reinit(device_t dev, uint64_t features);
 void	 virtio_reinit_complete(device_t dev);
 int	 virtio_child_pnpinfo(device_t busdev, device_t child, struct sbuf *sb);

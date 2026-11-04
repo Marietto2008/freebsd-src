@@ -83,6 +83,12 @@ struct vtpci_modern_softc {
 
 #define VTPCI_MODERN_MAX_BARS		6
 	struct vtpci_modern_bar_resource vtpci_bar_res[VTPCI_MODERN_MAX_BARS];
+
+	/*
+	 * BARs holding shared memory regions: reserved, never mapped by us
+	 * (they can be gigabytes; the consumer maps pages write-back).
+	 */
+	struct resource			*vtpci_shm_res[VTPCI_MODERN_MAX_BARS];
 };
 
 static int	vtpci_modern_probe(device_t);
@@ -135,6 +141,8 @@ static struct resource *vtpci_modern_get_bar_resource(
 static struct resource *vtpci_modern_alloc_bar_resource(
 		    struct vtpci_modern_softc *, int, int);
 static void	vtpci_modern_free_bar_resources(struct vtpci_modern_softc *);
+static int	vtpci_modern_get_shm_region(device_t, uint8_t, vm_paddr_t *,
+		    uint64_t *);
 static int	vtpci_modern_alloc_resource_map(struct vtpci_modern_softc *,
 		    struct vtpci_modern_resource_map *);
 static void	vtpci_modern_free_resource_map(struct vtpci_modern_softc *,
@@ -234,6 +242,7 @@ static device_method_t vtpci_modern_methods[] = {
 	DEVMETHOD(virtio_bus_config_generation,	  vtpci_modern_config_generation),
 	DEVMETHOD(virtio_bus_read_device_config,  vtpci_modern_read_dev_config),
 	DEVMETHOD(virtio_bus_write_device_config, vtpci_modern_write_dev_config),
+	DEVMETHOD(virtio_bus_get_shm_region,	  vtpci_modern_get_shm_region),
 
 	DEVMETHOD_END
 };
@@ -777,6 +786,63 @@ vtpci_modern_find_cap(device_t dev, uint8_t cfg_type, int *cap_offset)
 	return (error);
 }
 
+/*
+ * Shared memory region "id" (VIRTIO_PCI_CAP_SHARED_MEMORY_CFG), as Linux's
+ * vp_modern_get_shm_region(): physical address and length.  The BAR is
+ * reserved on first use and released on detach.
+ */
+static int
+vtpci_modern_get_shm_region(device_t dev, uint8_t id, vm_paddr_t *paddr,
+    uint64_t *len)
+{
+	struct vtpci_modern_softc *sc;
+	uint64_t offset, length;
+	uint32_t type, bar, capid;
+	int capreg, error, rid;
+
+	sc = device_get_softc(dev);
+
+	for (error = pci_find_cap(dev, PCIY_VENDOR, &capreg);
+	     error == 0;
+	     error = pci_find_next_cap(dev, PCIY_VENDOR, capreg, &capreg)) {
+		type = pci_read_config(dev, capreg + VIRTIO_PCI_CAP_CFG_TYPE, 1);
+		if (type != VIRTIO_PCI_CAP_SHARED_MEMORY_CFG)
+			continue;
+		capid = pci_read_config(dev, capreg + VIRTIO_PCI_CAP_ID, 1);
+		bar = pci_read_config(dev, capreg + VIRTIO_PCI_CAP_BAR, 1);
+		if (capid != id || bar >= VTPCI_MODERN_MAX_BARS)
+			continue;
+
+		offset = pci_read_config(dev, capreg + VIRTIO_PCI_CAP_OFFSET, 4);
+		offset |= (uint64_t)pci_read_config(dev, capreg +
+		    offsetof(struct virtio_pci_cap64, offset_hi), 4) << 32;
+		length = pci_read_config(dev, capreg + VIRTIO_PCI_CAP_LENGTH, 4);
+		length |= (uint64_t)pci_read_config(dev, capreg +
+		    offsetof(struct virtio_pci_cap64, length_hi), 4) << 32;
+
+		if (sc->vtpci_shm_res[bar] == NULL) {
+			rid = PCIR_BAR(bar);
+			sc->vtpci_shm_res[bar] = bus_alloc_resource_any(dev,
+			    SYS_RES_MEMORY, &rid, RF_PREFETCHABLE);
+			if (sc->vtpci_shm_res[bar] == NULL) {
+				device_printf(dev, "cannot reserve BAR %u of "
+				    "shared memory region %u\n", bar, id);
+				return (ENXIO);
+			}
+		}
+		if (offset + length > rman_get_size(sc->vtpci_shm_res[bar])) {
+			device_printf(dev, "shared memory region %u beyond "
+			    "BAR %u\n", id, bar);
+			return (ENXIO);
+		}
+		*paddr = rman_get_start(sc->vtpci_shm_res[bar]) + offset;
+		*len = length;
+		return (0);
+	}
+
+	return (ENOENT);
+}
+
 static int
 vtpci_modern_map_common_config(struct vtpci_modern_softc *sc)
 {
@@ -1048,6 +1114,11 @@ vtpci_modern_free_bar_resources(struct vtpci_modern_softc *sc)
 			bus_release_resource(dev, type, rid, res);
 			sc->vtpci_bar_res[bar].vtbr_res = NULL;
 			sc->vtpci_bar_res[bar].vtbr_type = 0;
+		}
+		if (sc->vtpci_shm_res[bar] != NULL) {
+			bus_release_resource(dev, SYS_RES_MEMORY, PCIR_BAR(bar),
+			    sc->vtpci_shm_res[bar]);
+			sc->vtpci_shm_res[bar] = NULL;
 		}
 	}
 }

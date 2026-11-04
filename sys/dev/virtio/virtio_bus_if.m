@@ -45,6 +45,13 @@ CODE {
 	{
 		return (0);
 	}
+
+	static int
+	virtio_bus_default_get_shm_region(device_t dev, uint8_t id,
+	    vm_paddr_t *paddr, uint64_t *len)
+	{
+		return (ENOENT);
+	}
 };
 
 METHOD uint64_t negotiate_features {
@@ -109,3 +116,13 @@ METHOD void write_device_config {
 	int		len;
 };
 
+#
+# Shared memory region "id" of the device (virtio 1.2, 2.10): its physical
+# address and length.  ENOENT if the device has no such region.
+#
+METHOD int get_shm_region {
+	device_t	dev;
+	uint8_t		id;
+	vm_paddr_t	*paddr;
+	uint64_t	*len;
+} DEFAULT virtio_bus_default_get_shm_region;

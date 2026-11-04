@@ -49,6 +49,8 @@
 #define VIRTIO_PCI_CAP_DEVICE_CFG	4
 /* PCI configuration access */
 #define VIRTIO_PCI_CAP_PCI_CFG		5
+/* Shared memory region (virtio 1.2, 4.1.4.7): a virtio_pci_cap64 with an id. */
+#define VIRTIO_PCI_CAP_SHARED_MEMORY_CFG	8
 
 /* This is the PCI capability header: */
 struct virtio_pci_cap {
@@ -61,6 +63,17 @@ struct virtio_pci_cap {
 	uint32_t offset;		/* Offset within bar. */
 	uint32_t length;		/* Length of the structure, in bytes. */
 };
+
+/*
+ * 64-bit form, used by the shared memory capability.  Its region id is the
+ * byte after "bar" (padding[0] above, "id" in virtio 1.2).
+ */
+struct virtio_pci_cap64 {
+	struct virtio_pci_cap cap;
+	uint32_t offset_hi;
+	uint32_t length_hi;
+};
+#define VIRTIO_PCI_CAP_ID		5
 
 struct virtio_pci_notify_cap {
 	struct virtio_pci_cap cap;
