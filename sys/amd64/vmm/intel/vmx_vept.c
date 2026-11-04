@@ -1838,23 +1838,38 @@ vept_cur_slot(struct vmx_nested *n)
  * si applica come sul ferro. Prima l'EPT02 forzava sempre WB+IPAT: la radice
  * di Hyper-V vedeva WB i suoi buffer DMA UC/WC non coerenti, e la RTX 2080 Ti
  * dava codice 43 senza un solo interrupt (04/11/2026, parere Opus 004 §2.2).
- * ept_ipat e' un tunable in sola lettura: si legge una volta.
+ * ept_ipat e' un tunable in sola lettura: si legge una volta (vept_ipat_init).
  */
-static int vept_l0_ipat = -1;
+static int vept_l0_ipat = 1;
 
-static uint64_t
-vept_ram_attr(uint64_t perm)
+/*
+ * Letto al caricamento del modulo (SYSINIT: contesto del kldload o del boot).
+ * NON dal thread del vCPU: e' un thread di bhyve in modalita' capability, e
+ * il sysctl, senza CTLFLAG_CAPRD, risponderebbe ECAPMODE (la prima versione
+ * lo leggeva li', il ripiego forzava WB+IPAT e la correzione restava inerte).
+ */
+static void
+vept_ipat_init(void *arg __unused)
 {
 	size_t len;
 	int v;
 
-	if (vept_l0_ipat < 0) {
-		len = sizeof(v);
-		if (kernel_sysctlbyname(curthread, "vm.pmap.ept_ipat", &v, &len,
-		    NULL, 0, NULL, 0) != 0)
-			v = 1;
-		vept_l0_ipat = v != 0;
+	len = sizeof(v);
+	if (kernel_sysctlbyname(curthread, "vm.pmap.ept_ipat", &v, &len, NULL,
+	    0, NULL, 0) != 0) {
+		printf("vmm: EPT02, vm.pmap.ept_ipat illeggibile: RAM WB+IPAT\n");
+		v = 1;
 	}
+	vept_l0_ipat = v != 0;
+	printf("vmm: EPT02, foglie RAM: %s (vm.pmap.ept_ipat=%d)\n",
+	    vept_l0_ipat ? "WB+IPAT forzati" : "memtype/IPAT dall'EPT12", v);
+}
+SYSINIT(vept_ipat, SI_SUB_DRIVERS, SI_ORDER_ANY, vept_ipat_init, NULL);
+
+static uint64_t
+vept_ram_attr(uint64_t perm)
+{
+
 	if (vept_l0_ipat)
 		return (EPT_PG_MEMORY_TYPE(6) | EPT_PG_IGNORE_PAT);
 	atomic_add_long(&vept_ram_pat_ept12, 1);
