@@ -410,6 +410,25 @@ struct vmx_nested {
 					 * del prossimo ingresso in L2 */
 	uint64_t	emu_viol_gpa;	/* GPA dell'L2 della voce di tabella */
 	uint64_t	emu_viol_gla;	/* indirizzo lineare che si traduceva */
+	/*
+	 * WSL2-FreeBSD 003 (diagnostica, sysctl nested_diag_pf): #PF di fetch
+	 * in modo supervisore dell'L2 intercettato da L0 nel VMCS02 quando il
+	 * VMCS12 non intercetta i #PF. Nessun cambio di comportamento: si
+	 * registra, si fa il walk nello slow path e si rientra in L2 per UN
+	 * ingresso senza intercetto, cosi' il processore riesegue l'istruzione.
+	 */
+	bool		diag_pf_armed;	/* il VMCS02 intercetta per noi */
+	bool		diag_pf_rearm;	/* riarmare alla prossima uscita da L2 */
+	bool		diag_pf_pending; /* walk da fare nello slow path */
+	uint32_t	diag_pf_ec;	/* codice d'errore del #PF */
+	uint32_t	diag_pf_idtv;	/* IDT-vectoring info dell'uscita */
+	uint32_t	diag_pf_ss_ar;	/* diritti di SS (CPL) */
+	uint64_t	diag_pf_rip;
+	uint64_t	diag_pf_qual;	/* indirizzo lineare del fault */
+	uint64_t	diag_pf_cr0;
+	uint64_t	diag_pf_cr3;
+	uint64_t	diag_pf_cr4;
+	uint64_t	diag_pf_efer;
 	uint64_t	emu_viol_qual;	/* qualificazione per il VMCS12 */
 	uint64_t	emu_viol_vmcs12; /* VMCS12 corrente alla produzione:
 					  * la riflessione va a QUELLO (#110 §3) */

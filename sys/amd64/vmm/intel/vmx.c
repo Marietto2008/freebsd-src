@@ -3034,6 +3034,19 @@ vmx_exit_process(struct vmx *vmx, struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 				vmexit->inst_length = 0;
 				return (UNHANDLED);
 			}
+			if (vcpu->nested->diag_pf_pending) {
+				/*
+				 * WSL2-FreeBSD 003: #PF dell'L2 intercettato in
+				 * diagnostica, walk nello slow path (fuori dalla
+				 * sezione critica), poi si rientra in L2 come per
+				 * ept_pending; l'eventuale evento in consegna lo
+				 * ripristina vmx_exit_save_idtvec.
+				 */
+				vmx_exit_save_idtvec(vcpu, vmexit, reason);
+				vmexit->exitcode = VM_EXITCODE_NESTED;
+				vmexit->inst_length = 0;
+				return (UNHANDLED);
+			}
 			if (vcpu->nested->in_l2) {
 				/* gestita in L0, resta in L2 */
 				vmx_exit_save_idtvec(vcpu, vmexit, reason);

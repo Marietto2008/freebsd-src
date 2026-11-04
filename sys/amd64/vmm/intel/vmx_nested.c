@@ -74,6 +74,7 @@ static int	nested_vpid_track;
 static int	nested_vpid_test_off;
 static u_long	vpid02_off_vcpus;
 static int	nested_vpid_d4_arm;
+static void	nested_diag_pf_arm(struct vmx_vcpu *vcpu);	/* WSL2-FreeBSD 003 */
 static u_long	nested_vpid_d4_injected;
 static void	nested_field_tab_build(void);
 static int	shv_global_init(void);
@@ -256,6 +257,28 @@ NESTED_CTR(nested_ept12_viol_emul_nocache,
     "nested: violazioni dell'emulatore senza il loro VMCS12 (deve essere 0)");
 NESTED_CTR(nested_ept12_misconf_reflected,
     "nested: EPT misconfiguration riflesse all'L1");
+/*
+ * WSL2-FreeBSD 003 (Claude 04/11/2026): diagnostica del #PF di fetch in modo
+ * supervisore che manda in panic il guest FreeBSD (lapic_et_start+0x327). Con
+ * nested_diag_pf=1, e solo se il VMCS12 non intercetta i #PF (bit 14, maschera
+ * e confronto a 0), il VMCS02 intercetta i #PF con codice I=1 U=0. All'uscita
+ * si registrano lo stato e il walk (vista dell'L1 attraverso EPT12 contro EPT02
+ * ombra) nello slow path, poi si rientra in L2 per UN ingresso senza
+ * intercetto: il processore riesegue l'istruzione e, se il fault si ripete,
+ * lo consegna all'L2 come senza diagnostica. Spento di default.
+ */
+static int nested_diag_pf = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag_pf, CTLFLAG_RWTUN,
+    &nested_diag_pf, 0,
+    "nested: intercetta in diagnostica i #PF di fetch supervisore dell'L2 (WSL2-FreeBSD 003)");
+NESTED_CTR(nested_diag_pf_hits,
+    "nested: #PF di fetch supervisore dell'L2 intercettati in diagnostica");
+NESTED_CTR(nested_diag_pf_vectoring,
+    "nested: di questi, durante la consegna di un altro evento (IDT-vectoring valido)");
+NESTED_CTR(nested_diag_pf_l1_exits,
+    "nested: uscite #PF dell'L2 chieste dal VMCS12 (riflesse all'L1)");
+NESTED_CTR(nested_diag_pf_skipped,
+    "nested: armamenti saltati perche' il VMCS12 intercetta gia' i #PF");
 NESTED_CTR(nested_ept12_misconf_emul_reflected,
     "nested: EPT misconfiguration trovate dall'emulatore riflesse (H2)");
 NESTED_CTR(nested_l2_entries, "nested: ingressi in L2");
@@ -4219,6 +4242,11 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	uint32_t reason = vmexit->u.vmx.exit_reason & 0xffff;
 
 	n_exit_rip_record(vcpu, vmexit);
+	/* WSL2-FreeBSD 003: l'ingresso senza intercetto e' passato, si riarma */
+	if (__predict_false(vcpu->nested->diag_pf_rearm)) {
+		vcpu->nested->diag_pf_rearm = false;
+		nested_diag_pf_arm(vcpu);
+	}
 	/* un'uscita normale da L2 = l'ingresso e' riuscito: VMCS12 launched */
 	if ((vmcs_read(VMCS_EXIT_REASON) & 0x80000000) == 0)
 		vcpu->nested->launching = false;
@@ -4258,13 +4286,50 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 			return (true);
 		}
 		break;			/* timer dell'L1 -> riflette */
-	case EXIT_REASON_EXCEPTION:
+	case EXIT_REASON_EXCEPTION: {
+		uint32_t ii = (uint32_t)vmcs_read(VMCS_EXIT_INTR_INFO);
+		struct vmx_nested *dn = vcpu->nested;
+
 		/* NMI (intr_type NMI) all'L0; le altre eccezioni si riflettono
 		 * se nella exception bitmap di VMCS12 (semplificato: riflette). */
-		if (((uint32_t)vmcs_read(VMCS_EXIT_INTR_INFO) & 0x700) ==
-		    (2 << 8))	/* type 2 = NMI */
+		if ((ii & 0x700) == (2 << 8))	/* type 2 = NMI */
 			return (false);
+		if ((ii & 0xff) == IDT_PF && dn->diag_pf_armed) {
+			/*
+			 * WSL2-FreeBSD 003: #PF intercettato per noi (il VMCS12 non
+			 * lo vuole). Si cattura lo stato col VMCS02 caricato, si
+			 * toglie l'intercetto per UN ingresso e si rimanda il walk
+			 * allo slow path; nessun evento iniettato: il processore
+			 * riesegue l'istruzione (rip invariato).
+			 */
+			dn->diag_pf_ec = (uint32_t)vmcs_read(VMCS_EXIT_INTR_ERRCODE);
+			dn->diag_pf_idtv = (uint32_t)vmcs_read(VMCS_IDT_VECTORING_INFO);
+			dn->diag_pf_ss_ar =
+			    (uint32_t)vmcs_read(VMCS_GUEST_SS_ACCESS_RIGHTS);
+			dn->diag_pf_rip = vmcs_read(VMCS_GUEST_RIP);
+			dn->diag_pf_qual = vmcs_read(VMCS_EXIT_QUALIFICATION);
+			dn->diag_pf_cr0 = vmcs_read(VMCS_GUEST_CR0);
+			dn->diag_pf_cr3 = vmcs_read(VMCS_GUEST_CR3);
+			dn->diag_pf_cr4 = vmcs_read(VMCS_GUEST_CR4);
+			dn->diag_pf_efer = vmcs_read(VMCS_GUEST_IA32_EFER);
+			atomic_add_long(&nested_diag_pf_hits, 1);
+			if (dn->diag_pf_idtv & VMCS_IDT_VEC_VALID)
+				atomic_add_long(&nested_diag_pf_vectoring, 1);
+			vmcs_write(VMCS_EXCEPTION_BITMAP,
+			    (uint32_t)vmcs_read(VMCS_EXCEPTION_BITMAP) &
+			    ~(1u << IDT_PF));
+			vmcs_write(VMCS_PF_ERROR_MASK, 0);
+			vmcs_write(VMCS_PF_ERROR_MATCH, 0);
+			dn->diag_pf_armed = false;
+			dn->diag_pf_rearm = true;
+			dn->diag_pf_pending = true;
+			vmexit->inst_length = 0;
+			return (true);
+		}
+		if ((ii & 0xff) == IDT_PF)
+			atomic_add_long(&nested_diag_pf_l1_exits, 1);
 		break;			/* eccezione non-NMI -> riflette */
+	}
 	case EXIT_REASON_INOUT: {
 		struct vmcs12_cache *cc = nested_current_cache(vcpu->nested);
 		uint32_t p12;
@@ -4699,6 +4764,112 @@ nested_ept_emul_reflect(struct vmx_vcpu *vcpu)
 	return (0);
 }
 
+/*
+ * WSL2-FreeBSD 003: arma l'intercetto diagnostico nel VMCS02 CORRENTE. Solo se il
+ * VMCS12 non vuole nessun #PF (bit 14 a 0 con maschera e confronto a 0: allora
+ * nessun #PF esce verso l'L1), cosi' l'intercetto non toglie nulla all'L1.
+ */
+static void
+nested_diag_pf_arm(struct vmx_vcpu *vcpu)
+{
+	struct vmcs12_cache *c = nested_current_cache(vcpu->nested);
+
+	vcpu->nested->diag_pf_armed = false;
+	if (nested_diag_pf == 0 || c == NULL)
+		return;
+	if ((vmcs12_read_field(c, VMCS_EXCEPTION_BITMAP) & (1u << IDT_PF)) != 0 ||
+	    vmcs12_read_field(c, VMCS_PF_ERROR_MASK) != 0 ||
+	    vmcs12_read_field(c, VMCS_PF_ERROR_MATCH) != 0) {
+		atomic_add_long(&nested_diag_pf_skipped, 1);
+		return;
+	}
+	vmcs_write(VMCS_EXCEPTION_BITMAP,
+	    (uint32_t)vmcs_read(VMCS_EXCEPTION_BITMAP) | (1u << IDT_PF));
+	vmcs_write(VMCS_PF_ERROR_MASK, PGEX_I | PGEX_U);
+	vmcs_write(VMCS_PF_ERROR_MATCH, PGEX_I);
+	vcpu->nested->diag_pf_armed = true;
+}
+
+/*
+ * WSL2-FreeBSD 003: slow path (nessun VMCS attivo, fuori dalla sezione critica
+ * del percorso d'uscita). Stato catturato all'uscita e walk delle tabelle
+ * dell'L2 per l'indirizzo del fault: per ogni livello la pagina host ATTESA
+ * (tabella dell'L2 tradotta con EPT12, la vista dell'L1) contro quella a cui
+ * punta l'EPT02 OMBRA (quella che ha letto il processore). Prime 32 volte.
+ */
+static void
+nested_diag_pf_walk(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vm_guest_paging pg;
+	uint64_t gla = n->diag_pf_qual, tgpa, l1, pte, exp, sh, swgpa = 0, *p;
+	void *ck;
+	int lvl, fault = 0, err, count;
+	static int count_fbsd, count_altri;
+
+	/*
+	 * Sotto Hyper-V anche la partizione radice (Windows) e' un L2, con
+	 * codice del kernel paginabile: i suoi #PF di fetch supervisore sono
+	 * legittimi. Si stampano fino a 32 eventi nel kernel FreeBSD (da
+	 * KERNBASE 0xffffffff80000000) e al piu' 4 degli altri; i contatori
+	 * contano tutto.
+	 */
+	if (n->diag_pf_rip >= 0xffffffff80000000ULL) {
+		if (count_fbsd >= 32)
+			return;
+		count = ++count_fbsd;
+	} else {
+		if (count_altri >= 4)
+			return;
+		count = 1000 + ++count_altri;
+	}
+	pg.cr3 = n->diag_pf_cr3;
+	pg.cpl = (n->diag_pf_ss_ar >> 5) & 3;
+	pg.cpu_mode = (n->diag_pf_efer & EFER_LMA) ? CPU_MODE_64BIT :
+	    CPU_MODE_PROTECTED;
+	pg.paging_mode = (n->diag_pf_cr4 & CR4_LA57) ? PAGING_MODE_64_LA57 :
+	    PAGING_MODE_64;
+	err = vm_gla2gpa_nofault(vcpu->vcpu, &pg, gla, VM_PROT_EXECUTE, &swgpa,
+	    &fault);
+	printf("nested_diag_pf #%d vcpu%d rip=%#lx cr2=%#lx ec=%#x idtv=%#x "
+	    "cpl=%d cr0=%#lx cr3=%#lx cr4=%#lx efer=%#lx | vista L1: gpa=%#lx "
+	    "err=%d fault=%d\n", count, vcpu->vcpuid, (u_long)n->diag_pf_rip,
+	    (u_long)gla, n->diag_pf_ec, n->diag_pf_idtv, pg.cpl,
+	    (u_long)n->diag_pf_cr0, (u_long)n->diag_pf_cr3,
+	    (u_long)n->diag_pf_cr4, (u_long)n->diag_pf_efer, (u_long)swgpa, err,
+	    fault);
+	if ((n->diag_pf_efer & EFER_LMA) == 0 || (n->diag_pf_cr4 & CR4_LA57))
+		return;
+	tgpa = n->diag_pf_cr3 & 0x000ffffffffff000ULL;
+	for (lvl = 3; lvl >= 0; lvl--) {
+		if (vmx_vept_l1gpa(vcpu, tgpa, VM_PROT_READ, &l1) != 0) {
+			printf("nested_diag_pf   L%d tabella l2gpa=%#lx: l'EPT12 "
+			    "non la mappa\n", lvl + 1, (u_long)tgpa);
+			return;
+		}
+		p = vm_gpa_hold(vcpu->vcpu, l1 & ~(uint64_t)PAGE_MASK,
+		    PAGE_SIZE, VM_PROT_READ, &ck);
+		if (p == NULL) {
+			printf("nested_diag_pf   L%d tabella l1gpa=%#lx non RAM\n",
+			    lvl + 1, (u_long)l1);
+			return;
+		}
+		exp = DMAP_TO_PHYS((vm_offset_t)p);
+		pte = p[(gla >> (12 + 9 * lvl)) & 0x1ff];
+		vm_gpa_release(ck);
+		sh = vmx_vept_shadow_entry(vcpu, tgpa);
+		printf("nested_diag_pf   L%d tabella l2gpa=%#lx l1gpa=%#lx host "
+		    "atteso=%#lx shadow=%#lx%s pte=%#lx P=%d U=%d NX=%d\n",
+		    lvl + 1, (u_long)tgpa, (u_long)l1, (u_long)exp, (u_long)sh,
+		    (sh != 0 && (sh & 0x000ffffffffff000ULL) != exp) ?
+		    " <-- DIVERSO" : "", (u_long)pte, (int)(pte & 1),
+		    (int)((pte >> 2) & 1), (int)(pte >> 63));
+		if ((pte & 1) == 0 || (lvl > 0 && (pte & 0x80) != 0))
+			return;
+		tgpa = pte & 0x000ffffffffff000ULL;
+	}
+}
+
 static int
 nested_ept_slow(struct vmx_vcpu *vcpu)
 {
@@ -4878,6 +5049,15 @@ vmx_nested_exit(void *vcpui)
 			return (nested_ept_emul_reflect(vcpu));
 		vcpu->nested->emu_viol = false;
 		atomic_add_long(&nested_ept12_viol_emul_stale, 1);
+	}
+
+	/* WSL2-FreeBSD 003: walk diagnostico di un #PF intercettato, poi si
+	 * rientra in L2 (l'intercetto e' gia' tolto per UN ingresso) */
+	if (vcpu->nested != NULL && vcpu->nested->diag_pf_pending) {
+		vcpu->nested->diag_pf_pending = false;
+		if (vcpu->nested->in_l2)
+			nested_diag_pf_walk(vcpu);
+		return (0);
 	}
 
 	/* Uscita di L2 gia' riflessa all'L1 in vmx_exit_process: qui va solo
@@ -5176,6 +5356,9 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	vmwrite(VMCS_EXCEPTION_BITMAP, excbmp);
 	vmwrite(VMCS_PF_ERROR_MASK, vmcs12_read_field(c, VMCS_PF_ERROR_MASK));
 	vmwrite(VMCS_PF_ERROR_MATCH, vmcs12_read_field(c, VMCS_PF_ERROR_MATCH));
+	/* WSL2-FreeBSD 003: intercetto diagnostico (spento di default) */
+	vcpu->nested->diag_pf_rearm = false;
+	nested_diag_pf_arm(vcpu);
 
 	/* --- CR0/CR4: maschere (mask12), read-shadow (VMCS12), guest con i bit
 	 *     fixed dell'host applicati --- */
