@@ -413,6 +413,14 @@ vtfs_remove(struct vtfs_softc *sc)
 }
 
 int
+vtfs_get_shm_region(struct vtfs_softc *sc, uint8_t id, vm_paddr_t *paddr,
+    uint64_t *len)
+{
+
+	return (virtio_get_shm_region(sc->vtfs_dev, id, paddr, len));
+}
+
+int
 vtfs_find(char *tag, struct vtfs_softc **scp)
 {
 	struct vtfs_softc *sc;

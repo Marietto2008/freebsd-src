@@ -40,5 +40,8 @@ int vtfs_find(char *, vtfs_instance *);
 void vtfs_release(vtfs_instance);
 void vtfs_drain(vtfs_instance);
 void vtfs_unregister_cb(vtfs_instance);
+/* Shared memory region "id" of the device (the DAX window is id 0). */
+int vtfs_get_shm_region(vtfs_instance, uint8_t, vm_paddr_t *, uint64_t *);
+#define VTFS_SHM_CACHE_ID	0
 
 #endif /* _VIRTIO_FS_H */
