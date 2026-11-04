@@ -1486,8 +1486,20 @@ vmbus_pcib_prepopulate_bars(struct hv_pcibus *hbus)
 			flags = RF_ALIGNMENT_LOG2(flsll(size) - 1);
 			if (probed & PCIM_BAR_MEM_PREFETCH)
 				flags |= RF_PREFETCHABLE;
-			res = bus_alloc_resource(hbus->pcib, SYS_RES_MEMORY,
-			    &rid, 0, is64 ? ~0 : 0xffffffff, size, flags);
+			/*
+			 * 64-bit BARs go above 4 GB, as Linux places them: a
+			 * 64-bit BAR of the virtio console put in the low MMIO
+			 * window left the guest unable to use the device.
+			 */
+			res = NULL;
+			if (is64)
+				res = bus_alloc_resource(hbus->pcib,
+				    SYS_RES_MEMORY, &rid, 0x100000000ULL, ~0,
+				    size, flags);
+			if (res == NULL)
+				res = bus_alloc_resource(hbus->pcib,
+				    SYS_RES_MEMORY, &rid, 0,
+				    is64 ? ~0 : 0xffffffff, size, flags);
 			if (res == NULL) {
 				device_printf(hbus->pcib, "no room for BAR %d "
 				    "(%#jx bytes) of device slot %#x\n", i,
