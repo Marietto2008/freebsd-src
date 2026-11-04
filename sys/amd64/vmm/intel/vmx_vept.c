@@ -31,7 +31,9 @@
 
 #include <vm/vm.h>
 #include <vm/vm_extern.h>
+#include <vm/vm_param.h>
 #include <vm/pmap.h>
+#include <vm/vm_map.h>
 #include <machine/clock.h>	/* tsc_freq (parere #41 §6) */
 #include <machine/vmparam.h>
 #include <machine/vmm.h>
@@ -127,6 +129,8 @@ VEPT_CTR(vept_keep_shadow_flushes,
 VEPT_CTR(vept_keep_walk_zaps, "B1: voci cambiate viste da un walk");
 VEPT_CTR(vept_keep_verify_checked, "B1: foglie riverificate");
 VEPT_CTR(vept_keep_verify_mismatch, "B1: foglie riverificate DISCORDANTI");
+VEPT_CTR(vept_mmio_faulted_in,
+    "BAR in passthrough portate nell'EPT01 da un fault dell'L2 (vm_fault)");
 VEPT_CTR(vept_memgen_changes_detected,
     "B1: generazioni dei mapping cambiate viste da un vCPU");
 VEPT_CTR(vept_ptp_write_retry_xlate,
@@ -1916,9 +1920,32 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		vept_install(n, k, l2gpa, hpa, *perm, 6);	/* RAM: WB */
 		return (VEPT_OK);
 	}
-	/* Non RAM. Se l'EPT01 mappa gia' l'L1-GPA (BAR di un dispositivo in
+	/* Non RAM. Se l'EPT01 mappa l'L1-GPA (BAR di un dispositivo in
 	 * passthrough) si usa la stessa pagina host, non cacheable. */
 	hpa = pmap_extract(vcpu->vmx->pmap, *l1gpa);
+	if (hpa == 0) {
+		/*
+		 * La BAR di un dispositivo in passthrough e' un oggetto OBJT_SG
+		 * nella mappa della VM, inserito SENZA prefault
+		 * (vmm_mmio_alloc): la sua voce nell'EPT01 nasce al primo fault
+		 * dell'L1 (vm_handle_paging -> vm_fault). Se a toccarla per primo
+		 * e' l'L2, pmap_extract da' 0 e prima si concludeva "dispositivo
+		 * emulato dell'L1": l'accesso andava all'emulatore di bhyve, che
+		 * per le pagine della BAR fuori dalla tabella MSI-X non lo prevede
+		 * (le tiene PROT_NONE apposta) -> SIGSEGV in passthru_read_locked
+		 * (04/11/2026: Windows con Hyper-V e la RTX 2080 Ti in passthrough,
+		 * prima lettura dell'L2 a BAR0+0xa00). Qui lo stesso vm_fault che
+		 * farebbe l'L1; se l'indirizzo non e' nella mappa (dispositivo
+		 * davvero emulato dall'L0) fallisce e si emula come prima.
+		 */
+		if (vm_fault(&vm_vmspace(vcpu->vmx->vm)->vm_map,
+		    trunc_page(*l1gpa), (qual & 0x2) != 0 ? VM_PROT_WRITE :
+		    VM_PROT_READ, VM_FAULT_NORMAL, NULL) == KERN_SUCCESS) {
+			hpa = pmap_extract(vcpu->vmx->pmap, *l1gpa);
+			if (hpa != 0)
+				atomic_add_long(&vept_mmio_faulted_in, 1);
+		}
+	}
 	if (hpa != 0) {
 		k->nokeep = true;		/* B1: MMIO mai conservata */
 		n->st_vept[VST_F_MMIO]++;
