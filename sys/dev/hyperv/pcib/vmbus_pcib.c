@@ -1408,17 +1408,20 @@ static void
 vmbus_pcib_prepopulate_bars(struct hv_pcibus *hbus)
 {
 	struct hv_pci_dev *hpdev;
-	int i;
+	struct resource *res;
+	uint64_t base, size, mask;
+	uint32_t probed, bar_val, cmd;
+	bool is64, all_assigned;
+	int i, rid, flags;
 
 	mtx_lock(&hbus->device_list_lock);
 	TAILQ_FOREACH(hpdev, &hbus->children, link) {
-		for (i = 0; i < 6; i++) {
+		for (i = 0; i < MAX_NUM_BARS; i++) {
 			/* Ignore empty bar */
 			if (hpdev->probed_bar[i] == 0)
 				continue;
 
-			uint32_t bar_val = 0;
-
+			bar_val = 0;
 			_hv_pcifront_read_config(hpdev, PCIR_BAR(i),
 			    4, &bar_val);
 
@@ -1434,6 +1437,89 @@ vmbus_pcib_prepopulate_bars(struct hv_pcibus *hbus)
 				_hv_pcifront_write_config(hpdev, PCIR_BAR(i),
 				    4, bar_val);
 			}
+		}
+
+		/*
+		 * Then give every memory BAR an address, as firmware and
+		 * Linux's prepopulate_bars() do.  Hyper-V does not map the
+		 * BARs of a device whose memory decoding is enabled while
+		 * one of its BARs is still 0, and FreeBSD assigns BARs
+		 * lazily, when a driver allocates them: a BAR that no driver
+		 * uses (e.g. the 8 GB shared memory window of the WSLg
+		 * virtio-fs device, which virtio_pci never maps) stayed 0,
+		 * decoding was never enabled, the driver read all ones and
+		 * virtio's reset loop spun forever.  Each range is reserved
+		 * from our parent only to pick a free, aligned address, then
+		 * released: pci_add_map() finds the BAR programmed and
+		 * decoding enabled, and reserves exactly that range.
+		 */
+		all_assigned = true;
+		rid = 0x100;
+		for (i = 0; i < MAX_NUM_BARS; i++) {
+			probed = hpdev->probed_bar[i];
+			if (probed == 0 ||
+			    (probed & PCIM_BAR_SPACE) != PCIM_BAR_MEM_SPACE)
+				continue;
+			is64 = (probed & PCIM_BAR_MEM_TYPE) == PCIM_BAR_MEM_64 &&
+			    i + 1 < MAX_NUM_BARS;
+			mask = probed & PCIM_BAR_MEM_BASE;
+			mask |= is64 ? (uint64_t)hpdev->probed_bar[i + 1] << 32 :
+			    0xffffffff00000000ULL;
+			size = ~mask + 1;
+
+			bar_val = 0;
+			_hv_pcifront_read_config(hpdev, PCIR_BAR(i), 4,
+			    &bar_val);
+			base = bar_val & PCIM_BAR_MEM_BASE;
+			if (is64) {
+				bar_val = 0;
+				_hv_pcifront_read_config(hpdev, PCIR_BAR(i + 1),
+				    4, &bar_val);
+				base |= (uint64_t)bar_val << 32;
+			}
+			if (base != 0 || size == 0 || (size & (size - 1)) != 0) {
+				if (is64)
+					i++;
+				continue;
+			}
+
+			flags = RF_ALIGNMENT_LOG2(flsll(size) - 1);
+			if (probed & PCIM_BAR_MEM_PREFETCH)
+				flags |= RF_PREFETCHABLE;
+			res = bus_alloc_resource(hbus->pcib, SYS_RES_MEMORY,
+			    &rid, 0, is64 ? ~0 : 0xffffffff, size, flags);
+			if (res == NULL) {
+				device_printf(hbus->pcib, "no room for BAR %d "
+				    "(%#jx bytes) of device slot %#x\n", i,
+				    (uintmax_t)size, hpdev->desc.wslot.val);
+				all_assigned = false;
+				if (is64)
+					i++;
+				continue;
+			}
+			base = rman_get_start(res);
+			bus_release_resource(hbus->pcib, SYS_RES_MEMORY, rid,
+			    res);
+			rid++;
+
+			_hv_pcifront_write_config(hpdev, PCIR_BAR(i), 4,
+			    (uint32_t)base);
+			if (is64)
+				_hv_pcifront_write_config(hpdev,
+				    PCIR_BAR(i + 1), 4, (uint32_t)(base >> 32));
+			if (bootverbose)
+				device_printf(hbus->pcib, "BAR %d of device slot %#x "
+				    "at %#jx (%#jx bytes)\n", i,
+				    hpdev->desc.wslot.val, (uintmax_t)base,
+				    (uintmax_t)size);
+			if (is64)
+				i++;
+		}
+		if (all_assigned) {
+			cmd = 0;
+			_hv_pcifront_read_config(hpdev, PCIR_COMMAND, 2, &cmd);
+			_hv_pcifront_write_config(hpdev, PCIR_COMMAND, 2,
+			    cmd | PCIM_CMD_MEMEN);
 		}
 	}
 	mtx_unlock(&hbus->device_list_lock);
