@@ -37,6 +37,7 @@
 #include <sys/rwlock.h>
 #include <sys/sglist.h>
 #include <sys/sx.h>
+#include <sys/sysctl.h>
 #include <sys/vmem.h>
 
 #include <vm/vm.h>
@@ -75,6 +76,19 @@ static struct {
 	uint64_t	unique;
 	struct mtx	req_mtx;	/* request completion */
 } wshm;
+
+/* What the share holds right now, and what went wrong (under wshm.lock). */
+static SYSCTL_NODE(_hw, OID_AUTO, wslgshm, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "WSLg shared memory");
+static uint64_t wshm_created, wshm_destroyed, wshm_inuse, wshm_errors;
+SYSCTL_U64(_hw_wslgshm, OID_AUTO, created, CTLFLAG_RD, &wshm_created, 0,
+    "Buffers created and mapped");
+SYSCTL_U64(_hw_wslgshm, OID_AUTO, destroyed, CTLFLAG_RD, &wshm_destroyed, 0,
+    "Buffers unmapped");
+SYSCTL_U64(_hw_wslgshm, OID_AUTO, inuse, CTLFLAG_RD, &wshm_inuse, 0,
+    "Bytes of the window in use");
+SYSCTL_U64(_hw_wslgshm, OID_AUTO, errors, CTLFLAG_RD, &wshm_errors, 0,
+    "Failed requests to the virtio-fs server");
 
 #define	WSHM_IN_MAX		128	/* largest request arguments */
 #define	WSHM_OUT_MAX		256	/* largest reply arguments */
@@ -317,12 +331,17 @@ wshm_destroy(struct wshm_buf *b)
 		rone.len = b->mlen;
 		error = wshm_request(FUSE_REMOVEMAPPING, b->nodeid, &rin,
 		    sizeof(rin), &rone, sizeof(rone), NULL, 0);
-		if (error != 0)
+		if (error != 0) {
 			printf("wslgshm: REMOVEMAPPING %s: %d\n", b->name,
 			    error);
+			wshm_errors++;
+		}
 		/* Only reuse the range if the host let it go. */
-		if (error == 0)
+		if (error == 0) {
 			vmem_xfree(wshm.arena, b->moffset, b->mlen);
+			wshm_inuse -= b->mlen;
+		}
+		wshm_destroyed++;
 		b->mapped = false;
 	}
 	if (b->created) {
@@ -385,6 +404,7 @@ wshm_create(struct wshm_buf *b, struct wslgshm_create *c)
 	    b->name, namelen + 1, &cout, sizeof(cout));
 	if (error != 0) {
 		printf("wslgshm: CREATE %s: %d\n", b->name, error);
+		wshm_errors++;
 		return (error);
 	}
 	b->nodeid = cout.entry.nodeid;
@@ -412,6 +432,7 @@ wshm_create(struct wshm_buf *b, struct wslgshm_create *c)
 	}
 	if (error != 0) {
 		printf("wslgshm: size of %s: %d\n", b->name, error);
+		wshm_errors++;
 		wshm_destroy(b);
 		return (error);
 	}
@@ -421,6 +442,7 @@ wshm_create(struct wshm_buf *b, struct wslgshm_create *c)
 	if (error != 0) {
 		printf("wslgshm: window full (%ju bytes for %s)\n",
 		    (uintmax_t)b->mlen, b->name);
+		wshm_errors++;
 		wshm_destroy(b);
 		return (ENOMEM);
 	}
@@ -436,11 +458,14 @@ wshm_create(struct wshm_buf *b, struct wslgshm_create *c)
 	    NULL, 0, NULL, 0);
 	if (error != 0) {
 		printf("wslgshm: SETUPMAPPING %s: %d\n", b->name, error);
+		wshm_errors++;
 		vmem_xfree(wshm.arena, b->moffset, b->mlen);
 		wshm_destroy(b);
 		return (error);
 	}
 	b->mapped = true;
+	wshm_created++;
+	wshm_inuse += b->mlen;
 	c->window_offset = b->moffset;
 	return (0);
 }
