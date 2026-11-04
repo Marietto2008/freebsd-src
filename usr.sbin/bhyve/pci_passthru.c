@@ -383,8 +383,17 @@ cfginitcaps(struct passthru_softc *sc)
 	 * the MSI-X cap at 0xC8 disconnected from the standard cap chain.
 	 * Scan the full config space for it if not found via chain walk.
 	 * DISABLED for testing: use MSI-only mode (Corvin's approach).
+	 *
+	 * claude 04/11/2026, SOLO DIAGNOSTICA (parere Opus WSL2-FreeBSD 005
+	 * §4.2): con BHYVE_PASSTHRU_NO_ORPHAN_MSIX nell'ambiente la MSI-X
+	 * orfana non si cerca ne' si collega, e l'ospite usa l'MSI visibile.
 	 */
-	if (sc->psc_msix.capoff == 0) {
+	if (sc->psc_msix.capoff == 0 &&
+	    getenv("BHYVE_PASSTHRU_NO_ORPHAN_MSIX") != NULL)
+		warnx("passthru: MSI-X orfana NON collegata per %d/%d/%d "
+		    "(BHYVE_PASSTHRU_NO_ORPHAN_MSIX)", sel.pc_bus, sel.pc_dev,
+		    sel.pc_func);
+	else if (sc->psc_msix.capoff == 0) {
 		int scan, cap_id;
 		for (scan = 0x40; scan <= 0xF0; scan += 4) {
 			cap_id = passthru_read_config(&sel, scan, 1);
