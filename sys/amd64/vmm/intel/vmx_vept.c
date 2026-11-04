@@ -24,6 +24,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/sdt.h>
@@ -129,6 +130,8 @@ VEPT_CTR(vept_keep_shadow_flushes,
 VEPT_CTR(vept_keep_walk_zaps, "B1: voci cambiate viste da un walk");
 VEPT_CTR(vept_keep_verify_checked, "B1: foglie riverificate");
 VEPT_CTR(vept_keep_verify_mismatch, "B1: foglie riverificate DISCORDANTI");
+VEPT_CTR(vept_ram_pat_ept12,
+    "foglie RAM dell'EPT02 con memtype/IPAT presi dall'EPT12 (PAT dell'L2 rispettata)");
 VEPT_CTR(vept_mmio_faulted_in,
     "BAR in passthrough portate nell'EPT01 da un fault dell'L2 (vm_fault)");
 VEPT_CTR(vept_memgen_changes_detected,
@@ -1776,7 +1779,9 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 			if (mt == 2 || mt == 3 || mt == 7)
 				return (VEPT_MISCONF);	/* tipo riservato */
 			*l1gpa = (EPT_ADDR(pte) & ~mask) | (l2gpa & mask);
-			*perm = acc & EPT_RWX;
+			/* bit 0-2 permessi; bit 3-6 memtype e IPAT della foglia
+			 * (VEPT_PERM_ATTR): ogni consumatore maschera con EPT_RWX */
+			*perm = (acc & EPT_RWX) | (pte & VEPT_PERM_ATTR);
 			return (VEPT_OK);
 		}
 		tbl_gpa = EPT_ADDR(pte);
@@ -1787,7 +1792,7 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 /* Installa una foglia shadow 4K: l2gpa -> hpa con permessi e memtype WB. */
 static int
 vept_install(struct vmx_nested *n, struct vept_kslot *k, uint64_t l2gpa,
-    uint64_t hpa, uint64_t perm, int mt)
+    uint64_t hpa, uint64_t perm, uint64_t attr)
 {
 	uint64_t *tbl = n->vept_root;
 	int level, idx;
@@ -1807,8 +1812,7 @@ vept_install(struct vmx_nested *n, struct vept_kslot *k, uint64_t l2gpa,
 			vept_vs_note(k, l2gpa);	/* candidati della verifica */
 	} else
 		n->st_vept[VST_F_REINSTALL]++;	/* parere #39 §5 */
-	tbl[idx] = (hpa & ~0xfffULL) | (perm & EPT_RWX) |
-	    EPT_PG_MEMORY_TYPE(mt) | EPT_PG_IGNORE_PAT;
+	tbl[idx] = (hpa & ~0xfffULL) | (perm & EPT_RWX) | (attr & VEPT_PERM_ATTR);
 	return (0);
 }
 
@@ -1822,6 +1826,39 @@ vept_cur_slot(struct vmx_nested *n)
 		if (n->vept_slot[i].root == n->vept_root)
 			return (i);
 	panic("%s: radice corrente %p senza slot", __func__, n->vept_root);
+}
+
+/*
+ * Tipo di memoria della foglia RAM dell'EPT02 = composizione EPT12 -> EPT01,
+ * come la farebbe l'hardware. L'EPT01 per la RAM e' WB; con
+ * vm.pmap.ept_ipat=1 (predefinito) ha anche IPAT e forza WB su tutto, e
+ * allora lo forza anche l'EPT02. Con ept_ipat=0 (questo host: VT-d senza
+ * snoop control, GPU in passthrough) l'EPT01 rispetta la PAT dell'ospite e a
+ * decidere e' la foglia dell'EPT12 (memtype e IPAT dell'L1): la PAT dell'L2
+ * si applica come sul ferro. Prima l'EPT02 forzava sempre WB+IPAT: la radice
+ * di Hyper-V vedeva WB i suoi buffer DMA UC/WC non coerenti, e la RTX 2080 Ti
+ * dava codice 43 senza un solo interrupt (04/11/2026, parere Opus 004 §2.2).
+ * ept_ipat e' un tunable in sola lettura: si legge una volta.
+ */
+static int vept_l0_ipat = -1;
+
+static uint64_t
+vept_ram_attr(uint64_t perm)
+{
+	size_t len;
+	int v;
+
+	if (vept_l0_ipat < 0) {
+		len = sizeof(v);
+		if (kernel_sysctlbyname(curthread, "vm.pmap.ept_ipat", &v, &len,
+		    NULL, 0, NULL, 0) != 0)
+			v = 1;
+		vept_l0_ipat = v != 0;
+	}
+	if (vept_l0_ipat)
+		return (EPT_PG_MEMORY_TYPE(6) | EPT_PG_IGNORE_PAT);
+	atomic_add_long(&vept_ram_pat_ept12, 1);
+	return (perm & VEPT_PERM_ATTR);
 }
 
 /*
@@ -1917,7 +1954,7 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		if (n->vept_keep && !vm_mem_wired(vcpu->vmx->vm,
 		    *l1gpa & ~(uint64_t)PAGE_MASK))
 			k->nokeep = true;
-		vept_install(n, k, l2gpa, hpa, *perm, 6);	/* RAM: WB */
+		vept_install(n, k, l2gpa, hpa, *perm, vept_ram_attr(*perm));
 		return (VEPT_OK);
 	}
 	/* Non RAM. Se l'EPT01 mappa l'L1-GPA (BAR di un dispositivo in
@@ -1938,6 +1975,8 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		 * farebbe l'L1; se l'indirizzo non e' nella mappa (dispositivo
 		 * davvero emulato dall'L0) fallisce e si emula come prima.
 		 */
+		WITNESS_WARN(WARN_GIANTOK | WARN_SLEEPOK, NULL,
+		    "vmx_vept_fault: vm_fault su una BAR in passthrough");
 		if (vm_fault(&vm_vmspace(vcpu->vmx->vm)->vm_map,
 		    trunc_page(*l1gpa), (qual & 0x2) != 0 ? VM_PROT_WRITE :
 		    VM_PROT_READ, VM_FAULT_NORMAL, NULL) == KERN_SUCCESS) {
@@ -1949,7 +1988,11 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	if (hpa != 0) {
 		k->nokeep = true;		/* B1: MMIO mai conservata */
 		n->st_vept[VST_F_MMIO]++;
-		vept_install(n, k, l2gpa, hpa, *perm, 0);	/* MMIO: UC */
+		/* MMIO: UC come l'EPT01 (VM_MEMATTR_UNCACHEABLE); al massimo RW:
+		 * l'EPT01 non concede X sulla memoria di un dispositivo (parere
+		 * Opus 004 §1.3) */
+		vept_install(n, k, l2gpa, hpa, *perm & (EPT_PG_READ | EPT_PG_WRITE),
+		    EPT_PG_MEMORY_TYPE(0) | EPT_PG_IGNORE_PAT);
 		return (VEPT_OK);
 	}
 	n->st_vept[VST_F_EMUL]++;

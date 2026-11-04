@@ -130,6 +130,8 @@ extern u_long nested_sh_entry_after_fault;
 #define	VEPT_VIOL	1	/* EPT violation da riflettere all'L1 */
 #define	VEPT_MISCONF	2	/* EPT misconfiguration da riflettere all'L1 */
 #define	VEPT_MMIO	3	/* MMIO dell'L1: emulazione in L0 */
+/* bit 3-6 di una voce EPT (memtype, IPAT), portati da ept12_translate in *perm */
+#define	VEPT_PERM_ATTR	(EPT_PG_MEMORY_TYPE(7) | EPT_PG_IGNORE_PAT)
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	    uint64_t *l1gpa, uint64_t *perm);			/* slow path */
 uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
