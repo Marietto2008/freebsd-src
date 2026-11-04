@@ -2148,6 +2148,64 @@ vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa)
 }
 
 /*
+ * WSL2-FreeBSD 003, diagpf2: walk dell'indirizzo lineare gla dell'L2 (CR3
+ * cr3, paginazione a 4 livelli) visto in due modi, per ogni tabella e per la
+ * pagina finale: (a) come lo vede l'L1, cioe' EPT12 letto VIVO + pagina host
+ * di vm_gpa_hold; (b) come lo vede l'hardware, cioe' la foglia dell'EPT02
+ * ombra della radice corrente. La PTE si legge da entrambe le pagine host.
+ * Si segue il cammino (a). Solo dallo slow path (vm_gpa_hold puo' dormire),
+ * con la radice ombra gia' allineata all'EPTP12 del VMCS12 (vmx_vept_prepare).
+ */
+void
+vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
+    uint64_t gla, const char *tag)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t tgpa, l1, perm, sh, exp, pte_e, pte_s, *p, m;
+	void *ck;
+	int lvl, r, idx;
+
+	tgpa = cr3 & 0x000ffffffffff000ULL;
+	for (lvl = 3; lvl >= -1; lvl--) {
+		idx = lvl >= 0 ? (int)((gla >> (12 + 9 * lvl)) & 0x1ff) : 0;
+		l1 = perm = 0;
+		r = ept12_translate(vcpu, eptp12, tgpa, &l1, &perm, NULL);
+		sh = n->vept_root != NULL ? vept_leaf_get(n->vept_root, tgpa) : 0;
+		exp = pte_e = pte_s = 0;
+		if (r == VEPT_OK && (p = vm_gpa_hold(vcpu->vcpu,
+		    l1 & ~(uint64_t)PAGE_MASK, PAGE_SIZE, VM_PROT_READ,
+		    &ck)) != NULL) {
+			exp = DMAP_TO_PHYS((vm_offset_t)p);
+			if (lvl >= 0)
+				pte_e = atomic_load_64(&p[idx]);
+			vm_gpa_release(ck);
+		}
+		if ((sh & EPT_RWX) != 0 && lvl >= 0)
+			pte_s = atomic_load_64(&((uint64_t *)PHYS_TO_DMAP(
+			    EPT_ADDR(sh)))[idx]);
+		printf("nested_diag_pfinj   %s %s l2gpa=%#lx | EPT12 viva r=%d "
+		    "l1gpa=%#lx perm=%#lx hpa=%#lx | ombra=%#lx%s | pte vera=%#lx "
+		    "ombra=%#lx%s\n", tag, lvl >= 0 ? (lvl == 3 ? "PML4" :
+		    lvl == 2 ? "PDPT" : lvl == 1 ? "PD  " : "PT  ") : "PAG ",
+		    (u_long)tgpa, r, (u_long)l1, (u_long)perm, (u_long)exp,
+		    (u_long)sh, ((sh & EPT_RWX) != 0 && EPT_ADDR(sh) != exp) ?
+		    " <-- HPA DIVERSO" : ((sh & EPT_RWX) == 0 ? " (assente)" : ""),
+		    (u_long)pte_e, (u_long)pte_s, ((sh & EPT_RWX) != 0 &&
+		    lvl >= 0 && pte_s != pte_e) ? " <-- PTE DIVERSA" : "");
+		if (lvl < 0 || r != VEPT_OK || (pte_e & 1) == 0)
+			return;
+		if (lvl > 0 && (pte_e & 0x80) != 0) {
+			m = (1ULL << (12 + 9 * lvl)) - 1;
+			tgpa = ((pte_e & 0x000ffffffffff000ULL & ~m) |
+			    (gla & m)) & ~(uint64_t)PAGE_MASK;
+			lvl = 0;		/* prossimo giro: la pagina finale */
+			continue;
+		}
+		tgpa = pte_e & 0x000ffffffffff000ULL;
+	}
+}
+
+/*
  * B1, generazione dei mapping di L0 (parere #28 §4, §6). Una foglia shadow
  * contiene l'HPA preso da vm_gpa_hold: con la radice conservata a lungo, un
  * mapping tolto o rifatto la renderebbe falsa. La generazione cambia solo con

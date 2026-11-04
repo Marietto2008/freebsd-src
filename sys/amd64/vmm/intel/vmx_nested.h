@@ -133,6 +133,8 @@ extern u_long nested_sh_entry_after_fault;
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	    uint64_t *l1gpa, uint64_t *perm);			/* slow path */
 uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
+void	vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
+	    uint64_t gla, const char *tag);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
 	    uint64_t *out);
 int	vmx_vept_l1gpa_emul(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,

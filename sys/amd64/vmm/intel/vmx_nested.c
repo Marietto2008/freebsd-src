@@ -74,7 +74,9 @@ static int	nested_vpid_track;
 static int	nested_vpid_test_off;
 static u_long	vpid02_off_vcpus;
 static int	nested_vpid_d4_arm;
-static void	nested_diag_pf_arm(struct vmx_vcpu *vcpu);	/* WSL2-FreeBSD 003 */
+static void	nested_diag_pf_arm(struct vmx_vcpu *vcpu);
+static void	nested_diag_pfinj_note(struct vmx_vcpu *vcpu,
+		    struct vmcs12_cache *c);	/* WSL2-FreeBSD 003 */
 static u_long	nested_vpid_d4_injected;
 static void	nested_field_tab_build(void);
 static int	shv_global_init(void);
@@ -279,6 +281,21 @@ NESTED_CTR(nested_diag_pf_l1_exits,
     "nested: uscite #PF dell'L2 chieste dal VMCS12 (riflesse all'L1)");
 NESTED_CTR(nested_diag_pf_skipped,
     "nested: armamenti saltati perche' il VMCS12 intercetta gia' i #PF");
+/*
+ * diagpf2: con nested_diag_pfinj=1, a ogni ingresso in L2 in cui l'L1 chiede
+ * nel VMCS12 di iniettare un #PF (vettore 14, eccezione hardware), si contano;
+ * se il codice d'errore ha il bit I (fetch) si stampano i campi d'uscita che
+ * l'L1 ha letto dall'uscita precedente e il walk di CR2 e dell'RIP dell'L2,
+ * EPT12 viva contro EPT02 ombra. Costo sul percorso normale: una lettura del
+ * VMCS12 software. Nessun effetto sull'ingresso. Spento di default.
+ */
+static int nested_diag_pfinj = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag_pfinj, CTLFLAG_RWTUN,
+    &nested_diag_pfinj, 0,
+    "nested: registra i #PF iniettati dall'L1 nell'L2 (WSL2-FreeBSD 003)");
+NESTED_CTR(nested_diag_pfinj_all, "nested: #PF iniettati dall'L1 nell'L2");
+NESTED_CTR(nested_diag_pfinj_fetch,
+    "nested: di questi, con il bit I (fetch) nel codice d'errore");
 NESTED_CTR(nested_ept12_misconf_emul_reflected,
     "nested: EPT misconfiguration trovate dall'emulatore riflesse (H2)");
 NESTED_CTR(nested_l2_entries, "nested: ingressi in L2");
@@ -2837,6 +2854,9 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	if (vmcs12_proc2(c) &
 	    PROCBASED2_ENABLE_EPT)
 		vmx_vept_prepare(vcpu);
+	/* diagpf2: #PF iniettato dall'L1 (qui si puo' dormire: vm_gpa_hold) */
+	if (__predict_false(nested_diag_pfinj != 0))
+		nested_diag_pfinj_note(vcpu, c);
 
 	VMPTRLD(vmcs02);
 	nested_compose_vmcs02(vcpu);
@@ -4797,6 +4817,59 @@ nested_diag_pf_arm(struct vmx_vcpu *vcpu)
  * (tabella dell'L2 tradotta con EPT12, la vista dell'L1) contro quella a cui
  * punta l'EPT02 OMBRA (quella che ha letto il processore). Prime 32 volte.
  */
+static void
+nested_diag_pfinj_note(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	uint32_t info, err;
+	uint64_t cr2, rip, cr3, eptp12;
+	static int printed;
+
+	info = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO);
+	if ((info & 0x800007ff) != 0x8000030e)
+		return;
+	atomic_add_long(&nested_diag_pfinj_all, 1);
+	err = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_EXCEPTION_ERROR);
+	if ((err & PGEX_I) == 0)
+		return;
+	atomic_add_long(&nested_diag_pfinj_fetch, 1);
+	if (printed >= 16)
+		return;
+	printed++;
+	cr2 = vcpu->ctx.guest_cr2;	/* il CR2 che l'L1 ha preparato per l'L2 */
+	rip = vmcs12_read_field(c, VMCS_GUEST_RIP);
+	cr3 = vmcs12_read_field(c, VMCS_GUEST_CR3);
+	eptp12 = vmcs12_read_field(c, VMCS_EPTP);
+	printf("nested_diag_pfinj #%d vcpu%d err=%#x cr2=%#lx | L2: rip=%#lx "
+	    "cr3=%#lx cr0=%#lx cr4=%#lx efer=%#lx rfl=%#lx intr=%#lx act=%#lx "
+	    "eptp12=%#lx\n", printed, vcpu->vcpuid, err, (u_long)cr2,
+	    (u_long)rip, (u_long)cr3,
+	    (u_long)vmcs12_read_field(c, VMCS_GUEST_CR0),
+	    (u_long)vmcs12_read_field(c, VMCS_GUEST_CR4),
+	    (u_long)vmcs12_read_field(c, VMCS_GUEST_IA32_EFER),
+	    (u_long)vmcs12_read_field(c, VMCS_GUEST_RFLAGS),
+	    (u_long)vmcs12_read_field(c, VMCS_GUEST_INTERRUPTIBILITY),
+	    (u_long)vmcs12_read_field(c, VMCS_GUEST_ACTIVITY), (u_long)eptp12);
+	printf("nested_diag_pfinj #%d   uscita riflessa prima: motivo=%#lx "
+	    "qual=%#lx gpa=%#lx gla=%#lx idtv=%#lx/%#lx exit_intr=%#lx/%#lx "
+	    "ilen=%#lx\n", printed,
+	    (u_long)vmcs12_read_field(c, VMCS_EXIT_REASON),
+	    (u_long)vmcs12_read_field(c, VMCS_EXIT_QUALIFICATION),
+	    (u_long)vmcs12_read_field(c, VMCS_GUEST_PHYSICAL_ADDRESS),
+	    (u_long)vmcs12_read_field(c, VMCS_GUEST_LINEAR_ADDRESS),
+	    (u_long)vmcs12_read_field(c, VMCS_IDT_VECTORING_INFO),
+	    (u_long)vmcs12_read_field(c, VMCS_IDT_VECTORING_ERROR),
+	    (u_long)vmcs12_read_field(c, VMCS_EXIT_INTR_INFO),
+	    (u_long)vmcs12_read_field(c, VMCS_EXIT_INTR_ERRCODE),
+	    (u_long)vmcs12_read_field(c, VMCS_EXIT_INSTRUCTION_LENGTH));
+	if ((vmcs12_proc2(c) & PROCBASED2_ENABLE_EPT) == 0 ||
+	    (vmcs12_read_field(c, VMCS_GUEST_IA32_EFER) & EFER_LMA) == 0 ||
+	    (vmcs12_read_field(c, VMCS_GUEST_CR4) & CR4_LA57) != 0)
+		return;
+	vmx_vept_diag_walk(vcpu, eptp12, cr3, cr2, "cr2");
+	if ((rip & ~(uint64_t)PAGE_MASK) != (cr2 & ~(uint64_t)PAGE_MASK))
+		vmx_vept_diag_walk(vcpu, eptp12, cr3, rip, "rip");
+}
+
 static void
 nested_diag_pf_walk(struct vmx_vcpu *vcpu)
 {
