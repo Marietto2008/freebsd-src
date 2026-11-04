@@ -4,3 +4,5 @@ include GENERIC
 ident	CLAUDE-WSL
 options 	DDB
 options 	ALT_BREAK_TO_DEBUGGER
+# Memoria condivisa di WSLg (VAIL): il file system virtio "wslg" mappato in DAX, /dev/wslgshm.
+device		wslgshm
