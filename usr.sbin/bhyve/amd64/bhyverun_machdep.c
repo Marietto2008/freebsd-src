@@ -315,6 +315,14 @@ bhyve_init_vcpu(struct vcpu *vcpu)
 
 	err = vm_set_capability(vcpu, VM_CAP_IPI_EXIT, 1);
 	assert(err == 0);
+
+	if (get_config_bool_default("x86.nested_virt", false)) {
+		err = vm_set_capability(vcpu, VM_CAP_NESTED_VIRT, 1);
+		if (err) {
+			EPRINTLN("nested virtualization (x86.nested_virt) not supported");
+			exit(BHYVE_EXIT_ERROR);
+		}
+	}
 }
 
 void
