@@ -610,6 +610,7 @@ struct vmx_nested {
 	uint64_t	diag_invept_eptp;
 	/* parere di Astra 010: episodio E0/E1 in corso su questo vCPU */
 	struct nested_pfrec pfst;
+	bool		pfrec_building;	/* E0 fatto, manca E1 (in questa uscita) */
 	bool		pfrec_armed;	/* E0+E1 fatti, si attende l'ingresso */
 	uint64_t	pfrec_seq;
 };

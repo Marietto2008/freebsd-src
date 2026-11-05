@@ -79,7 +79,8 @@ static int	nested_vpid_d4_arm;
 static void	nested_diag_pf_arm(struct vmx_vcpu *vcpu);
 static void	nested_diag_pfrec_entry(struct vmx_vcpu *vcpu,
 		    struct vmcs12_cache *c);
-static void	nested_diag_pfrec_e0e1(struct vmx_vcpu *vcpu);
+static void	nested_pfrec_cap_e0(struct vmx_vcpu *vcpu);
+static void	nested_pfrec_cap_e1(struct vmx_vcpu *vcpu);
 static void	nested_diag_pfinj_note(struct vmx_vcpu *vcpu,
 		    struct vmcs12_cache *c);	/* WSL2-FreeBSD 003 */
 static u_long	nested_vpid_d4_injected;
@@ -4959,41 +4960,53 @@ nested_pfrec_gpr(struct vmx_vcpu *vcpu, uint64_t *g)
  * record in corso del vCPU e lo arma per l'ingresso successivo.
  */
 static void
-nested_diag_pfrec_e0e1(struct vmx_vcpu *vcpu)
+nested_pfrec_cap_e0(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct nested_pfrec *p = &n->pfst;
 	struct vmcs12_cache *c = nested_current_cache(n);
-	uint64_t rip, eptp12, cr3;
+	uint64_t rip;
 
-	rip = vmcs_read(VMCS_GUEST_RIP);	/* RIP dell'L2 (VMCS02) */
+	rip = vmcs_read(VMCS_GUEST_RIP);	/* RIP dell'L2 (VMCS02, prima della riflessione) */
+	n->pfrec_building = false;
 	if (nested_diag_pfrec_rippage != 0 &&
 	    (rip & ~(uint64_t)PAGE_MASK) != nested_diag_pfrec_rippage)
 		return;
-	eptp12 = c != NULL ? vmcs12_read_field(c, VMCS_EPTP) : 0;
-	cr3 = vmcs_read(VMCS_GUEST_CR3);
 	memset(p, 0, sizeof(*p));
 	p->vcpu = vcpu->vcpuid;
 	p->seq = ++n->pfrec_seq;
 	p->t0 = rdtsc();
 	p->rip0 = rip;
-	p->cr3_0 = cr3;
+	p->cr3_0 = vmcs_read(VMCS_GUEST_CR3);
 	p->gpa0 = n->ept_gpa;
 	p->gla0 = vmcs_read(VMCS_GUEST_LINEAR_ADDRESS);
 	p->qual0 = n->ept_qual;
 	nested_pfrec_gpr(vcpu, p->gpr0);
-	vmx_vept_diag_code(vcpu, eptp12, cr3, rip, &p->c0);
-	/* E1: lo stato dell'L2 ora nel VMCS12 (quello che l'L1 rilegge) */
+	/* eptp12 conservato nel record per il walk in E1 (vm_gpa_hold puo' dormire) */
+	p->c0.l2gpa = c != NULL ? vmcs12_read_field(c, VMCS_EPTP) : 0;
+	n->pfrec_building = true;
+}
+
+static void
+nested_pfrec_cap_e1(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct nested_pfrec *p = &n->pfst;
+	struct vmcs12_cache *c = nested_current_cache(n);
+	uint64_t eptp12 = p->c0.l2gpa;	/* salvato in E0 */
+
+	n->pfrec_building = false;
+	p->t1 = rdtsc();
 	if (c != NULL) {
-		p->t1 = rdtsc();
 		p->rip1 = vmcs12_read_field(c, VMCS_GUEST_RIP);
 		p->gpa1 = vmcs12_read_field(c, VMCS_GUEST_PHYSICAL_ADDRESS);
 		p->gla1 = vmcs12_read_field(c, VMCS_GUEST_LINEAR_ADDRESS);
 		p->qual1 = vmcs12_read_field(c, VMCS_EXIT_QUALIFICATION);
 		p->reason1 = vmcs12_read_field(c, VMCS_EXIT_REASON);
 	}
-	/* i GPR non cambiano nella riflessione: E1 = E0 */
-	memcpy(p->gpr1, p->gpr0, sizeof(p->gpr1));
+	memcpy(p->gpr1, p->gpr0, sizeof(p->gpr1));	/* i GPR non cambiano */
+	/* walk del codice all'RIP dell'L2: byte dalla pagina dell'L1 e dall'EPT02 */
+	vmx_vept_diag_code(vcpu, eptp12, p->cr3_0, p->rip0, &p->c0);
 	atomic_add_long(&nested_diag_pfrec_e0, 1);
 	n->pfrec_armed = true;
 }
@@ -5248,20 +5261,23 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 	if (__predict_false(vmx_nested_probe == 9))
 		nested_probe_walk(vcpu, r, l1gpa, perm);
 	VMPTRLD(vcpu->vmcs);			/* il VMCS02 */
+	/*
+	 * Parere di Astra 010 §4: E0, lo stato dell'L2 all'uscita MMIO sul LAPIC,
+	 * PRIMA della riflessione (dopo, GUEST_RIP del VMCS02 e' gia' quello
+	 * dell'L1). Solo per una scrittura sulla pagina del LAPIC e con l'RIP
+	 * dell'L2 nella pagina sorvegliata.
+	 */
+	if (__predict_false(nested_diag_pfrec != 0) && (n->ept_qual & 0x2) != 0 &&
+	    (n->ept_gpa & ~0xfffUL) == 0xfee00000UL)
+		nested_pfrec_cap_e0(vcpu);
 	vmexit->u.vmx.exit_reason = (r == VEPT_MISCONF) ?
 	    EXIT_REASON_EPT_MISCONFIG : EXIT_REASON_EPT_FAULT;
 	n->slow_reflect = true;
 	nested_reflect_to_l1(vcpu, vmexit);
 	n->slow_reflect = false;
-	/*
-	 * Parere di Astra 010 §4: E0 (stato dell'L2 all'uscita MMIO sul LAPIC,
-	 * VMCS02 ancora caricato) ed E1 (stato appena consegnato all'L1 nel
-	 * VMCS12). Solo per una scrittura sulla pagina del LAPIC e con l'RIP
-	 * dell'L2 nella pagina sorvegliata. Arma l'episodio per l'ingresso.
-	 */
-	if (__predict_false(nested_diag_pfrec != 0) && (n->ept_qual & 0x2) != 0 &&
-	    (n->ept_gpa & ~0xfffUL) == 0xfee00000UL)
-		nested_diag_pfrec_e0e1(vcpu);
+	/* E1: lo stesso stato ora nel VMCS12, piu' il walk del codice; arma */
+	if (__predict_false(nested_diag_pfrec != 0) && n->pfrec_building)
+		nested_pfrec_cap_e1(vcpu);
 	c = nested_current_cache(n);
 	if (c != NULL)
 		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION,
