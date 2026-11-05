@@ -2257,7 +2257,7 @@ vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa)
  * Si segue il cammino (a). Solo dallo slow path (vm_gpa_hold puo' dormire),
  * con la radice ombra gia' allineata all'EPTP12 del VMCS12 (vmx_vept_prepare).
  */
-void
+uint64_t
 vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
     uint64_t gla, const char *tag)
 {
@@ -2293,8 +2293,10 @@ vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
 		    " <-- HPA DIVERSO" : ((sh & EPT_RWX) == 0 ? " (assente)" : ""),
 		    (u_long)pte_e, (u_long)pte_s, ((sh & EPT_RWX) != 0 &&
 		    lvl >= 0 && pte_s != pte_e) ? " <-- PTE DIVERSA" : "");
-		if (lvl < 0 || r != VEPT_OK || (pte_e & 1) == 0)
-			return;
+		if (lvl < 0)
+			return (tgpa);		/* L2-GPA della pagina finale */
+		if (r != VEPT_OK || (pte_e & 1) == 0)
+			return (0);
 		if (lvl > 0 && (pte_e & 0x80) != 0) {
 			m = (1ULL << (12 + 9 * lvl)) - 1;
 			tgpa = ((pte_e & 0x000ffffffffff000ULL & ~m) |
@@ -2304,6 +2306,59 @@ vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
 		}
 		tgpa = pte_e & 0x000ffffffffff000ULL;
 	}
+	return (0);
+}
+
+/*
+ * Parere Opus WSL2-FreeBSD 009 §1: per la pagina L2-GPA (quella del codice al
+ * #PF di fetch iniettato dall'L1), la tabella PT dell'EPT12 e la sua voce VIVA
+ * contro la FOTOGRAFIA della conservazione B1 (o "non tracciata"), con i flag
+ * della radice. Insieme all'ultimo INVEPT elaborato da questo vCPU separa
+ * (a) foglia sopravvissuta a un INVEPT da (b) finestra prima dell'INVEPT.
+ * Solo lettura, slow path (vm_gpa_hold puo' dormire).
+ */
+void
+vmx_vept_diag_keepstate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vept_obs *o;
+	struct vept_obs_ent *e = NULL;
+	struct vept_kslot *k;
+	uint64_t t, v = 0, *p;
+	void *ck;
+	int lvl, idx = 0, slot = -1, i;
+
+	for (i = 0; i < VEPT_NROOTS; i++)
+		if (n->vept_slot[i].root != NULL && (n->vept_slot[i].eptp12 &
+		    VEPT_EPTP_BASE) == (eptp12 & VEPT_EPTP_BASE))
+			slot = i;
+	t = eptp12 & VEPT_EPTP_BASE;
+	for (lvl = 3; lvl >= 0; lvl--) {
+		idx = (int)((l2gpa >> (12 + 9 * lvl)) & 0x1ff);
+		p = vm_gpa_hold(vcpu->vcpu, t, PAGE_SIZE, VM_PROT_READ, &ck);
+		if (p == NULL) {
+			printf("nested_diag_pfinj   keep: tabella EPT12 %#lx "
+			    "illeggibile\n", (u_long)t);
+			return;
+		}
+		v = atomic_load_64(&p[idx]);
+		vm_gpa_release(ck);
+		if (lvl == 0 || (v & EPT_RWX) == 0 || (v & EPT_PG_PS) != 0)
+			break;
+		t = EPT_ADDR(v);
+	}
+	o = slot >= 0 ? n->vept_obs[slot] : NULL;
+	if (o != NULL)
+		e = vept_obs_find(o, t);
+	k = slot >= 0 ? &n->vept_ks[slot] : NULL;
+	printf("nested_diag_pfinj   keep: slot=%d keep=%d force_full=%d nokeep=%d "
+	    "overflow=%d tracciate=%d | EPT12 lvl%d tab=%#lx[%d] viva=%#lx "
+	    "foto=%s%#lx%s\n", slot, n->vept_keep, k ? k->force_full : -1,
+	    k ? k->nokeep : -1, o ? o->overflow : -1, o ? o->n : -1, lvl,
+	    (u_long)t, idx, (u_long)v,
+	    e == NULL ? "NON TRACCIATA " : (e->ambiguous ? "ambigua " : ""),
+	    e != NULL ? (u_long)e->snap[idx] : 0UL,
+	    (e != NULL && e->snap[idx] != v) ? " <-- FOTO DIVERSA" : "");
 }
 
 /*

@@ -25,6 +25,7 @@
 #include <sys/sx.h>
 #include <sys/sysctl.h>
 
+#include <machine/clock.h>	/* tsc_freq: parere Opus 009 §1 */
 #include <machine/vmm.h>
 #include <machine/vmm_instruction_emul.h>
 #include <machine/cpufunc.h>
@@ -4611,6 +4612,10 @@ nested_invept(struct vmx_vcpu *vcpu)
 	}
 	t0 = sbinuptime();
 	wiped = vmx_vept_invept(vcpu, type, eptp, &kept);
+	n->diag_invept_seq++;		/* parere Opus 009 §1 */
+	n->diag_invept_tsc = rdtsc();
+	n->diag_invept_kept = kept;
+	n->diag_invept_wiped = wiped;
 	ns = (u_long)sbttons(sbinuptime() - t0);
 	atomic_add_long(&nested_invept_ns_sum, ns);
 	if (ns > nested_invept_ns_max)
@@ -4821,7 +4826,7 @@ static void
 nested_diag_pfinj_note(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 {
 	uint32_t info, err;
-	uint64_t cr2, rip, cr3, eptp12;
+	uint64_t cr2, rip, cr3, eptp12, pag;
 	static int printed;
 
 	info = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO);
@@ -4874,9 +4879,19 @@ nested_diag_pfinj_note(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	    (vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_GUEST_LMA) == 0 ||
 	    (vmcs12_read_field(c, VMCS_GUEST_CR4) & CR4_LA57) != 0)
 		return;
-	vmx_vept_diag_walk(vcpu, eptp12, cr3, cr2, "cr2");
+	pag = vmx_vept_diag_walk(vcpu, eptp12, cr3, cr2, "cr2");
 	if ((rip & ~(uint64_t)PAGE_MASK) != (cr2 & ~(uint64_t)PAGE_MASK))
-		vmx_vept_diag_walk(vcpu, eptp12, cr3, rip, "rip");
+		pag = vmx_vept_diag_walk(vcpu, eptp12, cr3, rip, "rip");
+	/* parere Opus 009 §1: ultimo INVEPT di questo vCPU e fotografia */
+	printf("nested_diag_pfinj #%d   ultimo INVEPT dell'L1 su vcpu%d: #%lu, "
+	    "%lu us fa (radici conservate=%d svuotate=%d)\n", printed,
+	    vcpu->vcpuid, (u_long)vcpu->nested->diag_invept_seq,
+	    vcpu->nested->diag_invept_tsc == 0 ? 0UL :
+	    (u_long)((rdtsc() - vcpu->nested->diag_invept_tsc) * 1000000 /
+	    tsc_freq), vcpu->nested->diag_invept_kept,
+	    vcpu->nested->diag_invept_wiped);
+	if (pag != 0)
+		vmx_vept_diag_keepstate(vcpu, eptp12, pag);
 }
 
 static void

@@ -135,7 +135,9 @@ extern u_long nested_sh_entry_after_fault;
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	    uint64_t *l1gpa, uint64_t *perm);			/* slow path */
 uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
-void	vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
+void	vmx_vept_diag_keepstate(struct vmx_vcpu *vcpu, uint64_t eptp12,
+	    uint64_t l2gpa);
+uint64_t vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
 	    uint64_t gla, const char *tag);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
 	    uint64_t *out);
@@ -562,6 +564,15 @@ struct vmx_nested {
 	 * eventi diag58 (exit L2 e INVEPT fisico). Non cambia il comportamento.
 	 */
 	uint32_t	diag58_seq;
+	/*
+	 * Parere Opus WSL2-FreeBSD 009 §1: ultimo INVEPT dell'L1 elaborato da
+	 * QUESTO vCPU (progressivo, TSC, radici conservate/svuotate), letto
+	 * dalla cattura nested_diag_pfinj. In coda: offset DTrace invariati.
+	 */
+	uint64_t	diag_invept_seq;
+	uint64_t	diag_invept_tsc;
+	int		diag_invept_kept;
+	int		diag_invept_wiped;
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 
