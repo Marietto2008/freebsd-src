@@ -4982,8 +4982,7 @@ nested_pfrec_cap_e0(struct vmx_vcpu *vcpu)
 	p->gla0 = vmcs_read(VMCS_GUEST_LINEAR_ADDRESS);
 	p->qual0 = n->ept_qual;
 	nested_pfrec_gpr(vcpu, p->gpr0);
-	/* eptp12 conservato nel record per il walk in E1 (vm_gpa_hold puo' dormire) */
-	p->c0.l2gpa = c != NULL ? vmcs12_read_field(c, VMCS_EPTP) : 0;
+	n->pfrec_eptp12 = c != NULL ? vmcs12_read_field(c, VMCS_EPTP) : 0;
 	n->pfrec_building = true;
 }
 
@@ -5005,10 +5004,13 @@ nested_pfrec_cap_e1(struct vmx_vcpu *vcpu)
 		p->reason1 = vmcs12_read_field(c, VMCS_EXIT_REASON);
 	}
 	memcpy(p->gpr1, p->gpr0, sizeof(p->gpr1));	/* i GPR non cambiano */
-	/* walk del codice all'RIP dell'L2: byte dalla pagina dell'L1 e dall'EPT02 */
-	vmx_vept_diag_code(vcpu, eptp12, p->cr3_0, p->rip0, &p->c0);
-	atomic_add_long(&nested_diag_pfrec_e0, 1);
-	n->pfrec_armed = true;
+	/*
+	 * Il walk del codice (vm_gpa_hold puo' dormire) NON va fatto qui: fra
+	 * VMPTRLD e VMCLEAR si e' in sezione critica. Si rimanda a dopo il
+	 * VMCLEAR in nested_ept_slow.
+	 */
+	(void)eptp12;
+	n->pfrec_need_walk = true;
 }
 
 /*
@@ -5284,6 +5286,18 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 		    (r == VEPT_MISCONF) ? 0 :
 		    ((n->ept_qual & ~0x38ULL) | ((perm & 0x7) << 3)));
 	VMCLEAR(vcpu->vmcs01);			/* niente VMCS attivo nello slow path */
+	/*
+	 * Parere di Astra 010 §4: ora fuori dalla sezione critica (il VMCLEAR
+	 * ha fatto critical_exit) si puo' dormire: walk del codice all'RIP
+	 * dell'L2 catturato in E0, byte dalla pagina dell'L1 e dall'EPT02.
+	 */
+	if (__predict_false(nested_diag_pfrec != 0) && n->pfrec_need_walk) {
+		n->pfrec_need_walk = false;
+		vmx_vept_diag_code(vcpu, n->pfrec_eptp12, n->pfst.cr3_0,
+		    n->pfst.rip0, &n->pfst.c0);
+		atomic_add_long(&nested_diag_pfrec_e0, 1);
+		n->pfrec_armed = true;
+	}
 	vm_set_register(vcpu->vcpu, VM_REG_GUEST_RIP, vmexit->rip);
 	return (0);
 }

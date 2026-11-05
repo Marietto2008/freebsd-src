@@ -611,6 +611,8 @@ struct vmx_nested {
 	/* parere di Astra 010: episodio E0/E1 in corso su questo vCPU */
 	struct nested_pfrec pfst;
 	bool		pfrec_building;	/* E0 fatto, manca E1 (in questa uscita) */
+	bool		pfrec_need_walk;	/* E1 scalari fatti, walk dopo il VMCLEAR */
+	uint64_t	pfrec_eptp12;	/* EPTP12 per il walk differito */
 	bool		pfrec_armed;	/* E0+E1 fatti, si attende l'ingresso */
 	uint64_t	pfrec_seq;
 };
