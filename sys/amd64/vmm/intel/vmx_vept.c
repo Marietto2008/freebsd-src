@@ -45,6 +45,7 @@
 #include "vmx_controls.h"
 #include "vmx.h"
 #include "vmx_nested.h"
+#include "io/ppt.h"
 
 MALLOC_DEFINE(M_VMX_VEPT, "vmx_vept", "Intel VMX nested shadow EPT");
 
@@ -1972,9 +1973,25 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		vept_install(n, k, l2gpa, hpa, *perm, vept_ram_attr(*perm));
 		return (VEPT_OK);
 	}
-	/* Non RAM. Se l'EPT01 mappa l'L1-GPA (BAR di un dispositivo in
-	 * passthrough) si usa la stessa pagina host, non cacheable. */
-	hpa = pmap_extract(vcpu->vmx->pmap, *l1gpa);
+	/*
+	 * Non RAM. Una pagina host c'e' solo per una BAR in passthrough, e a
+	 * dirlo e' ppt (ppt_is_mmio), non l'EPT01: tutto il resto e' un
+	 * dispositivo emulato dall'L0, come per gli accessi dell'L1 (le pagine
+	 * della tabella MSI-X restano fuori dai segmenti, emulate da bhyve).
+	 * pmap_extract al livello delle pagine da 4K NON guarda il bit di
+	 * validita' della PTE: con la tabella delle pagine presente (una BAR
+	 * vicina gia' mappata nella stessa zona da 2M) restituiva per una PTE
+	 * vuota l'OFFSET dell'indirizzo, non 0, e qui si installava la pagina
+	 * host 0 al posto dei registri AHCI emulati (05/11/2026: la radice
+	 * sotto Hyper-V perdeva il disco all'avvio del dispositivo passato;
+	 * foglia EPT02 0x43 su c200a000, rapporto WSL2-FreeBSD 008 e parere di
+	 * Astra). Per questo anche l'indirizzo si allinea alla pagina.
+	 */
+	if (!ppt_is_mmio(vcpu->vmx->vm, *l1gpa)) {
+		n->st_vept[VST_F_EMUL]++;
+		return (VEPT_MMIO);		/* dispositivo emulato dell'L0 */
+	}
+	hpa = pmap_extract(vcpu->vmx->pmap, trunc_page(*l1gpa));
 	if (hpa == 0) {
 		/*
 		 * La BAR di un dispositivo in passthrough e' un oggetto OBJT_SG
@@ -1987,15 +2004,14 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		 * (le tiene PROT_NONE apposta) -> SIGSEGV in passthru_read_locked
 		 * (04/11/2026: Windows con Hyper-V e la RTX 2080 Ti in passthrough,
 		 * prima lettura dell'L2 a BAR0+0xa00). Qui lo stesso vm_fault che
-		 * farebbe l'L1; se l'indirizzo non e' nella mappa (dispositivo
-		 * davvero emulato dall'L0) fallisce e si emula come prima.
+		 * farebbe l'L1 (solo su una BAR di ppt: il filtro e' sopra).
 		 */
 		WITNESS_WARN(WARN_GIANTOK | WARN_SLEEPOK, NULL,
 		    "vmx_vept_fault: vm_fault su una BAR in passthrough");
 		if (vm_fault(&vm_vmspace(vcpu->vmx->vm)->vm_map,
 		    trunc_page(*l1gpa), (qual & 0x2) != 0 ? VM_PROT_WRITE :
 		    VM_PROT_READ, VM_FAULT_NORMAL, NULL) == KERN_SUCCESS) {
-			hpa = pmap_extract(vcpu->vmx->pmap, *l1gpa);
+			hpa = pmap_extract(vcpu->vmx->pmap, trunc_page(*l1gpa));
 			if (hpa != 0)
 				atomic_add_long(&vept_mmio_faulted_in, 1);
 		}
