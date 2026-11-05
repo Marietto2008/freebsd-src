@@ -26,6 +26,7 @@
 #include <sys/sysctl.h>
 
 #include <machine/clock.h>	/* tsc_freq: parere Opus 009 §1 */
+#include <sys/sbuf.h>		/* parere di Astra 010: record E0/E1/E2 */
 #include <machine/vmm.h>
 #include <machine/vmm_instruction_emul.h>
 #include <machine/cpufunc.h>
@@ -76,6 +77,9 @@ static int	nested_vpid_test_off;
 static u_long	vpid02_off_vcpus;
 static int	nested_vpid_d4_arm;
 static void	nested_diag_pf_arm(struct vmx_vcpu *vcpu);
+static void	nested_diag_pfrec_entry(struct vmx_vcpu *vcpu,
+		    struct vmcs12_cache *c);
+static void	nested_diag_pfrec_e0e1(struct vmx_vcpu *vcpu);
 static void	nested_diag_pfinj_note(struct vmx_vcpu *vcpu,
 		    struct vmcs12_cache *c);	/* WSL2-FreeBSD 003 */
 static u_long	nested_vpid_d4_injected;
@@ -297,6 +301,114 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag_pfinj, CTLFLAG_RWTUN,
 NESTED_CTR(nested_diag_pfinj_all, "nested: #PF iniettati dall'L1 nell'L2");
 NESTED_CTR(nested_diag_pfinj_fetch,
     "nested: di questi, con il bit I (fetch) nel codice d'errore");
+/*
+ * Parere di Astra sul rapporto 010: episodi "uscita MMIO LAPIC dell'L2 riflessa
+ * -> ingresso successivo" sullo stesso vCPU, con tre punti E0/E1/E2 copiati in
+ * memoria preallocata (prenotazione atomica) e stampati da un sysctl. Si
+ * sorvegliano solo i RIP della pagina nested_diag_pfrec_rippage (0 = ogni RIP
+ * del kernel dell'L2). Spento di base.
+ */
+static int nested_diag_pfrec = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag_pfrec, CTLFLAG_RWTUN,
+    &nested_diag_pfrec, 0, "nested: record E0/E1/E2 degli episodi MMIO LAPIC");
+static u_long nested_diag_pfrec_rippage = 0xffffffff8120b000UL;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_diag_pfrec_rippage, CTLFLAG_RWTUN,
+    &nested_diag_pfrec_rippage, 0, "nested: pagina dei RIP sorvegliati (0 = kernel)");
+NESTED_CTR(nested_diag_pfrec_e0, "nested: episodi E0 (uscita LAPIC sorvegliata)");
+NESTED_CTR(nested_diag_pfrec_ok, "nested: episodi chiusi senza eccezione");
+NESTED_CTR(nested_diag_pfrec_pf_fetch, "nested: episodi con #PF di fetch");
+NESTED_CTR(nested_diag_pfrec_pf_data, "nested: episodi con #PF dati");
+NESTED_CTR(nested_diag_pfrec_other, "nested: episodi con altro evento");
+#define	NESTED_PFREC_MAX	8
+static struct nested_pfrec nested_pfrecs[NESTED_PFREC_MAX];
+static u_int nested_pfrec_n;
+
+static void
+nested_pfrec_code_sbuf(struct sbuf *sb, const char *tag,
+    const struct vept_diag_code *o)
+{
+	int i;
+
+	sbuf_printf(sb, "  %s: pte %#lx %#lx %#lx %#lx fail_lvl=%d | pagina "
+	    "l2gpa=%#lx EPT12 r=%d l1gpa=%#lx perm=%#lx hpa_l1=%#lx ombra=%#lx%s\n",
+	    tag, (u_long)o->pte[0], (u_long)o->pte[1], (u_long)o->pte[2],
+	    (u_long)o->pte[3], o->fail_lvl, (u_long)o->l2gpa, o->r,
+	    (u_long)o->l1gpa, (u_long)o->perm, (u_long)o->hpa_l1,
+	    (u_long)o->shadow, ((o->shadow & 0x7) != 0 && o->ok_l1 &&
+	    (o->shadow & 0x000ffffffffff000ULL) != o->hpa_l1) ? " <-- HPA DIVERSO" : "");
+	sbuf_printf(sb, "  %s: byte L1  ", tag);
+	for (i = 0; i < o->nbytes && o->ok_l1; i++)
+		sbuf_printf(sb, "%02x ", o->b_l1[i]);
+	sbuf_printf(sb, "%s\n  %s: byte EPT02", o->ok_l1 ? "" : "(non letti)",
+	    tag);
+	for (i = 0; i < o->nbytes && o->ok_sh; i++)
+		sbuf_printf(sb, " %02x", o->b_sh[i]);
+	sbuf_printf(sb, "%s%s\n", o->ok_sh ? "" : " (nessuna foglia)",
+	    (o->ok_l1 && o->ok_sh && memcmp(o->b_l1, o->b_sh, o->nbytes) != 0) ?
+	    "  <-- BYTE DIVERSI" : "");
+}
+
+static void
+nested_pfrec_gpr_sbuf(struct sbuf *sb, const char *tag, const uint64_t *g)
+{
+	sbuf_printf(sb, "  %s: rdi=%#lx rsi=%#lx rdx=%#lx rcx=%#lx r8=%#lx "
+	    "r9=%#lx rax=%#lx rbx=%#lx rbp=%#lx r10=%#lx r11=%#lx r12=%#lx "
+	    "r13=%#lx r14=%#lx r15=%#lx cr2=%#lx\n", tag, (u_long)g[0],
+	    (u_long)g[1], (u_long)g[2], (u_long)g[3], (u_long)g[4],
+	    (u_long)g[5], (u_long)g[6], (u_long)g[7], (u_long)g[8],
+	    (u_long)g[9], (u_long)g[10], (u_long)g[11], (u_long)g[12],
+	    (u_long)g[13], (u_long)g[14], (u_long)g[15]);
+}
+
+static int
+sysctl_nested_pfrec_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf *sb;
+	struct nested_pfrec *p;
+	u_int i, n;
+	int error;
+
+	sb = sbuf_new_for_sysctl(NULL, NULL, 4096, req);
+	n = atomic_load_int(&nested_pfrec_n);
+	if (n > NESTED_PFREC_MAX)
+		n = NESTED_PFREC_MAX;
+	sbuf_printf(sb, "\n%u record (max %d)\n", n, NESTED_PFREC_MAX);
+	for (i = 0; i < n; i++) {
+		p = &nested_pfrecs[i];
+		if (atomic_load_acq_int(&p->done) == 0)
+			continue;
+		sbuf_printf(sb, "== episodio %u vcpu%d seq %lu: E1-E0 %lu tsc, "
+		    "E2-E0 %lu tsc\n", i, p->vcpu, (u_long)p->seq,
+		    (u_long)(p->t1 - p->t0), (u_long)(p->t2 - p->t0));
+		sbuf_printf(sb, " E0 uscita: rip=%#lx cr3=%#lx gpa=%#lx gla=%#lx "
+		    "qual=%#lx\n", (u_long)p->rip0, (u_long)p->cr3_0,
+		    (u_long)p->gpa0, (u_long)p->gla0, (u_long)p->qual0);
+		nested_pfrec_gpr_sbuf(sb, "E0", p->gpr0);
+		nested_pfrec_code_sbuf(sb, "E0", &p->c0);
+		sbuf_printf(sb, " E1 all'L1: motivo=%#lx rip=%#lx gpa=%#lx "
+		    "gla=%#lx qual=%#lx\n", (u_long)p->reason1, (u_long)p->rip1,
+		    (u_long)p->gpa1, (u_long)p->gla1, (u_long)p->qual1);
+		nested_pfrec_gpr_sbuf(sb, "E1", p->gpr1);
+		sbuf_printf(sb, " E2 ingresso: info=%#x err=%#x%s cr2=%#lx "
+		    "rip=%#lx cr3=%#lx\n", p->info2, p->err2,
+		    (p->info2 & (1U << 11)) ? "" : " (codice d'errore NON valido)",
+		    (u_long)p->cr2_2, (u_long)p->rip2, (u_long)p->cr3_2);
+		nested_pfrec_gpr_sbuf(sb, "E2", p->gpr2);
+		nested_pfrec_code_sbuf(sb, "E2", &p->c2);
+		sbuf_printf(sb, " ultimo INVEPT dell'L1 su questo vCPU: #%lu tipo=%lu "
+		    "eptp=%#lx %lu tsc prima di E0, radici conservate=%d "
+		    "svuotate=%d\n", (u_long)p->inv_seq, (u_long)p->inv_type,
+		    (u_long)p->inv_eptp, (u_long)(p->t0 - p->inv_tsc),
+		    p->inv_kept, p->inv_wiped);
+	}
+	error = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (error);
+}
+SYSCTL_PROC(_hw_vmm_vmx, OID_AUTO, nested_diag_pfrec_dump,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_nested_pfrec_dump, "A",
+    "nested: record E0/E1/E2 degli episodi MMIO LAPIC con eccezione");
 NESTED_CTR(nested_ept12_misconf_emul_reflected,
     "nested: EPT misconfiguration trovate dall'emulatore riflesse (H2)");
 NESTED_CTR(nested_l2_entries, "nested: ingressi in L2");
@@ -2858,6 +2970,8 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	/* diagpf2: #PF iniettato dall'L1 (qui si puo' dormire: vm_gpa_hold) */
 	if (__predict_false(nested_diag_pfinj != 0))
 		nested_diag_pfinj_note(vcpu, c);
+	if (__predict_false(nested_diag_pfrec != 0))
+		nested_diag_pfrec_entry(vcpu, c);
 
 	VMPTRLD(vmcs02);
 	nested_compose_vmcs02(vcpu);
@@ -4616,6 +4730,8 @@ nested_invept(struct vmx_vcpu *vcpu)
 	n->diag_invept_tsc = rdtsc();
 	n->diag_invept_kept = kept;
 	n->diag_invept_wiped = wiped;
+	n->diag_invept_type = type;	/* parere di Astra 010 §4 */
+	n->diag_invept_eptp = eptp;
 	ns = (u_long)sbttons(sbinuptime() - t0);
 	atomic_add_long(&nested_invept_ns_sum, ns);
 	if (ns > nested_invept_ns_max)
@@ -4822,6 +4938,119 @@ nested_diag_pf_arm(struct vmx_vcpu *vcpu)
  * (tabella dell'L2 tradotta con EPT12, la vista dell'L1) contro quella a cui
  * punta l'EPT02 OMBRA (quella che ha letto il processore). Prime 32 volte.
  */
+/* parere di Astra 010: copia i 16 registri del contesto (rdi..r15, cr2) */
+static void
+nested_pfrec_gpr(struct vmx_vcpu *vcpu, uint64_t *g)
+{
+	struct vmxctx *x = &vcpu->ctx;
+
+	g[0] = x->guest_rdi; g[1] = x->guest_rsi; g[2] = x->guest_rdx;
+	g[3] = x->guest_rcx; g[4] = x->guest_r8; g[5] = x->guest_r9;
+	g[6] = x->guest_rax; g[7] = x->guest_rbx; g[8] = x->guest_rbp;
+	g[9] = x->guest_r10; g[10] = x->guest_r11; g[11] = x->guest_r12;
+	g[12] = x->guest_r13; g[13] = x->guest_r14; g[14] = x->guest_r15;
+	g[15] = x->guest_cr2;
+}
+
+/*
+ * Parere di Astra 010 §4: E0 (stato dell'L2 all'uscita MMIO sul LAPIC; il
+ * VMCS02 e' caricato, la riflessione ha letto lo stato guest senza cambiarlo)
+ * ed E1 (lo stesso stato appena consegnato all'L1 nel VMCS12). Riempie il
+ * record in corso del vCPU e lo arma per l'ingresso successivo.
+ */
+static void
+nested_diag_pfrec_e0e1(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct nested_pfrec *p = &n->pfst;
+	struct vmcs12_cache *c = nested_current_cache(n);
+	uint64_t rip, eptp12, cr3;
+
+	rip = vmcs_read(VMCS_GUEST_RIP);	/* RIP dell'L2 (VMCS02) */
+	if (nested_diag_pfrec_rippage != 0 &&
+	    (rip & ~(uint64_t)PAGE_MASK) != nested_diag_pfrec_rippage)
+		return;
+	eptp12 = c != NULL ? vmcs12_read_field(c, VMCS_EPTP) : 0;
+	cr3 = vmcs_read(VMCS_GUEST_CR3);
+	memset(p, 0, sizeof(*p));
+	p->vcpu = vcpu->vcpuid;
+	p->seq = ++n->pfrec_seq;
+	p->t0 = rdtsc();
+	p->rip0 = rip;
+	p->cr3_0 = cr3;
+	p->gpa0 = n->ept_gpa;
+	p->gla0 = vmcs_read(VMCS_GUEST_LINEAR_ADDRESS);
+	p->qual0 = n->ept_qual;
+	nested_pfrec_gpr(vcpu, p->gpr0);
+	vmx_vept_diag_code(vcpu, eptp12, cr3, rip, &p->c0);
+	/* E1: lo stato dell'L2 ora nel VMCS12 (quello che l'L1 rilegge) */
+	if (c != NULL) {
+		p->t1 = rdtsc();
+		p->rip1 = vmcs12_read_field(c, VMCS_GUEST_RIP);
+		p->gpa1 = vmcs12_read_field(c, VMCS_GUEST_PHYSICAL_ADDRESS);
+		p->gla1 = vmcs12_read_field(c, VMCS_GUEST_LINEAR_ADDRESS);
+		p->qual1 = vmcs12_read_field(c, VMCS_EXIT_QUALIFICATION);
+		p->reason1 = vmcs12_read_field(c, VMCS_EXIT_REASON);
+	}
+	/* i GPR non cambiano nella riflessione: E1 = E0 */
+	memcpy(p->gpr1, p->gpr0, sizeof(p->gpr1));
+	atomic_add_long(&nested_diag_pfrec_e0, 1);
+	n->pfrec_armed = true;
+}
+
+/*
+ * Parere di Astra 010 §3-4: all'ingresso in L2, se un episodio E0/E1 e' armato
+ * su questo vCPU, si guarda che cosa l'L1 sta per iniettare (VMCS12
+ * ENTRY_INTR_INFO). #PF (vettore 14) valido -> E2 completo e record committato
+ * in un anello; fetch e dati separati. Altrimenti l'episodio si chiude "ok".
+ * Si disarma sempre. Chiamato a ingresso (vm_gpa_hold puo' dormire).
+ */
+static void
+nested_diag_pfrec_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct nested_pfrec *p = &n->pfst;
+	uint32_t info, err;
+	uint64_t cr2, rip, cr3, eptp12;
+	u_int slot;
+
+	if (!n->pfrec_armed)
+		return;
+	n->pfrec_armed = false;
+	info = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO);
+	if ((info & 0x800007ff) != 0x8000030e) {	/* non #PF valido */
+		atomic_add_long((info & 0x80000000) ? &nested_diag_pfrec_other :
+		    &nested_diag_pfrec_ok, 1);
+		return;
+	}
+	err = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_EXCEPTION_ERROR);
+	atomic_add_long((err & PGEX_I) ? &nested_diag_pfrec_pf_fetch :
+	    &nested_diag_pfrec_pf_data, 1);
+	cr2 = vcpu->ctx.guest_cr2;	/* CR2 che l'L1 prepara per l'L2 */
+	rip = vmcs12_read_field(c, VMCS_GUEST_RIP);
+	cr3 = vmcs12_read_field(c, VMCS_GUEST_CR3);
+	eptp12 = vmcs12_read_field(c, VMCS_EPTP);
+	p->t2 = rdtsc();
+	p->info2 = info;
+	p->err2 = err;
+	p->cr2_2 = cr2;
+	p->rip2 = rip;
+	p->cr3_2 = cr3;
+	nested_pfrec_gpr(vcpu, p->gpr2);
+	vmx_vept_diag_code(vcpu, eptp12, cr3, rip, &p->c2);
+	p->inv_seq = n->diag_invept_seq;
+	p->inv_tsc = n->diag_invept_tsc;
+	p->inv_type = n->diag_invept_type;
+	p->inv_eptp = n->diag_invept_eptp;
+	p->inv_kept = n->diag_invept_kept;
+	p->inv_wiped = n->diag_invept_wiped;
+	/* committa in un anello (prenotazione atomica dello slot) */
+	slot = atomic_fetchadd_int(&nested_pfrec_n, 1) % NESTED_PFREC_MAX;
+	p->done = 0;
+	memcpy(&nested_pfrecs[slot], p, sizeof(*p));
+	atomic_store_rel_int(&nested_pfrecs[slot].done, 1);
+}
+
 static void
 nested_diag_pfinj_note(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 {
@@ -5024,6 +5253,15 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 	n->slow_reflect = true;
 	nested_reflect_to_l1(vcpu, vmexit);
 	n->slow_reflect = false;
+	/*
+	 * Parere di Astra 010 §4: E0 (stato dell'L2 all'uscita MMIO sul LAPIC,
+	 * VMCS02 ancora caricato) ed E1 (stato appena consegnato all'L1 nel
+	 * VMCS12). Solo per una scrittura sulla pagina del LAPIC e con l'RIP
+	 * dell'L2 nella pagina sorvegliata. Arma l'episodio per l'ingresso.
+	 */
+	if (__predict_false(nested_diag_pfrec != 0) && (n->ept_qual & 0x2) != 0 &&
+	    (n->ept_gpa & ~0xfffUL) == 0xfee00000UL)
+		nested_diag_pfrec_e0e1(vcpu);
 	c = nested_current_cache(n);
 	if (c != NULL)
 		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION,

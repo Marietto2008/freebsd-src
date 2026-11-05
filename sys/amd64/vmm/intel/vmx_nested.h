@@ -132,11 +132,44 @@ extern u_long nested_sh_entry_after_fault;
 #define	VEPT_MMIO	3	/* MMIO dell'L1: emulazione in L0 */
 /* bit 3-6 di una voce EPT (memtype, IPAT), portati da ept12_translate in *perm */
 #define	VEPT_PERM_ATTR	(EPT_PG_MEMORY_TYPE(7) | EPT_PG_IGNORE_PAT)
+/*
+ * Parere di Astra sul rapporto WSL2-FreeBSD 010 (§3-4): record E0/E1/E2 dello
+ * stesso episodio "uscita MMIO LAPIC dell'L2 -> #PF chiesto dall'L1". Si
+ * COPIA in memoria preallocata e si stampa dopo (sysctl), fuori dal percorso
+ * critico. vept_diag_code: walk silenzioso del codice all'RIP dell'L2 con le
+ * tabelle dell'L2 lette dalla memoria dell'L1 (vista di Hyper-V) e 16 byte
+ * letti sia dalla pagina ombra EPT02 (vista della CPU) sia dall'L1.
+ */
+struct vept_diag_code {
+	uint64_t	pte[4];		/* voci PML4..PT dell'L2 lette dall'L1 */
+	uint64_t	l2gpa;		/* pagina finale del codice (L2-GPA) */
+	uint64_t	l1gpa, perm;	/* EPT12 viva */
+	uint64_t	shadow;		/* foglia EPT02 corrente */
+	uint64_t	hpa_l1;		/* HPA della pagina dell'L1 (vm_gpa_hold) */
+	int		r, fail_lvl, nbytes, ok_l1, ok_sh;
+	uint8_t		b_l1[16], b_sh[16];
+};
+struct nested_pfrec {
+	volatile int	done;
+	int		vcpu;
+	uint64_t	seq;		/* progressivo delle uscite E0 del vCPU */
+	uint64_t	t0, rip0, cr3_0, gpa0, gla0, qual0, gpr0[16];
+	struct vept_diag_code c0;
+	uint64_t	t1, rip1, gpa1, gla1, qual1, reason1, gpr1[16];
+	uint64_t	t2, cr2_2, rip2, cr3_2, gpr2[16];
+	uint32_t	info2, err2;
+	struct vept_diag_code c2;
+	uint64_t	inv_seq, inv_tsc, inv_type, inv_eptp;
+	int		inv_kept, inv_wiped;
+};
+
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	    uint64_t *l1gpa, uint64_t *perm);			/* slow path */
 uint64_t vmx_vept_shadow_entry(struct vmx_vcpu *vcpu, uint64_t l2gpa);
 void	vmx_vept_diag_keepstate(struct vmx_vcpu *vcpu, uint64_t eptp12,
 	    uint64_t l2gpa);
+int	vmx_vept_diag_code(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
+	    uint64_t gla, struct vept_diag_code *o);
 uint64_t vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
 	    uint64_t gla, const char *tag);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
@@ -573,6 +606,12 @@ struct vmx_nested {
 	uint64_t	diag_invept_tsc;
 	int		diag_invept_kept;
 	int		diag_invept_wiped;
+	uint64_t	diag_invept_type;	/* parere di Astra 010 §4 */
+	uint64_t	diag_invept_eptp;
+	/* parere di Astra 010: episodio E0/E1 in corso su questo vCPU */
+	struct nested_pfrec pfst;
+	bool		pfrec_armed;	/* E0+E1 fatti, si attende l'ingresso */
+	uint64_t	pfrec_seq;
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 

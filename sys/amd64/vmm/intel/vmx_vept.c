@@ -2310,6 +2310,83 @@ vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
 }
 
 /*
+ * Parere di Astra sul rapporto WSL2-FreeBSD 010 §4: walk SILENZIOSO del codice
+ * all'indirizzo lineare gla dell'L2, per i record E0/E2. Le tabelle dell'L2 si
+ * leggono dalla memoria dell'L1 (EPT12 viva, come fa l'emulatore di Hyper-V);
+ * della pagina finale si copiano fino a 16 byte sia dall'L1 (vm_gpa_hold) sia
+ * dalla foglia ombra EPT02 corrente (quello che esegue la CPU). Non e' una
+ * lettura del buffer d'istruzioni della CPU: e' il contenuto delle due
+ * pagine in quel momento. Solo lettura, slow path (vm_gpa_hold puo' dormire).
+ */
+int
+vmx_vept_diag_code(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
+    uint64_t gla, struct vept_diag_code *o)
+{
+	struct vmx_nested *n = vcpu->nested;
+	uint64_t tgpa, l1, perm, pte, m, sh, *p;
+	void *ck;
+	int lvl, r, idx, k;
+
+	memset(o, 0, sizeof(*o));
+	tgpa = cr3 & 0x000ffffffffff000ULL;
+	for (lvl = 3; lvl >= 0; lvl--) {
+		idx = (int)((gla >> (12 + 9 * lvl)) & 0x1ff);
+		l1 = perm = 0;
+		r = ept12_translate(vcpu, eptp12, tgpa, &l1, &perm, NULL);
+		if (r != VEPT_OK) {
+			o->r = r;
+			o->fail_lvl = lvl + 1;	/* 4 = PML4 ... 1 = PT */
+			return (-1);
+		}
+		p = vm_gpa_hold(vcpu->vcpu, l1 & ~(uint64_t)PAGE_MASK, PAGE_SIZE,
+		    VM_PROT_READ, &ck);
+		if (p == NULL) {
+			o->r = -1;
+			o->fail_lvl = lvl + 1;
+			return (-1);
+		}
+		pte = atomic_load_64(&p[idx]);
+		vm_gpa_release(ck);
+		o->pte[3 - lvl] = pte;
+		if ((pte & 1) == 0) {
+			o->fail_lvl = lvl + 1;
+			return (-1);
+		}
+		if (lvl > 0 && (pte & 0x80) != 0) {
+			m = (1ULL << (12 + 9 * lvl)) - 1;
+			tgpa = ((pte & 0x000ffffffffff000ULL & ~m) | (gla & m)) &
+			    ~(uint64_t)PAGE_MASK;
+			break;
+		}
+		tgpa = pte & 0x000ffffffffff000ULL;
+	}
+	o->l2gpa = tgpa;
+	l1 = perm = 0;
+	o->r = ept12_translate(vcpu, eptp12, tgpa, &l1, &perm, NULL);
+	o->l1gpa = l1;
+	o->perm = perm;
+	sh = n->vept_root != NULL ? vept_leaf_get(n->vept_root, tgpa) : 0;
+	o->shadow = sh;
+	k = (int)(PAGE_SIZE - (gla & PAGE_MASK));
+	if (k > 16)
+		k = 16;
+	o->nbytes = k;
+	if (o->r == VEPT_OK && (p = vm_gpa_hold(vcpu->vcpu,
+	    l1 & ~(uint64_t)PAGE_MASK, PAGE_SIZE, VM_PROT_READ, &ck)) != NULL) {
+		o->hpa_l1 = DMAP_TO_PHYS((vm_offset_t)p);
+		memcpy(o->b_l1, (char *)p + (gla & PAGE_MASK), k);
+		vm_gpa_release(ck);
+		o->ok_l1 = 1;
+	}
+	if ((sh & EPT_RWX) != 0) {
+		memcpy(o->b_sh, (char *)PHYS_TO_DMAP(EPT_ADDR(sh)) +
+		    (gla & PAGE_MASK), k);
+		o->ok_sh = 1;
+	}
+	return (0);
+}
+
+/*
  * Parere Opus WSL2-FreeBSD 009 §1: per la pagina L2-GPA (quella del codice al
  * #PF di fetch iniettato dall'L1), la tabella PT dell'EPT12 e la sua voce VIVA
  * contro la FOTOGRAFIA della conservazione B1 (o "non tracciata"), con i flag
