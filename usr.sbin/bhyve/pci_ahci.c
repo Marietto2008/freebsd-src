@@ -35,6 +35,8 @@
 #include <sys/disk.h>
 #include <sys/ata.h>
 #include <sys/endian.h>
+#include <sys/mman.h>
+#include <time.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -218,6 +220,86 @@ static void ahci_handle_next_trim(struct ahci_port *p, int slot, uint8_t *cfis,
     uint8_t *buf, uint32_t len, uint32_t done);
 static void ahci_handle_port(struct ahci_port *p);
 
+/*
+ * Registro diagnostico (WSL2-FreeBSD 008, parere di Astra §5): anello binario
+ * preallocato in un file condiviso (BHYVE_AHCI_DIAG=<file>), aperto prima
+ * della modalita' capability; nel percorso critico solo una fetch_add e
+ * scritture in memoria. Si legge a VM ferma con ahci-diag-leggi.py.
+ */
+#define	ADIAG_NREC	(1u << 21)
+struct adiag_rec {
+	uint64_t	ns;
+	uint32_t	seq;
+	uint16_t	type;
+	uint8_t		port;
+	uint8_t		slot;
+	uint32_t	v[8];
+};
+struct adiag_hdr {
+	uint32_t	magic;		/* 'ADG1' */
+	uint32_t	recsize;
+	uint32_t	nrec;
+	uint32_t	idx;
+	uint64_t	pad[6];
+};
+enum { AD_CMD = 1, AD_DONE, AD_FIS, AD_MSI, AD_NOMSI, AD_WR, AD_RD, AD_GENI };
+static struct adiag_hdr *adiag_h;
+static struct adiag_rec *adiag_r;
+
+static void
+adiag_open(void)
+{
+	const char *path;
+	size_t len;
+	void *m;
+	int fd;
+
+	if (adiag_h != NULL || (path = getenv("BHYVE_AHCI_DIAG")) == NULL)
+		return;
+	len = sizeof(struct adiag_hdr) + (size_t)ADIAG_NREC *
+	    sizeof(struct adiag_rec);
+	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0 || ftruncate(fd, len) != 0) {
+		EPRINTLN("ahci diag: %s non utilizzabile", path);
+		return;
+	}
+	m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (m == MAP_FAILED) {
+		EPRINTLN("ahci diag: mmap fallita");
+		return;
+	}
+	adiag_h = m;
+	adiag_r = (struct adiag_rec *)(adiag_h + 1);
+	adiag_h->recsize = sizeof(struct adiag_rec);
+	adiag_h->nrec = ADIAG_NREC;
+	adiag_h->idx = 0;
+	adiag_h->magic = 0x31474441;
+	EPRINTLN("ahci diag: anello di %u voci in %s", ADIAG_NREC, path);
+}
+
+static void
+adiag(int type, int port, int slot, uint32_t a, uint32_t b, uint32_t c,
+    uint32_t d, uint32_t e, uint32_t f, uint32_t g, uint32_t h)
+{
+	struct adiag_rec *r;
+	struct timespec ts;
+	uint32_t i;
+
+	if (adiag_h == NULL)
+		return;
+	i = __atomic_fetch_add(&adiag_h->idx, 1, __ATOMIC_RELAXED);
+	r = &adiag_r[i & (ADIAG_NREC - 1)];
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	r->ns = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+	r->type = type;
+	r->port = port;
+	r->slot = slot;
+	r->v[0] = a; r->v[1] = b; r->v[2] = c; r->v[3] = d;
+	r->v[4] = e; r->v[5] = f; r->v[6] = g; r->v[7] = h;
+	__atomic_store_n(&r->seq, i + 1, __ATOMIC_RELEASE);
+}
+
 static inline void lba_to_msf(uint8_t *buf, int lba)
 {
 	lba += 150;
@@ -244,6 +326,7 @@ ahci_generate_intr(struct pci_ahci_softc *sc, uint32_t mask)
 			sc->is |= (1 << i);
 	}
 	DPRINTF("%s(%08x) %08x", __func__, mask, sc->is);
+	adiag(AD_GENI, 0xff, 0, mask, sc->is, sc->ghc, 0, 0, 0, 0, 0);
 
 	/* If there is nothing enabled -- clear legacy interrupt and exit. */
 	if (sc->is == 0 || (sc->ghc & AHCI_GHC_IE) == 0) {
@@ -270,8 +353,12 @@ ahci_generate_intr(struct pci_ahci_softc *sc, uint32_t mask)
 			mmask = 1 << i;
 		else
 			mmask = 0xffffffff << i;
-		if (sc->is & mask && mmask & mask)
+		if (sc->is & mask && mmask & mask) {
+			adiag(AD_MSI, 0xff, i, (uint32_t)pi->pi_msi.addr,
+			    (uint32_t)pi->pi_msi.msg_data, sc->is, mask, sc->ghc,
+			    pi->pi_msi.enabled, 1, 0);
 			pci_generate_msi(pi, i);
+		}
 	}
 }
 
@@ -289,29 +376,47 @@ ahci_port_intr(struct ahci_port *p)
 	    p->port, p->is, p->ie, sc->is);
 
 	/* If there is nothing enabled -- we are done. */
-	if ((p->is & p->ie) == 0)
+	if ((p->is & p->ie) == 0) {
+		adiag(AD_NOMSI, p->port, 0, 1, p->is, p->ie, sc->is, sc->ghc,
+		    0, 0, 0);
 		return;
+	}
 
 	/* In case of non-shared MSI always generate interrupt. */
 	nmsg = pci_msi_maxmsgnum(pi);
 	if (sc->ports <= nmsg || p->port < nmsg - 1) {
 		sc->is |= (1 << p->port);
-		if ((sc->ghc & AHCI_GHC_IE) == 0)
+		if ((sc->ghc & AHCI_GHC_IE) == 0) {
+			adiag(AD_NOMSI, p->port, 0, 2, p->is, p->ie, sc->is,
+			    sc->ghc, 0, 0, 0);
 			return;
+		}
+		adiag(AD_MSI, p->port, p->port, (uint32_t)pi->pi_msi.addr,
+		    (uint32_t)pi->pi_msi.msg_data, sc->is, p->is, sc->ghc,
+		    pi->pi_msi.enabled, 2, p->ie);
 		pci_generate_msi(pi, p->port);
 		return;
 	}
 
 	/* If IS for this port is already set -- do nothing. */
-	if (sc->is & (1 << p->port))
+	if (sc->is & (1 << p->port)) {
+		adiag(AD_NOMSI, p->port, 0, 3, p->is, p->ie, sc->is, sc->ghc,
+		    0, 0, 0);
 		return;
+	}
 
 	sc->is |= (1 << p->port);
 
 	/* If interrupts are enabled -- generate one. */
-	if ((sc->ghc & AHCI_GHC_IE) == 0)
+	if ((sc->ghc & AHCI_GHC_IE) == 0) {
+		adiag(AD_NOMSI, p->port, 0, 2, p->is, p->ie, sc->is, sc->ghc,
+		    0, 0, 0);
 		return;
+	}
 	if (nmsg > 0) {
+		adiag(AD_MSI, p->port, nmsg - 1, (uint32_t)pi->pi_msi.addr,
+		    (uint32_t)pi->pi_msi.msg_data, sc->is, p->is, sc->ghc,
+		    pi->pi_msi.enabled, 3, p->ie);
 		pci_generate_msi(pi, nmsg - 1);
 	} else if (!sc->lintr) {
 		sc->lintr = 1;
@@ -352,6 +457,8 @@ ahci_write_fis(struct ahci_port *p, enum sata_fis_type ft, uint8_t *fis)
 		irq |= AHCI_P_IX_TFE;
 	}
 	memcpy(p->rfis + offset, fis, len);
+	adiag(AD_FIS, p->port, 0, ft, irq, p->is, p->ie, p->ci, p->sact,
+	    (irq && (~p->is & irq)) ? 1 : 0, fis[2]);
 	if (irq) {
 		if (~p->is & irq) {
 			p->is |= irq;
@@ -1899,6 +2006,9 @@ ahci_handle_slot(struct ahci_port *p, int slot)
 		return;
 	}
 
+	adiag(AD_CMD, p->port, slot, cfis[2], cfis[1], p->ci, p->sact,
+	    p->pending, p->is, (uint32_t)sc->asc_pi->pi_bar[5].addr,
+	    cfis[4] | cfis[5] << 8 | cfis[6] << 16 | (uint32_t)cfis[12] << 24);
 	if (cfis[1] & 0x80) {
 		ahci_handle_cmd(p, slot, cfis);
 	} else {
@@ -1969,6 +2079,8 @@ ata_ioreq_cb(struct blockif_req *br, int err)
 	aior->dsm = NULL;
 
 	pthread_mutex_lock(&sc->mtx);
+	adiag(AD_DONE, p->port, slot, err, aior->done, aior->more, cfis[2],
+	    p->ci, p->sact, p->pending, ncq);
 
 	/*
 	 * Delete the blockif request from the busy list
@@ -2251,6 +2363,9 @@ pci_ahci_write(struct pci_devinst *pi, int baridx, uint64_t offset, int size,
 	assert((offset % 4) == 0 && size == 4);
 
 	pthread_mutex_lock(&sc->mtx);
+	adiag(AD_WR, offset < AHCI_OFFSET ? 0xff : (offset - AHCI_OFFSET) /
+	    AHCI_STEP, 0, (uint32_t)offset, (uint32_t)value, size, 0, 0, 0,
+	    0, 0);
 
 	if (offset < AHCI_OFFSET)
 		pci_ahci_host_write(sc, offset, value);
@@ -2359,6 +2474,8 @@ pci_ahci_read(struct pci_devinst *pi, int baridx, uint64_t regoff, int size)
 		    regoff);
 	}
 	value >>= 8 * (regoff & 0x3);
+	adiag(AD_RD, offset < AHCI_OFFSET ? 0xff : (offset - AHCI_OFFSET) /
+	    AHCI_STEP, 0, (uint32_t)regoff, value, size, 0, 0, 0, 0, 0);
 
 	pthread_mutex_unlock(&sc->mtx);
 
@@ -2481,6 +2598,7 @@ pci_ahci_init(struct pci_devinst *pi, nvlist_t *nvl)
 	dbg = fopen("/tmp/log", "w+");
 #endif
 
+	adiag_open();
 	sc = calloc(1, sizeof(struct pci_ahci_softc));
 	pi->pi_arg = sc;
 	sc->asc_pi = pi;
