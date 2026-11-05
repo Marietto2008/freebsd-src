@@ -315,6 +315,16 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag_pfrec, CTLFLAG_RWTUN,
 static u_long nested_diag_pfrec_rippage = 0xffffffff8120b000UL;
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_diag_pfrec_rippage, CTLFLAG_RWTUN,
     &nested_diag_pfrec_rippage, 0, "nested: pagina dei RIP sorvegliati (0 = kernel)");
+/*
+ * Walk del codice a E0 (5 vm_gpa_hold a ogni uscita LAPIC sorvegliata). Costa
+ * su ogni uscita, e il 05/11 con il walk acceso il difetto non e' comparso in
+ * 20 minuti di carico + svuotamento (prima ~10 min): puo' spostarne i tempi
+ * come facevano le sonde DTrace. Spento di base: E0/E1 registrano solo i
+ * valori, i byte si leggono a E2 (solo quando l'L1 chiede un #PF).
+ */
+static int nested_diag_pfrec_e0walk = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag_pfrec_e0walk, CTLFLAG_RWTUN,
+    &nested_diag_pfrec_e0walk, 0, "nested: walk del codice anche a E0 (costoso)");
 NESTED_CTR(nested_diag_pfrec_e0, "nested: episodi E0 (uscita LAPIC sorvegliata)");
 NESTED_CTR(nested_diag_pfrec_ok, "nested: episodi chiusi senza eccezione");
 NESTED_CTR(nested_diag_pfrec_pf_fetch, "nested: episodi con #PF di fetch");
@@ -5293,8 +5303,9 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 	 */
 	if (__predict_false(nested_diag_pfrec != 0) && n->pfrec_need_walk) {
 		n->pfrec_need_walk = false;
-		vmx_vept_diag_code(vcpu, n->pfrec_eptp12, n->pfst.cr3_0,
-		    n->pfst.rip0, &n->pfst.c0);
+		if (nested_diag_pfrec_e0walk != 0)
+			vmx_vept_diag_code(vcpu, n->pfrec_eptp12, n->pfst.cr3_0,
+			    n->pfst.rip0, &n->pfst.c0);
 		atomic_add_long(&nested_diag_pfrec_e0, 1);
 		n->pfrec_armed = true;
 	}
