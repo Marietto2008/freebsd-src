@@ -4851,7 +4851,7 @@ nested_diag_pfinj_note(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	    (u_long)vmcs12_read_field(c, VMCS_GUEST_ACTIVITY), (u_long)eptp12);
 	printf("nested_diag_pfinj #%d   uscita riflessa prima: motivo=%#lx "
 	    "qual=%#lx gpa=%#lx gla=%#lx idtv=%#lx/%#lx exit_intr=%#lx/%#lx "
-	    "ilen=%#lx\n", printed,
+	    "ilen=%#lx entry=%#lx exit=%#lx\n", printed,
 	    (u_long)vmcs12_read_field(c, VMCS_EXIT_REASON),
 	    (u_long)vmcs12_read_field(c, VMCS_EXIT_QUALIFICATION),
 	    (u_long)vmcs12_read_field(c, VMCS_GUEST_PHYSICAL_ADDRESS),
@@ -4860,9 +4860,18 @@ nested_diag_pfinj_note(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	    (u_long)vmcs12_read_field(c, VMCS_IDT_VECTORING_ERROR),
 	    (u_long)vmcs12_read_field(c, VMCS_EXIT_INTR_INFO),
 	    (u_long)vmcs12_read_field(c, VMCS_EXIT_INTR_ERRCODE),
-	    (u_long)vmcs12_read_field(c, VMCS_EXIT_INSTRUCTION_LENGTH));
+	    (u_long)vmcs12_read_field(c, VMCS_EXIT_INSTRUCTION_LENGTH),
+	    (u_long)vmcs12_read_field(c, VMCS_ENTRY_CTLS),
+	    (u_long)vmcs12_read_field(c, VMCS_EXIT_CTLS));
+	/*
+	 * Modo a 64 bit dal controllo d'ingresso "IA-32e mode guest", non da
+	 * GUEST_IA32_EFER: Hyper-V non usa LOAD_EFER ne' SAVE_EFER per i suoi
+	 * guest e quel campo resta un valore mai caricato (0x801 nel panic
+	 * LAPIC del 05/11, con l'L2 a 64 bit): la vecchia guardia saltava
+	 * proprio il confronto delle tabelle che serviva.
+	 */
 	if ((vmcs12_proc2(c) & PROCBASED2_ENABLE_EPT) == 0 ||
-	    (vmcs12_read_field(c, VMCS_GUEST_IA32_EFER) & EFER_LMA) == 0 ||
+	    (vmcs12_read_field(c, VMCS_ENTRY_CTLS) & VM_ENTRY_GUEST_LMA) == 0 ||
 	    (vmcs12_read_field(c, VMCS_GUEST_CR4) & CR4_LA57) != 0)
 		return;
 	vmx_vept_diag_walk(vcpu, eptp12, cr3, cr2, "cr2");
