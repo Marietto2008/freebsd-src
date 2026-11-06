@@ -45,6 +45,7 @@
 #include "vmx_controls.h"
 #include "vmx.h"
 #include "vmx_nested.h"
+#include "ept.h"
 #include "io/ppt.h"
 
 MALLOC_DEFINE(M_VMX_VEPT, "vmx_vept", "Intel VMX nested shadow EPT");
@@ -116,6 +117,16 @@ static int vept_verify_hpa = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_verify_hpa, CTLFLAG_RWTUN,
     &vept_verify_hpa, 0,
     "nested: B1, riverifica a campione le foglie conservate (0 = no)");
+/*
+ * Fase A (parere Astra 012): offrire all'L1 i flag A/D dell'EPT, come KVM.
+ * Letto UNA volta alla creazione della VM (vmx_vminit -> vmx->nested_ad),
+ * uniforme fra i vCPU; richiede che l'host usi gli A/D per il proprio EPT
+ * (ept_ad_bits_enabled). Spento di base: finche' il walker non imposta A/D
+ * (passo A2) la capacita' NON va esposta all'L1.
+ */
+static int nested_ept_ad = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_ept_ad, CTLFLAG_RWTUN, &nested_ept_ad,
+    0, "nested: offre i flag A/D dell'EPT all'L1 (letto alla creazione della VM)");
 
 #define	VEPT_CTR(name, descr)						\
 	static u_long name;						\
@@ -210,6 +221,12 @@ bool
 vmx_vept_keep_enabled(void)
 {
 	return (vept_keep != 0);
+}
+
+int
+vmx_vept_ad_policy(void)
+{
+	return (nested_ept_ad != 0 && ept_ad_bits_enabled());
 }
 
 /* Pagina di tabella shadow (puo' dormire) e suo rilascio, con il conto. */

@@ -155,6 +155,13 @@ struct vmx {
 	uint64_t	eptp;
 	long		eptgen[MAXCPU];		/* cached pmap->pm_eptgen */
 	pmap_t		pmap;
+	/*
+	 * Fase A (parere Astra 012): politica EPT A/D offerta all'L1, CONGELATA
+	 * alla creazione della VM e uniforme fra tutti i suoi vCPU; non riletta
+	 * dal sysctl alla nascita di ogni vCPU. Spenta finche' il walker non la
+	 * implementa (A2); qui e' solo propagazione.
+	 */
+	bool		nested_ad;
 };
 
 extern bool vmx_have_msr_tsc_aux;

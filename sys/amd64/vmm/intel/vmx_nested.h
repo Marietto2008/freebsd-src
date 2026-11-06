@@ -231,6 +231,7 @@ void	vst_tratto(struct vmx_nested *n, int base, int bucket0, int imax,
 void	vept_stats_flush(struct vmx_nested *n);	/* da nested_stats_flush */
 /* B1 */
 bool	vmx_vept_keep_enabled(void);		/* hw.vmm.vmx.vept_keep */
+int	vmx_vept_ad_policy(void);		/* hw.vmm.vmx.nested_ept_ad && host A/D */
 void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
 int	vmx_vept_cur_slot(struct vmx_nested *n);	/* parere #53 §8: slot corrente o -1 */
 bool	vmx_vept_memgen_stale(struct vmx_vcpu *vcpu);	/* non dorme */

@@ -189,6 +189,12 @@ ept_vmspace_free(struct vmspace *vmspace)
 	vmspace_free(vmspace);
 }
 
+int
+ept_ad_bits_enabled(void)
+{
+	return (ept_enable_ad_bits);
+}
+
 uint64_t
 eptp(uint64_t pml4)
 {
