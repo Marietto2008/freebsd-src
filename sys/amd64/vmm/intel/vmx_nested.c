@@ -476,7 +476,7 @@ VMM_STAT_INTEL(VMX_NESTED_VEPT_WIPED, "radici shadow EPT svuotate da INVEPT");
  * essere rifiniti dopo quel test: vedi docs/nested/T1.4.md.
  */
 static void
-vmx_nested_init_msrs(struct vmx_nested *n)
+vmx_nested_init_msrs(struct vmx_nested *n, bool ad_policy)
 {
 	uint64_t basic, misc, proc2, eptcap;
 	uint64_t *m = n->vmx_msr;
@@ -551,9 +551,16 @@ vmx_nested_init_msrs(struct vmx_nested *n)
 		m[0x48b - 0x480] = proc2 & ~(exc << 32);
 	}
 
-	/* EPT/VPID cap: host senza EPT A/D (21) e page-walk a 5 livelli (7). */
+	/*
+	 * EPT/VPID cap: page-walk a 5 livelli (7) sempre tolto. EPT A/D (21)
+	 * offerti all'L1 SOLO se la VM li ha in politica (fase A2): esposizione
+	 * e implementazione del walker insieme, come chiede Astra. Con la
+	 * politica spenta (di base) il bit 21 resta tolto e tutto e' come prima.
+	 */
 	eptcap = rdmsr(MSR_VMX_EPT_VPID_CAP);
-	m[0x48c - 0x480] = eptcap & ~((1ULL << 21) | (1ULL << 7));
+	m[0x48c - 0x480] = eptcap & ~(1ULL << 7);
+	if (!ad_policy)
+		m[0x48c - 0x480] &= ~(1ULL << 21);
 
 	/* IA32_FEATURE_CONTROL: LOCK + VMX outside SMX (niente SMX). */
 	n->feature_control = IA32_FEATURE_CONTROL_LOCK |
@@ -576,7 +583,7 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	n->current_vmcs12 = VMCS12_GPA_NONE;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
 		n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
-	vmx_nested_init_msrs(n);
+	vmx_nested_init_msrs(n, vcpu->vmx->nested_ad);
 	n->vpid2 = vpid_alloc(vcpu->vcpuid);	/* VPID distinto L2 (T2.8) */
 	/*
 	 * Bitmap MSR del VMCS02 (T6.3): una pagina per vCPU, allineata e

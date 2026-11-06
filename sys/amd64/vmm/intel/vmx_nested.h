@@ -551,6 +551,7 @@ struct vmx_nested {
 	 * creazione del nested: spento, tutto come prima (31b286d).
 	 */
 	bool		vept_keep;
+	bool		vept_ad;	/* fase A2: A/D attivi sulla radice CORRENTE (EPTP12 bit 6) */
 	bool		vept_memgen_pending;	/* vmx_run: generazione cambiata */
 	bool		vept_flush_pending;	/* shadow ridotta: INVEPT hw dovuto */
 	struct vept_kslot {

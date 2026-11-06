@@ -52,6 +52,7 @@ MALLOC_DEFINE(M_VMX_VEPT, "vmx_vept", "Intel VMX nested shadow EPT");
 
 #define	EPT_RWX		(EPT_PG_READ | EPT_PG_WRITE | EPT_PG_EXECUTE)
 #define	EPT_ADDR(e)	((e) & 0x000ffffffffff000ULL)
+#define	EPT_PG_AD_ENABLE	(1ULL << 6)	/* nell EPTP: abilita i flag A/D (A2) */
 #define	EPT_IDX(gpa, lvl)	(((gpa) >> (12 + 9 * (lvl))) & 0x1ff)
 
 /*
@@ -1599,6 +1600,14 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 	pick->used = ++n->vept_tick;
 	n->vept_root = pick->root;
 	n->vept_eptp12 = eptp12;
+	/*
+	 * Fase A2 (parere Astra 012): A/D sulla radice shadow SOLO se la VM
+	 * li offre (vmx->nested_ad, congelato) e l'L1 li ha accesi nel suo
+	 * EPTP12 (bit 6). Le radici sono distinte per EPTP12 pieno (prepare
+	 * confronta eptp12 intero), quindi lo stesso indirizzo con modalita'
+	 * A/D diversa usa uno slot diverso.
+	 */
+	n->vept_ad = vcpu->vmx->nested_ad && (eptp12 & EPT_PG_AD_ENABLE) != 0;
 }
 
 /* Shadow EPTP (radice) da scrivere nel VMCS02: WB, 4 livelli. Non dorme:
@@ -1616,7 +1625,8 @@ vmx_vept_eptp(struct vmx_vcpu *vcpu)
 	 * voci foglia (bit 5:3): dava 0x38 = UC con cammino 8, EPTP non valido
 	 * (INVEPT -> VM-instruction error 28, kvm-unit-tests EPT A/D disabled).
 	 */
-	return (vtophys(n->vept_root) | 6UL | (3UL << 3));
+	return (vtophys(n->vept_root) | 6UL | (3UL << 3) |
+	    (n->vept_ad ? EPT_PG_AD_ENABLE : 0));	/* A2: A/D se l'L1 li ha accesi */
 }
 
 /* Svuota le sottotabelle della radice (non la radice) e la azzera. */
@@ -1807,6 +1817,66 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 	return (VEPT_VIOL);
 }
 
+/*
+ * Fase A2 (parere Astra 012): accende i flag A/D nelle voci EPT12 dell'L1,
+ * come fa l'hardware quando l'L1 attiva A/D nel suo EPTP (come KVM in
+ * update_accessed_dirty_bits). Percorre le stesse tabelle di ept12_translate,
+ * ma tenendo ogni pagina in SCRITTURA, e scrive con compare-and-exchange sul
+ * valore letto: A su ogni livello attraversato, D sulla foglia se l'accesso e'
+ * una scrittura. Se la CAS fallisce (l'L1 ha cambiato la voce) ritorna 1 e il
+ * chiamante rifa' il percorso. *leaf_dirty riceve lo stato D della foglia dopo
+ * l'aggiornamento (per protect_clean_gpte: foglia pulita -> shadow senza W).
+ * Solo slow path (vm_gpa_hold puo' dormire). Non tocca le fotografie della
+ * conservazione: le nostre scritture A/D restano visibili al confronto
+ * all'INVEPT, che le tratta come un cambiamento (invalidazione conservativa).
+ * Ritorna 0 ok, -1 tabella illeggibile, 1 ricomincia.
+ */
+static int
+nested_ept12_ad_mark(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
+    bool write, bool *leaf_dirty)
+{
+	uint64_t tbl_gpa, pte, want;
+	uint64_t *page;
+	void *cookie;
+	int level, idx;
+
+	*leaf_dirty = false;
+	tbl_gpa = EPT_ADDR(eptp12);
+	for (level = 3; level >= 0; level--) {
+		idx = EPT_IDX(l2gpa, level);
+		page = vm_gpa_hold(vcpu->vcpu, tbl_gpa, PAGE_SIZE,
+		    VM_PROT_READ | VM_PROT_WRITE, &cookie);
+		if (page == NULL)
+			return (-1);
+		pte = atomic_load_64(&page[idx]);
+		if ((pte & EPT_RWX) == 0) {	/* diventata non presente */
+			vm_gpa_release(cookie);
+			return (1);		/* rifa' il percorso */
+		}
+		if (level == 0 || (pte & EPT_PG_PS) != 0) {
+			/* foglia: A sempre, D se scrittura */
+			want = pte | EPT_PG_A | (write ? EPT_PG_M : 0);
+			if (want != pte &&
+			    !atomic_cmpset_64(&page[idx], pte, want)) {
+				vm_gpa_release(cookie);
+				return (1);
+			}
+			*leaf_dirty = (want & EPT_PG_M) != 0;
+			vm_gpa_release(cookie);
+			return (0);
+		}
+		/* tabella intermedia: solo A */
+		want = pte | EPT_PG_A;
+		if (want != pte && !atomic_cmpset_64(&page[idx], pte, want)) {
+			vm_gpa_release(cookie);
+			return (1);
+		}
+		vm_gpa_release(cookie);
+		tbl_gpa = EPT_ADDR(pte);
+	}
+	return (1);
+}
+
 /* Installa una foglia shadow 4K: l2gpa -> hpa con permessi e memtype WB. */
 static int
 vept_install(struct vmx_nested *n, struct vept_kslot *k, uint64_t l2gpa,
@@ -1907,9 +1977,10 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	struct vmcs12_cache *c = nested_current_cache(n);
 	struct vept_kslot *k;
 	struct vept_obs *obs = NULL;
-	uint64_t eptp12, hpa, access;
+	uint64_t eptp12, hpa, access, ram_perm;
 	void *p, *ck;
 	int r;
+	bool ad_clean_now = false;	/* A2: foglia EPT12 pulita -> shadow senza W */
 
 	/*
 	 * SLOW PATH (vCPU FROZEN, nessun VMCS caricato): qui si puo' dormire
@@ -1972,6 +2043,34 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		return (VEPT_VIOL);
 	}
 	/*
+	 * Fase A2: se l'L1 usa A/D (radice corrente con il bit 6), si accendono
+	 * A sui livelli e D sulla foglia nelle voci dell'EPT12. La foglia ancora
+	 * PULITA (D=0) si installa senza W (protect_clean_gpte): la prima
+	 * scrittura dell'L2 rifara' questo fault e accendera' D. *perm resta coi
+	 * permessi VERI dell'EPT12, usati sopra per il controllo d'accesso, cosi'
+	 * il fault dovuto al W tolto nella shadow non si riflette mai come
+	 * violazione dell'L1.
+	 */
+	if (n->vept_ad) {
+		bool leaf_dirty;
+		int ad_r, tries;
+
+		for (tries = 0; tries < 8; tries++) {
+			ad_r = nested_ept12_ad_mark(vcpu, eptp12, l2gpa,
+			    (qual & 0x2) != 0, &leaf_dirty);
+			if (ad_r != 1)
+				break;
+		}
+		if (ad_r == -1) {
+			n->st_vept[VST_F_UNREAD]++;
+			return (VEPT_VIOL);	/* tabella illeggibile */
+		}
+		if (ad_r == 1)
+			return (VEPT_VIOL);	/* troppi conflitti: riflette, l'L2 riprova */
+		if ((qual & 0x2) == 0 && !leaf_dirty)
+			ad_clean_now = true;	/* foglia pulita: shadow senza W */
+	}
+	/*
 	 * Pagina host dell'L1-GPA: vm_gpa_hold la porta in memoria se serve
 	 * (prima pmap_extract sull'EPT01 falliva per una pagina mai toccata
 	 * dall'L1). La memoria del guest e' wired: non si sposta dopo il
@@ -1987,7 +2086,11 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		if (n->vept_keep && !vm_mem_wired(vcpu->vmx->vm,
 		    *l1gpa & ~(uint64_t)PAGE_MASK))
 			k->nokeep = true;
-		vept_install(n, k, l2gpa, hpa, *perm, vept_ram_attr(*perm));
+		/* A2: foglia EPT12 ancora pulita -> shadow senza W (il memtype
+		 * resta dai permessi veri, vept_ram_attr usa *perm) */
+		ram_perm = ad_clean_now ? (*perm & ~(uint64_t)EPT_PG_WRITE) :
+		    *perm;
+		vept_install(n, k, l2gpa, hpa, ram_perm, vept_ram_attr(*perm));
 		return (VEPT_OK);
 	}
 	/*
@@ -2039,8 +2142,9 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		/* MMIO: UC come l'EPT01 (VM_MEMATTR_UNCACHEABLE); al massimo RW:
 		 * l'EPT01 non concede X sulla memoria di un dispositivo (parere
 		 * Opus 004 §1.3) */
-		vept_install(n, k, l2gpa, hpa, *perm & (EPT_PG_READ | EPT_PG_WRITE),
-		    EPT_PG_MEMORY_TYPE(0) | EPT_PG_IGNORE_PAT);
+		vept_install(n, k, l2gpa, hpa, (*perm & (EPT_PG_READ |
+		    EPT_PG_WRITE)) & (ad_clean_now ? ~(uint64_t)EPT_PG_WRITE :
+		    ~0ULL), EPT_PG_MEMORY_TYPE(0) | EPT_PG_IGNORE_PAT);
 		return (VEPT_OK);
 	}
 	n->st_vept[VST_F_EMUL]++;
