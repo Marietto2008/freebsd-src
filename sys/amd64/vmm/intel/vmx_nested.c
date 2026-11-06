@@ -4389,6 +4389,77 @@ nested_diag_efer_trace(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	    vcpu->nested->current_vmcs12);
 }
 
+/*
+ * Sonda 10 (06/11/2026, L1 FreeBSD 15.1/bhyve -> L2 UEFI: «VM-entry failure due
+ * to invalid guest state», motivo 33 qual 0 riflesso all'L1 con l'RIP dell'L2 nel
+ * firmware). Al primo ingresso in L2 RIFIUTATO dall'HARDWARE (non le nostre
+ * uscite sintetiche: quelle non passano di qui), lo stato guest e i controlli
+ * del VMCS02 accanto allo stesso campo del VMCS12: la differenza dice cosa ha
+ * alterato la composizione. Solo vmcs_read e letture della cache (sezione
+ * critica: nessuna attesa). Al massimo due stampe.
+ */
+#define	GSD_SEG(N)							\
+	{ VMCS_GUEST_##N##_SELECTOR, #N },				\
+	{ VMCS_GUEST_##N##_BASE, #N "_B" },				\
+	{ VMCS_GUEST_##N##_LIMIT, #N "_L" },				\
+	{ VMCS_GUEST_##N##_ACCESS_RIGHTS, #N "_AR" }
+static void
+nested_probe_gs_dump(struct vmx_vcpu *vcpu)
+{
+	static const struct { uint32_t enc; const char *nm; } f[] = {
+		{ VMCS_EXIT_QUALIFICATION, "X_QUAL" },
+		{ VMCS_PIN_BASED_CTLS, "PIN" }, { VMCS_PRI_PROC_BASED_CTLS, "PROC" },
+		{ VMCS_SEC_PROC_BASED_CTLS, "PROC2" }, { VMCS_ENTRY_CTLS, "ENTRY" },
+		{ VMCS_EXIT_CTLS, "EXIT" },
+		{ VMCS_CR0_MASK, "CR0_MASK" }, { VMCS_CR0_SHADOW, "CR0_SHAD" },
+		{ VMCS_CR4_MASK, "CR4_MASK" }, { VMCS_CR4_SHADOW, "CR4_SHAD" },
+		{ VMCS_GUEST_CR0, "CR0" }, { VMCS_GUEST_CR3, "CR3" },
+		{ VMCS_GUEST_CR4, "CR4" }, { VMCS_GUEST_DR7, "DR7" },
+		{ VMCS_GUEST_IA32_DEBUGCTL, "DEBUGCTL" },
+		{ VMCS_GUEST_IA32_EFER, "EFER" }, { VMCS_GUEST_IA32_PAT, "PAT" },
+		{ VMCS_GUEST_IA32_PERF_GLOBAL_CTRL, "PERFGC" },
+		{ VMCS_GUEST_IA32_SYSENTER_CS, "SE_CS" },
+		{ VMCS_GUEST_IA32_SYSENTER_ESP, "SE_ESP" },
+		{ VMCS_GUEST_IA32_SYSENTER_EIP, "SE_EIP" },
+		{ VMCS_GUEST_RIP, "RIP" }, { VMCS_GUEST_RSP, "RSP" },
+		{ VMCS_GUEST_RFLAGS, "RFLAGS" },
+		GSD_SEG(ES), GSD_SEG(CS), GSD_SEG(SS), GSD_SEG(DS), GSD_SEG(FS),
+		GSD_SEG(GS), GSD_SEG(LDTR), GSD_SEG(TR),
+		{ VMCS_GUEST_GDTR_BASE, "GDTR_B" }, { VMCS_GUEST_GDTR_LIMIT, "GDTR_L" },
+		{ VMCS_GUEST_IDTR_BASE, "IDTR_B" }, { VMCS_GUEST_IDTR_LIMIT, "IDTR_L" },
+		{ VMCS_GUEST_ACTIVITY, "ACTIVITY" },
+		{ VMCS_GUEST_INTERRUPTIBILITY, "INTR" },
+		{ VMCS_GUEST_PENDING_DBG_EXCEPTIONS, "PEND_DBG" },
+		{ VMCS_LINK_POINTER, "LINK" },
+		{ VMCS_ENTRY_INTR_INFO, "N_INTINFO" },
+		{ VMCS_ENTRY_EXCEPTION_ERROR, "N_ERR" },
+		{ VMCS_ENTRY_INST_LENGTH, "N_ILEN" },
+		{ VMCS_GUEST_PDPTE0, "PDPTE0" }, { VMCS_GUEST_PDPTE1, "PDPTE1" },
+		{ VMCS_GUEST_PDPTE2, "PDPTE2" }, { VMCS_GUEST_PDPTE3, "PDPTE3" },
+	};
+	static int traced;
+	struct vmcs12_cache *c = nested_current_cache(vcpu->nested);
+	u_int i;
+
+	if (traced >= 2)
+		return;
+	traced++;
+	printf("nested_probe10 #%d vcpu%d: ingresso in L2 RIFIUTATO dall'hardware "
+	    "(motivo %#lx); CR0 FIXED0=%#lx FIXED1=%#lx CR4 FIXED0=%#lx "
+	    "FIXED1=%#lx\n", traced, vcpu->vcpuid,
+	    (u_long)vmcs_read(VMCS_EXIT_REASON),
+	    (u_long)rdmsr(MSR_VMX_CR0_FIXED0), (u_long)rdmsr(MSR_VMX_CR0_FIXED1),
+	    (u_long)rdmsr(MSR_VMX_CR4_FIXED0), (u_long)rdmsr(MSR_VMX_CR4_FIXED1));
+	for (i = 0; i < nitems(f); i++) {
+		uint64_t v2 = vmcs_read(f[i].enc);
+		uint64_t v12 = c != NULL ? vmcs12_read_field(c, f[i].enc) : 0;
+
+		printf("nested_probe10   %-9s VMCS02=%#18lx VMCS12=%#18lx%s\n",
+		    f[i].nm, (u_long)v2, (u_long)v12, v2 != v12 ? "  <--" : "");
+	}
+}
+#undef	GSD_SEG
+
 bool
 nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 {
@@ -4403,6 +4474,9 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	/* un'uscita normale da L2 = l'ingresso e' riuscito: VMCS12 launched */
 	if ((vmcs_read(VMCS_EXIT_REASON) & 0x80000000) == 0)
 		vcpu->nested->launching = false;
+	if (__predict_false(vmx_nested_probe == 10) &&
+	    (vmcs_read(VMCS_EXIT_REASON) & 0x80000000) != 0)
+		nested_probe_gs_dump(vcpu);		/* sonda 10, vedi sopra */
 	/*
 	 * D4 (parere #51 §7): aggancio di prova, SPENTO per default. Qui il
 	 * vCPU e' in L2 (n->in_l2 vero) e siamo in sezione critica: si
