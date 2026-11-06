@@ -1640,6 +1640,39 @@ vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc)
 	return (0);
 }
 
+/*
+ * Sonda 10, storia (06/11/2026): l'L2 UEFI dentro l'L1 bhyve rientra con
+ * CR0.PG=0 ma EFER.LMA=1 e "IA-32e mode guest"=1, combinazione che ne'
+ * l'hardware ne' il bhyve dell'L1 producono. Con nested_probe=10 si annotano
+ * le scritture nel VMCS12 di ENTRY_CTLS, GUEST_IA32_EFER e GUEST_CR0 (valore
+ * vecchio, nuovo, indirizzo di ritorno = funzione che scrive); la sonda 10 le
+ * stampa al primo ingresso rifiutato. n12hist_rec non e' in linea: il suo
+ * indirizzo di ritorno cade nella funzione chiamante.
+ */
+#define	N12HIST	256
+static struct n12hist {
+	uint64_t	tsc;
+	const void	*c;
+	uintptr_t	ra;
+	uint32_t	enc;
+	uint64_t	old, val;
+} n12hist[N12HIST];
+static u_int n12hist_idx;
+
+static __noinline void
+n12hist_rec(const void *c, uint32_t enc, uint64_t old, uint64_t val)
+{
+	struct n12hist *h = &n12hist[atomic_fetchadd_int(&n12hist_idx, 1) %
+	    N12HIST];
+
+	h->tsc = rdtsc();
+	h->c = c;
+	h->ra = (uintptr_t)__builtin_return_address(0);
+	h->enc = enc;
+	h->old = old;
+	h->val = val;
+}
+
 static int
 vmcs12_write_field(struct vmcs12_cache *c, uint32_t enc, uint64_t val)
 {
@@ -1649,6 +1682,11 @@ vmcs12_write_field(struct vmcs12_cache *c, uint32_t enc, uint64_t val)
 		shv_guard(c, enc);
 	for (i = 0; i < c->nfields; i++)
 		if (c->fields[i].enc == enc) {
+			if (__predict_false(vmx_nested_probe == 10) &&
+			    (enc == VMCS_ENTRY_CTLS ||
+			    enc == VMCS_GUEST_IA32_EFER || enc == VMCS_GUEST_CR0) &&
+			    c->fields[i].val != val)
+				n12hist_rec(c, enc, c->fields[i].val, val);
 			c->fields[i].val = val;
 			return (0);
 		}
@@ -4478,6 +4516,25 @@ nested_probe_gs_dump(struct vmx_vcpu *vcpu)
 
 		printf("nested_probe10   %-9s VMCS02=%#18lx VMCS12=%#18lx%s\n",
 		    f[i].nm, (u_long)v2, (u_long)v12, v2 != v12 ? "  <--" : "");
+	}
+	/* storia delle scritture di ENTRY/EFER/CR0 in QUESTO VMCS12, dalla piu'
+	 * vecchia; ra da risolvere con nm sul modulo (base da kldstat) */
+	{
+		u_int end = n12hist_idx, k, from;
+		uint64_t now = rdtsc();
+
+		from = end > N12HIST ? end - N12HIST : 0;
+		for (k = from; k < end; k++) {
+			struct n12hist *h = &n12hist[k % N12HIST];
+
+			if (h->c != c)
+				continue;
+			printf("nested_probe10 storia -%lu tsc %s %#lx -> %#lx ra=%#lx\n",
+			    (u_long)(now - h->tsc),
+			    h->enc == VMCS_ENTRY_CTLS ? "ENTRY" :
+			    h->enc == VMCS_GUEST_IA32_EFER ? "EFER " : "CR0  ",
+			    (u_long)h->old, (u_long)h->val, (u_long)h->ra);
+		}
 	}
 }
 #undef	GSD_SEG
