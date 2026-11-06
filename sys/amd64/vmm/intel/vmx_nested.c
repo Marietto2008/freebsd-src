@@ -3399,6 +3399,28 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	}
 	/* [v2] IA-32e mode guest degli entry controls di VMCS12 = EFER.LMA di L2 */
 	efer = vmcs_read(VMCS_GUEST_IA32_EFER);
+	/*
+	 * 06/11/2026: questa scrittura era annunciata dal commento [v2] fin
+	 * dalla T2.5 (b2cf06a81e80) ma non c'era. All'uscita il processore
+	 * aggiorna il controllo d'ingresso "IA-32e mode guest" con
+	 * IA32_EFER.LMA dell'ospite; l'hardware lo fa sul VMCS02, qui lo si
+	 * riporta nel VMCS12, come KVM in prepare_vmcs12 (dal controllo del
+	 * VMCS02). Senza, un L1 che lascia all'L2 la scrittura di CR0.PG (bhyve
+	 * con unrestricted guest: CR0_MASK senza PG; il firmware UEFI entra da
+	 * solo in modo 64 bit) ritrovava EFER.LMA=1 (save EFER) ma il
+	 * controllo a 0, e al VMRESUME l'hardware rifiutava l'ingresso:
+	 * "VM-entry failure due to invalid guest state" (33), sonda 10. Non su
+	 * un VM-entry fallito: lo stato guest non e' stato salvato (SDM 27.8).
+	 */
+	if ((vmexit->u.vmx.exit_reason & 0x80000000) == 0) {
+		uint32_t e12 = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_CTLS);
+
+		if (vmcs_read(VMCS_ENTRY_CTLS) & VM_ENTRY_GUEST_LMA)
+			e12 |= VM_ENTRY_GUEST_LMA;
+		else
+			e12 &= ~VM_ENTRY_GUEST_LMA;
+		vmcs12_write_field(c, VMCS_ENTRY_CTLS, e12);
+	}
 
 	/* 3. se VMCS12 non usa VPID, flush del VPID02 (§6.6); col VMCS02 senza
 	 * VPID (vpid02_off) lo fa gia' l'hardware all'uscita */
