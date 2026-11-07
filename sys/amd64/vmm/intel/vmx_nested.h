@@ -232,6 +232,7 @@ void	vept_stats_flush(struct vmx_nested *n);	/* da nested_stats_flush */
 /* B1 */
 bool	vmx_vept_keep_enabled(void);		/* hw.vmm.vmx.vept_keep */
 int	vmx_vept_ad_policy(void);		/* hw.vmm.vmx.nested_ept_ad && host A/D */
+bool	vmx_nested_apicacc_policy(void);	/* hw.vmm.vmx.nested_apic_access && host */
 void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
 int	vmx_vept_cur_slot(struct vmx_nested *n);	/* parere #53 §8: slot corrente o -1 */
 bool	vmx_vept_memgen_stale(struct vmx_vcpu *vcpu);	/* non dorme */
@@ -485,6 +486,9 @@ struct vmx_nested {
 	bool		preempt_on;	/* timer di preemption dell'L1 attivo */
 	uint64_t	vapic_hpa;	/* pagina host della virtual-APIC dell'L1
 					 * (TPR shadow nel VMCS02); 0 = nessuna */
+	uint64_t	apicacc_hpa;	/* pagina host della APIC-access dell'L1
+					 * ("virtualize APIC accesses" nel VMCS02);
+					 * 0 = l'L1 non lo chiede o non e' RAM */
 	uint64_t	preempt_deadline; /* sua scadenza, TSC host assoluto */
 	int		preempt_rate;	/* IA32_VMX_MISC[4:0] */
 	uint64_t	pdpte[4];	/* PDPTE dell'L2 letti dalla memoria di CR3 */

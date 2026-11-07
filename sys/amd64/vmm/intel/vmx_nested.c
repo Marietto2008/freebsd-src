@@ -476,7 +476,7 @@ VMM_STAT_INTEL(VMX_NESTED_VEPT_WIPED, "radici shadow EPT svuotate da INVEPT");
  * essere rifiniti dopo quel test: vedi docs/nested/T1.4.md.
  */
 static void
-vmx_nested_init_msrs(struct vmx_nested *n, bool ad_policy)
+vmx_nested_init_msrs(struct vmx_nested *n, bool ad_policy, bool apicacc_policy)
 {
 	uint64_t basic, misc, proc2, eptcap;
 	uint64_t *m = n->vmx_msr;
@@ -548,6 +548,10 @@ vmx_nested_init_msrs(struct vmx_nested *n, bool ad_policy)
 		    (1ULL << 24) | /* Intel PT uses guest phys */
 		    (1ULL << 25) | /* TSC scaling */
 		    (1ULL << 28);  /* ENCLV exiting */
+		/* bit 0 offerto solo con la politica della VM (vedi
+		 * nested_apic_access); 4/8/9 restano tolti */
+		if (apicacc_policy)
+			exc &= ~(1ULL << 0);
 		m[0x48b - 0x480] = proc2 & ~(exc << 32);
 	}
 
@@ -583,7 +587,7 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	n->current_vmcs12 = VMCS12_GPA_NONE;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
 		n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
-	vmx_nested_init_msrs(n, vcpu->vmx->nested_ad);
+	vmx_nested_init_msrs(n, vcpu->vmx->nested_ad, vcpu->vmx->nested_apicacc);
 	n->vpid2 = vpid_alloc(vcpu->vcpuid);	/* VPID distinto L2 (T2.8) */
 	/*
 	 * Bitmap MSR del VMCS02 (T6.3): una pagina per vCPU, allineata e
@@ -2009,6 +2013,40 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid_d4_arm, CTLFLAG_RWTUN,
     "slow path in L2 (0 = spento)");
 NESTED_CTR(nested_vpid_d4_injected,
     "prova D4: richieste differite del VPID02 iniettate dall'aggancio");
+/*
+ * "Virtualize APIC accesses" (controllo secondario bit 0) per l'L1, piano di
+ * Astra sul rapporto 012 §2: come funzione GENERALE, non come cura. Con la
+ * politica accesa (letta alla creazione della VM) il bit si offre all'L1;
+ * se l'L1 lo accende, il VMCS02 usa la pagina HOST della sua pagina
+ * APIC-access (come KVM, nested_get_vmcs12_pages): un accesso dell'L2 che,
+ * tradotto da EPT12 ed EPT01, cade su quella pagina da' un'uscita
+ * APIC-access (44) che si riflette all'L1, qualificazione compresa.
+ * Spenta: niente cambia rispetto a prima.
+ */
+static int nested_apic_access = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_apic_access, CTLFLAG_RWTUN,
+    &nested_apic_access, 0,
+    "nested: offri all'L1 'virtualize APIC accesses' (letto alla creazione "
+    "della VM; 0 = spento)");
+NESTED_CTR(nested_apicacc_l1_wants,
+    "APIC-access: ingressi in L2 in cui l'L1 ha acceso 'virtualize APIC "
+    "accesses' nel VMCS12");
+NESTED_CTR(nested_apicacc_entries,
+    "APIC-access: ingressi in L2 col controllo acceso nel VMCS02");
+NESTED_CTR(nested_apicacc_noram,
+    "APIC-access: ripiego, pagina dell'L1 non RAM (o TPR shadow senza "
+    "pagina): controllo spento nel VMCS02, si resta sulle EPT violation");
+NESTED_CTR(nested_apicacc_exits,
+    "APIC-access: uscite 44 dell'L2 riflesse all'L1");
+
+bool
+vmx_nested_apicacc_policy(void)
+{
+	return (nested_apic_access != 0 &&
+	    ((rdmsr(MSR_VMX_PROCBASED_CTLS2) >> 32) &
+	    PROCBASED2_VIRTUALIZE_APIC_ACCESSES) != 0);
+}
+
 static int nested_vpid_track = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_vpid_track, CTLFLAG_RWTUN,
     &nested_vpid_track, 0,
@@ -3014,6 +3052,26 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		    PAGE_SIZE, VM_PROT_READ | VM_PROT_WRITE, &ck);
 		if (pg != NULL) {
 			n->vapic_hpa = DMAP_TO_PHYS((vm_offset_t)pg);
+			vm_gpa_release(ck);
+		}
+	}
+
+	/* Pagina host della APIC-access dell'L1, stesso motivo e stessa regola
+	 * (memoria del guest wired). Il controllo conta solo se l'L1 ha attivo
+	 * il gruppo dei secondari e gli e' stato offerto (vmx_msr 0x48B). */
+	n->apicacc_hpa = 0;
+	if ((vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+	    PROCBASED_SECONDARY_CONTROLS) != 0 &&
+	    (vmcs12_proc2(c) & (uint32_t)(n->vmx_msr[0x48b - 0x480] >> 32) &
+	    PROCBASED2_VIRTUALIZE_APIC_ACCESSES) != 0) {
+		uint64_t aa12 = vmcs12_read_field(c, VMCS_APIC_ACCESS);
+		void *pg, *ck;
+
+		atomic_add_long(&nested_apicacc_l1_wants, 1);
+		pg = vm_gpa_hold(vcpu->vcpu, aa12 & ~(uint64_t)PAGE_MASK,
+		    PAGE_SIZE, VM_PROT_READ, &ck);
+		if (pg != NULL) {
+			n->apicacc_hpa = DMAP_TO_PHYS((vm_offset_t)pg);
 			vm_gpa_release(ck);
 		}
 	}
@@ -4774,6 +4832,15 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		/* VMCS12 senza EPT: L2-GPA == L1-GPA, gestione L0 normale */
 		return (false);
 	}
+	case EXIT_REASON_APIC_ACCESS:
+		/*
+		 * Solo con "virtualize APIC accesses" nel VMCS02, che si accende
+		 * solo se l'L1 l'ha chiesto: l'uscita e' sua (qualificazione =
+		 * offset e tipo d'accesso), MAI l'APIC-access dell'L1 stesso
+		 * (vmx_handle_apic_access agirebbe sul vlapic dell'L1).
+		 */
+		atomic_add_long(&nested_apicacc_exits, 1);
+		break;
 	default:
 		break;
 	}
@@ -5842,11 +5909,34 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	proc2 = nested_adjust_ctl(proc2, MSR_VMX_PROCBASED_CTLS2);
 	if (n->vpid02_off)		/* ripiego sicuro (parere #49 §5) */
 		proc2 &= ~PROCBASED2_ENABLE_VPID;
-	proc2 &= ~(PROCBASED2_VMCS_SHADOWING |
-	    PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
-	    PROCBASED2_VIRTUALIZE_X2APIC_MODE |
-	    PROCBASED2_APIC_REGISTER_VIRTUALIZATION |
-	    PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY);
+	{
+		/* l'L1 l'ha chiesto? (proc2 contiene solo cio' che gli si offre) */
+		bool aa12 = (proc2 & PROCBASED2_VIRTUALIZE_APIC_ACCESSES) != 0;
+		bool tpr12 = (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+		    PROCBASED_USE_TPR_SHADOW) != 0;
+
+		proc2 &= ~(PROCBASED2_VMCS_SHADOWING |
+		    PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
+		    PROCBASED2_VIRTUALIZE_X2APIC_MODE |
+		    PROCBASED2_APIC_REGISTER_VIRTUALIZATION |
+		    PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY);
+		/*
+		 * "Virtualize APIC accesses" dell'L1 (nested_apic_access): con la
+		 * sua pagina APIC-access in RAM, e col TPR shadow dell'L1 davvero
+		 * riprodotto se l'L1 lo usa (senza, gli accessi al TPR che l'L1
+		 * si aspetta virtualizzati gli arriverebbero come uscite). In
+		 * ripiego il controllo resta spento: comportamento di prima.
+		 */
+		if (aa12) {
+			if (n->apicacc_hpa != 0 &&
+			    (!tpr12 || n->vapic_hpa != 0)) {
+				proc2 |= PROCBASED2_VIRTUALIZE_APIC_ACCESSES;
+				vmwrite(VMCS_APIC_ACCESS, n->apicacc_hpa);
+				atomic_add_long(&nested_apicacc_entries, 1);
+			} else
+				atomic_add_long(&nested_apicacc_noram, 1);
+		}
+	}
 	vmwrite(VMCS_SEC_PROC_BASED_CTLS, proc2);
 
 	/* --- Exit controls: quelli dell'L0 --- */

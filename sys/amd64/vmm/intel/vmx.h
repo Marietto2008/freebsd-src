@@ -162,6 +162,12 @@ struct vmx {
 	 * implementa (A2); qui e' solo propagazione.
 	 */
 	bool		nested_ad;
+	/*
+	 * "Virtualize APIC accesses" offerto all'L1 (piano Astra, parere 012
+	 * §2): stessa regola dell'A/D, politica letta UNA volta alla creazione
+	 * della VM e uguale per tutti i vCPU (hw.vmm.vmx.nested_apic_access).
+	 */
+	bool		nested_apicacc;
 };
 
 extern bool vmx_have_msr_tsc_aux;
