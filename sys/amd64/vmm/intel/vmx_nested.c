@@ -654,6 +654,36 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 }
 
 /*
+ * Pagine virtual-APIC e APIC-access dell'L1 usate dal VMCS02: rilascio dei
+ * riferimenti tenuti (vedi vapic_ck/apicacc_ck in vmx_nested.h) e azzeramento
+ * degli HPA. Fuori dalla sezione critica (vm_gpa_release).
+ */
+static void
+nested_apic_pages_release(struct vmx_nested *n)
+{
+	if (n->vapic_ck != NULL)
+		vm_gpa_release(n->vapic_ck);
+	if (n->apicacc_ck != NULL)
+		vm_gpa_release(n->apicacc_ck);
+	n->vapic_ck = n->apicacc_ck = NULL;
+	n->vapic_hpa = n->apicacc_hpa = 0;
+}
+
+/*
+ * L'L1 chiede "virtualize APIC accesses" per questo VMCS12? Solo dal VMCS12
+ * e da cio' che gli e' stato offerto: gruppo secondario attivo nei primari e
+ * bit 0 dei secondari dentro le allowed-1 offerte (politica della VM).
+ */
+static bool
+nested_l1_wants_apicacc(struct vmx_nested *n, struct vmcs12_cache *c)
+{
+	return ((vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+	    PROCBASED_SECONDARY_CONTROLS) != 0 &&
+	    (vmcs12_proc2(c) & (uint32_t)(n->vmx_msr[0x48b - 0x480] >> 32) &
+	    PROCBASED2_VIRTUALIZE_APIC_ACCESSES) != 0);
+}
+
+/*
  * Libera lo stato nested. Idempotente. Chiamata a 1->0 della capability e
  * da vmx_vcpu_cleanup.
  */
@@ -684,6 +714,7 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 		free(n->sh_vmcs, M_VMX_NESTED);
 	if (n->diag_simp_ck != NULL)
 		vm_gpa_release(n->diag_simp_ck);
+	nested_apic_pages_release(n);
 	free(n, M_VMX_NESTED);
 	vcpu->nested = NULL;
 }
@@ -2033,9 +2064,12 @@ NESTED_CTR(nested_apicacc_l1_wants,
     "accesses' nel VMCS12");
 NESTED_CTR(nested_apicacc_entries,
     "APIC-access: ingressi in L2 col controllo acceso nel VMCS02");
-NESTED_CTR(nested_apicacc_noram,
-    "APIC-access: ripiego, pagina dell'L1 non RAM (o TPR shadow senza "
-    "pagina): controllo spento nel VMCS02, si resta sulle EPT violation");
+NESTED_CTR(nested_apicacc_stop_page,
+    "APIC-access: VM fermata, la pagina APIC-access chiesta dall'L1 non e' "
+    "RAM (nessuna gestione equivalente: niente ripiego silenzioso)");
+NESTED_CTR(nested_apicacc_stop_vapic,
+    "APIC-access: VM fermata, l'L1 usa il TPR shadow ma la sua pagina "
+    "virtual-APIC non e' RAM");
 NESTED_CTR(nested_apicacc_exits,
     "APIC-access: uscite 44 dell'L2 riflesse all'L1");
 
@@ -3042,7 +3076,7 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	/* Pagina host della virtual-APIC dell'L1 (TPR shadow nel VMCS02, vedi
 	 * nested_compose_vmcs02): QUI, prima del VMPTRLD, perche' vm_gpa_hold
 	 * puo' dormire. 0 = non RAM o TPR shadow spento -> emulazione su CR8. */
-	n->vapic_hpa = 0;
+	nested_apic_pages_release(n);	/* quelle dell'ingresso precedente */
 	if (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
 	    PROCBASED_USE_TPR_SHADOW) {
 		uint64_t va12 = vmcs12_read_field(c, VMCS_VIRTUAL_APIC);
@@ -3052,27 +3086,50 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		    PAGE_SIZE, VM_PROT_READ | VM_PROT_WRITE, &ck);
 		if (pg != NULL) {
 			n->vapic_hpa = DMAP_TO_PHYS((vm_offset_t)pg);
-			vm_gpa_release(ck);
+			n->vapic_ck = ck;	/* tenuto: vedi vmx_nested.h */
 		}
 	}
 
-	/* Pagina host della APIC-access dell'L1, stesso motivo e stessa regola
-	 * (memoria del guest wired). Il controllo conta solo se l'L1 ha attivo
-	 * il gruppo dei secondari e gli e' stato offerto (vmx_msr 0x48B). */
-	n->apicacc_hpa = 0;
-	if ((vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
-	    PROCBASED_SECONDARY_CONTROLS) != 0 &&
-	    (vmcs12_proc2(c) & (uint32_t)(n->vmx_msr[0x48b - 0x480] >> 32) &
-	    PROCBASED2_VIRTUALIZE_APIC_ACCESSES) != 0) {
+	/* Pagina host della APIC-access dell'L1, stessa regola. Il controllo
+	 * conta solo se l'L1 ha attivo il gruppo dei secondari e gli e' stato
+	 * offerto (vmx_msr 0x48B): letto qui dal VMCS12, non da controlli gia'
+	 * fusi con quelli di L0 (parere 015 §3.5). */
+	if (nested_l1_wants_apicacc(n, c)) {
 		uint64_t aa12 = vmcs12_read_field(c, VMCS_APIC_ACCESS);
 		void *pg, *ck;
+		bool tpr12 = (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
+		    PROCBASED_USE_TPR_SHADOW) != 0;
 
 		atomic_add_long(&nested_apicacc_l1_wants, 1);
 		pg = vm_gpa_hold(vcpu->vcpu, aa12 & ~(uint64_t)PAGE_MASK,
 		    PAGE_SIZE, VM_PROT_READ, &ck);
 		if (pg != NULL) {
 			n->apicacc_hpa = DMAP_TO_PHYS((vm_offset_t)pg);
-			vm_gpa_release(ck);
+			n->apicacc_ck = ck;
+		}
+		/*
+		 * Niente ripiego silenzioso (parere 015 §3.2): spegnere il
+		 * controllo cambierebbe cio' che l'L1 ha chiesto (EPT violation o
+		 * accesso completato al posto dell'uscita 44; il TPR non piu'
+		 * virtualizzato). Senza una gestione equivalente la VM si ferma con
+		 * una diagnosi esplicita. E' un limite di QUESTA implementazione
+		 * (come KVM_EXIT_INTERNAL_ERROR), non una regola Intel: i controlli
+		 * sono validi, quindi nessun VMfail inventato.
+		 */
+		if (n->apicacc_hpa == 0 || (tpr12 && n->vapic_hpa == 0)) {
+			bool pag = n->apicacc_hpa == 0;
+
+			atomic_add_long(pag ? &nested_apicacc_stop_page :
+			    &nested_apicacc_stop_vapic, 1);
+			printf("nested: vcpu%d, l'L1 chiede 'virtualize APIC "
+			    "accesses' ma la pagina %s %#lx non e' RAM: VM fermata "
+			    "(limite di questa implementazione)\n", vcpu->vcpuid,
+			    pag ? "APIC-access" : "virtual-APIC del TPR shadow",
+			    (u_long)(pag ? aa12 : vmcs12_read_field(c,
+			    VMCS_VIRTUAL_APIC)));
+			nested_apic_pages_release(n);
+			vm_suspend(vcpu->vmx->vm, VM_SUSPEND_POWEROFF);
+			return (0);
 		}
 	}
 
@@ -5909,33 +5966,23 @@ nested_compose_vmcs02(struct vmx_vcpu *vcpu)
 	proc2 = nested_adjust_ctl(proc2, MSR_VMX_PROCBASED_CTLS2);
 	if (n->vpid02_off)		/* ripiego sicuro (parere #49 §5) */
 		proc2 &= ~PROCBASED2_ENABLE_VPID;
-	{
-		/* l'L1 l'ha chiesto? (proc2 contiene solo cio' che gli si offre) */
-		bool aa12 = (proc2 & PROCBASED2_VIRTUALIZE_APIC_ACCESSES) != 0;
-		bool tpr12 = (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) &
-		    PROCBASED_USE_TPR_SHADOW) != 0;
-
-		proc2 &= ~(PROCBASED2_VMCS_SHADOWING |
-		    PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
-		    PROCBASED2_VIRTUALIZE_X2APIC_MODE |
-		    PROCBASED2_APIC_REGISTER_VIRTUALIZATION |
-		    PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY);
-		/*
-		 * "Virtualize APIC accesses" dell'L1 (nested_apic_access): con la
-		 * sua pagina APIC-access in RAM, e col TPR shadow dell'L1 davvero
-		 * riprodotto se l'L1 lo usa (senza, gli accessi al TPR che l'L1
-		 * si aspetta virtualizzati gli arriverebbero come uscite). In
-		 * ripiego il controllo resta spento: comportamento di prima.
-		 */
-		if (aa12) {
-			if (n->apicacc_hpa != 0 &&
-			    (!tpr12 || n->vapic_hpa != 0)) {
-				proc2 |= PROCBASED2_VIRTUALIZE_APIC_ACCESSES;
-				vmwrite(VMCS_APIC_ACCESS, n->apicacc_hpa);
-				atomic_add_long(&nested_apicacc_entries, 1);
-			} else
-				atomic_add_long(&nested_apicacc_noram, 1);
-		}
+	proc2 &= ~(PROCBASED2_VMCS_SHADOWING |
+	    PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
+	    PROCBASED2_VIRTUALIZE_X2APIC_MODE |
+	    PROCBASED2_APIC_REGISTER_VIRTUALIZATION |
+	    PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY);
+	/*
+	 * "Virtualize APIC accesses" dell'L1 (nested_apic_access): la richiesta
+	 * si legge dal VMCS12 (nested_l1_wants_apicacc), non da proc2 gia' fuso
+	 * con i controlli di L0. nested_vmlaunch garantisce pagina APIC-access
+	 * in RAM e, se l'L1 usa il TPR shadow, la sua pagina virtual-APIC
+	 * riprodotta qui sopra; altrimenti ha fermato la VM prima di arrivare
+	 * qui. Nessun ripiego: o il controllo come l'L1 l'ha chiesto, o niente.
+	 */
+	if (nested_l1_wants_apicacc(n, c) && n->apicacc_hpa != 0) {
+		proc2 |= PROCBASED2_VIRTUALIZE_APIC_ACCESSES;
+		vmwrite(VMCS_APIC_ACCESS, n->apicacc_hpa);
+		atomic_add_long(&nested_apicacc_entries, 1);
 	}
 	vmwrite(VMCS_SEC_PROC_BASED_CTLS, proc2);
 

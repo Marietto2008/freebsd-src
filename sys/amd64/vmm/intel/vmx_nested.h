@@ -488,7 +488,16 @@ struct vmx_nested {
 					 * (TPR shadow nel VMCS02); 0 = nessuna */
 	uint64_t	apicacc_hpa;	/* pagina host della APIC-access dell'L1
 					 * ("virtualize APIC accesses" nel VMCS02);
-					 * 0 = l'L1 non lo chiede o non e' RAM */
+					 * 0 = l'L1 non lo chiede */
+	/*
+	 * Riferimenti (vm_gpa_hold) alle due pagine qui sopra, TENUTI finche'
+	 * il VMCS02 puo' usarle (parere Astra 015 §3.3, come la mappatura che
+	 * KVM conserva): la pagina non si sposta ne' si libera sotto l'HPA.
+	 * Si rilasciano al ricalcolo (prossimo VMLAUNCH/VMRESUME) e in
+	 * vmx_nested_free. NULL = nessun riferimento tenuto.
+	 */
+	void		*vapic_ck;
+	void		*apicacc_ck;
 	uint64_t	preempt_deadline; /* sua scadenza, TSC host assoluto */
 	int		preempt_rate;	/* IA32_VMX_MISC[4:0] */
 	uint64_t	pdpte[4];	/* PDPTE dell'L2 letti dalla memoria di CR3 */
