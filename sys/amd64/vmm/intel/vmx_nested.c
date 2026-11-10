@@ -356,11 +356,12 @@ SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_oprec_every, CTLFLAG_RWTUN,
     "nested: copia anche un episodio normale ogni N (0 = mai)");
 enum {
 	OPR_VMREAD = 1, OPR_VMWRITE, OPR_VMPTRLD, OPR_VMCLEAR, OPR_INVEPT,
-	OPR_INVVPID, OPR_LAUNCH, OPR_RESUME, OPR_RIFL, OPR_RIFL_RIP, OPR_RIFL_INFO
+	OPR_INVVPID, OPR_LAUNCH, OPR_RESUME, OPR_RIFL, OPR_RIFL_RIP, OPR_RIFL_INFO, OPR_RIFL_IDTV
 };
 static const char *const nested_oprec_nome[] = {
 	"?", "VMREAD", "VMWRITE", "VMPTRLD", "VMCLEAR", "INVEPT", "INVVPID",
-	"VMLAUNCH", "VMRESUME", "RIFLESSA", "  rip L2", "  info"	/* 18: RCX; 48: GPA */
+	"VMLAUNCH", "VMRESUME", "RIFLESSA", "  rip L2", "  info",	/* 18: RCX; 48: GPA */
+	"  idt-vect"	/* Fable 023 §2.1ii: campo = IDT-vectoring info valida, val = codice d'errore */
 };
 static struct nested_pfrec nested_pfrec_norm;	/* ultimo episodio normale */
 static volatile u_int nested_pfrec_norm_busy;
@@ -387,8 +388,66 @@ NESTED_CTR(nested_diag_e0c_fermo, "nested: episodi E0 col RIP FERMO e nessun eve
 NESTED_CTR(nested_diag_e0c_fermo_ev, "nested: episodi E0 col RIP fermo e un evento (il #PF del panic e' qui)");
 NESTED_CTR(nested_diag_e0c_altrovmcs, "nested: ingressi con un altro VMCS12 mentre un episodio E0 attende");
 #define	NESTED_ANOM_MAX	4
-static struct nested_pfrec nested_pfrec_anom[NESTED_ANOM_MAX];	/* casi «altro» e «fermo senza evento» */
-static u_int nested_pfrec_anom_n;
+/* Fable 023 §2.3c: posti riservati per classe, 0 = «altro», 1 = «fermo senza evento» */
+static struct nested_pfrec nested_pfrec_anom[2][NESTED_ANOM_MAX];
+static u_int nested_pfrec_anom_n[2];
+/*
+ * Fable 023 §2.2: l'episodio E0 segue il VMCS12, non il vCPU. Tabella globale indicizzata da (VMCS12 >> 12) & 63, con
+ * la chiave completa verificata. E0 scrive il posto e poi alza pending; il primo ingresso con quel VMCS12 su
+ * QUALUNQUE vCPU lo chiude con una cmpset e classifica. Un VMCS12 e' attivo su un solo vCPU alla volta, quindi E0 e
+ * chiusura dello stesso episodio non si sovrappongono. Nessuna attesa, nessun lock.
+ */
+struct nested_e0slot {
+	volatile uint64_t vmcs12;	/* chiave; 0 = libero */
+	volatile u_int	pending;
+	int		vcpu0;
+	struct vmx_nested *n0;		/* per copiare il pfst del vCPU di E0 */
+	uint64_t	seq, rip0, cr3_0, t0;
+	uint32_t	ilen0, idtv0;
+	uint64_t	e12_0[NESTED_E12W];
+	uint64_t	run_rip;	/* §2.3b: serie di «fermi» consecutivi sullo stesso rip0 */
+	u_int		run_len;
+} __aligned(CACHE_LINE_SIZE);
+static struct nested_e0slot nested_e0tab[64];
+#define	NESTED_E0SLOT(v)	(&nested_e0tab[((v) >> 12) & 63])
+NESTED_CTR(nested_diag_e0c_ilen_migr, "nested: di ilen, chiusi su un altro vCPU (VP migrato)");
+NESTED_CTR(nested_diag_e0c_ilen_ev_migr, "nested: di ilen_ev, chiusi su un altro vCPU");
+NESTED_CTR(nested_diag_e0c_altro_migr, "nested: di altro, chiusi su un altro vCPU");
+NESTED_CTR(nested_diag_e0c_altro_ev_migr, "nested: di altro_ev, chiusi su un altro vCPU");
+NESTED_CTR(nested_diag_e0c_fermo_migr, "nested: di fermo, chiusi su un altro vCPU");
+NESTED_CTR(nested_diag_e0c_fermo_ev_migr, "nested: di fermo_ev, chiusi su un altro vCPU");
+NESTED_CTR(nested_diag_e0tab_collisioni, "nested: E0 che hanno sovrascritto un episodio pendente di un altro VMCS12");
+NESTED_CTR(nested_diag_pfrec_pf_esclusi, "nested: #PF all'ingresso che NON rispondono all'emulazione (classe non fermo, o CR3 cambiato)");
+NESTED_CTR(nested_diag_e12w_stale, "nested: riconvalide del puntatore EPT12 che hanno trovato un indirizzo diverso");
+/* §2.3a maschera a 3 bit delle voci EPT12 sorvegliate assenti (RWX=0) a E0, per classe: 0 ilen, 1 fermo, 2 fermo+evento */
+static u_long nested_e0_mask[3][8];
+/* §2.3b serie di fermi consecutivi dello stesso VMCS12 sullo stesso rip0: lunghezza 1, 2, 3, >= 4 */
+static u_long nested_e0_runs[4];
+
+static int
+sysctl_nested_e0c_maschere(SYSCTL_HANDLER_ARGS)
+{
+	static const char *const nome[3] = { "ilen", "fermo", "fermo+evento" };
+	struct sbuf *sb;
+	int error, k, m;
+
+	sb = sbuf_new_for_sysctl(NULL, NULL, 1024, req);
+	sbuf_printf(sb, "\nmaschera delle voci EPT12 assenti a E0 (bit0 codice, bit1 e bit2 tabelle sorvegliate):\n");
+	for (k = 0; k < 3; k++) {
+		sbuf_printf(sb, "  %-13s", nome[k]);
+		for (m = 0; m < 8; m++)
+			sbuf_printf(sb, " %d:%lu", m, atomic_load_long(&nested_e0_mask[k][m]));
+		sbuf_printf(sb, "\n");
+	}
+	sbuf_printf(sb, "serie di fermi consecutivi (stesso VMCS12, stesso rip0): 1:%lu 2:%lu 3:%lu >=4:%lu\n",
+	    atomic_load_long(&nested_e0_runs[0]), atomic_load_long(&nested_e0_runs[1]),
+	    atomic_load_long(&nested_e0_runs[2]), atomic_load_long(&nested_e0_runs[3]));
+	error = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (error);
+}
+SYSCTL_PROC(_hw_vmm_vmx, OID_AUTO, nested_diag_e0c_maschere, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_nested_e0c_maschere, "A", "nested: maschere delle assenze EPT12 per classe e serie di fermi (Fable 023 §2.3)");
 
 static __inline void
 nested_oprec_note(struct vmx_nested *n, uint32_t type, uint32_t field,
@@ -523,9 +582,11 @@ nested_pfrec_rec_sbuf(struct sbuf *sb, const struct nested_pfrec *p, u_int i, in
 	u_int w, v, k;
 
 	sbuf_printf(sb, "== episodio %u vcpu%d seq %lu (%s): E1-E0 %lu tsc, "
-	    "E2-E0 %lu tsc\n", i, p->vcpu, (u_long)p->seq,
-	    p->kind == 1 ? "NORMALE, per confronto" : "#PF iniettato",
-	    (u_long)(p->t1 - p->t0), (u_long)(p->t2 - p->t0));
+	    "E2-E0 %lu tsc; chiuso su vcpu%d%s%s\n", i, p->vcpu, (u_long)p->seq,
+	    p->kind == 1 ? "NORMALE, per confronto" : p->kind == 2 ? "ANOMALO: RIP avanzato d'altro" :
+	    p->kind == 3 ? "ANOMALO: RIP fermo senza evento" : "#PF dell'emulazione",
+	    (u_long)(p->t1 - p->t0), (u_long)(p->t2 - p->t0), p->vcpu_close,
+	    p->migr ? " (VP MIGRATO)" : "", p->pfst_stale ? " ATTENZIONE: E0/E1 riscritti nel frattempo" : "");
 	sbuf_printf(sb, " E0 uscita: rip=%#lx cr3=%#lx gpa=%#lx gla=%#lx "
 	    "qual=%#lx\n", (u_long)p->rip0, (u_long)p->cr3_0,
 	    (u_long)p->gpa0, (u_long)p->gla0, (u_long)p->qual0);
@@ -582,7 +643,7 @@ static int
 sysctl_nested_pfrec_dump(SYSCTL_HANDLER_ARGS)
 {
 	struct sbuf *sb;
-	u_int i, n;
+	u_int i, n, k;
 	int error;
 
 	sb = sbuf_new_for_sysctl(NULL, NULL, 4096, req);
@@ -597,12 +658,16 @@ sysctl_nested_pfrec_dump(SYSCTL_HANDLER_ARGS)
 	}
 	if (atomic_load_acq_int(&nested_pfrec_norm.done) != 0)
 		nested_pfrec_rec_sbuf(sb, &nested_pfrec_norm, NESTED_PFREC_MAX, -1);
-	n = MIN(atomic_load_int(&nested_pfrec_anom_n), NESTED_ANOM_MAX);
-	if (n > 0)
-		sbuf_printf(sb, "\n%u episodi ANOMALI (RIP avanzato d'altro, o fermo senza evento)\n", n);
-	for (i = 0; i < n; i++)
-		if (atomic_load_acq_int(&nested_pfrec_anom[i].done) != 0)
-			nested_pfrec_rec_sbuf(sb, &nested_pfrec_anom[i], 100 + i, -1);
+	for (k = 0; k < 2; k++) {
+		n = MIN(atomic_load_int(&nested_pfrec_anom_n[k]), NESTED_ANOM_MAX);
+		if (n > 0)
+			sbuf_printf(sb, "\n%u episodi ANOMALI di classe %s (su %u)\n", n,
+			    k == 0 ? "«RIP avanzato d'altro»" : "«RIP fermo senza evento»",
+			    atomic_load_int(&nested_pfrec_anom_n[k]));
+		for (i = 0; i < n; i++)
+			if (atomic_load_acq_int(&nested_pfrec_anom[k][i].done) != 0)
+				nested_pfrec_rec_sbuf(sb, &nested_pfrec_anom[k][i], 100 * (k + 1) + i, -1);
+	}
 	error = sbuf_finish(sb);
 	sbuf_delete(sb);
 	return (error);
@@ -3604,6 +3669,14 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		    vcpu->nested->synth_qual : vmcs_read(VMCS_EXIT_QUALIFICATION));
 		nested_oprec_note(vcpu->nested, OPR_RIFL_RIP, 0,
 		    vmcs_read(VMCS_GUEST_RIP));
+		/* Fable 023 §2.1ii: IDT-vectoring valido (consegna interrotta: #PF reiniettato contro originato) */
+		{
+			uint32_t idtv = (uint32_t)vmcs_read(VMCS_IDT_VECTORING_INFO);
+
+			if ((idtv & 0x80000000) != 0)
+				nested_oprec_note(vcpu->nested, OPR_RIFL_IDTV, idtv,
+				    vmcs_read(VMCS_IDT_VECTORING_ERROR));
+		}
 		/* Fable 022 §3.1c: chi toglie o riporta pagine (hypercall) e su quale GPA */
 		if ((vmexit->u.vmx.exit_reason & 0xffff) == EXIT_REASON_VMCALL)
 			nested_oprec_note(vcpu->nested, OPR_RIFL_INFO, 18, vcpu->ctx.guest_rcx);
@@ -5514,6 +5587,31 @@ nested_pfrec_cap_e0(struct vmx_vcpu *vcpu)
 	nested_pfrec_gpr(vcpu, p->gpr0);
 	n->pfrec_eptp12 = c != NULL ? vmcs12_read_field(c, VMCS_EPTP) : 0;
 	n->pfrec_building = true;
+	/* Fable 023 §2.2: il posto dell'episodio nella tabella per VMCS12 (sezione critica: solo scritture semplici) */
+	{
+		struct nested_e0slot *s = NESTED_E0SLOT(n->current_vmcs12);
+		int w;
+
+		if (s->vmcs12 != n->current_vmcs12) {
+			if (s->pending != 0)
+				atomic_add_long(&nested_diag_e0tab_collisioni, 1);
+			s->run_rip = 0;
+			s->run_len = 0;
+		}
+		atomic_store_rel_int(&s->pending, 0);
+		s->vmcs12 = n->current_vmcs12;
+		s->vcpu0 = vcpu->vcpuid;
+		s->n0 = n;
+		s->seq = p->seq;
+		s->rip0 = p->rip0;
+		s->cr3_0 = p->cr3_0;
+		s->t0 = p->t0;
+		s->ilen0 = p->ilen0;
+		s->idtv0 = p->idtv0;
+		for (w = 0; w < NESTED_E12W; w++)
+			s->e12_0[w] = p->e12_0[w];
+		atomic_store_rel_int(&s->pending, 1);
+	}
 }
 
 static void
@@ -5553,95 +5651,129 @@ nested_pfrec_cap_e1(struct vmx_vcpu *vcpu)
 static void
 nested_diag_pfrec_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 {
-	struct vmx_nested *n = vcpu->nested;
-	struct nested_pfrec *p = &n->pfst;
+	struct vmx_nested *n = vcpu->nested, *n0;
+	struct nested_e0slot *s;
+	struct nested_pfrec *r;
 	uint32_t info, err;
-	uint64_t cr2, rip, cr3, eptp12;
-	u_int slot;
+	uint64_t rip, cr3, eptp12;
+	u_int slot, a, v, k, cnt, oi;
+	int cls, migr, w, m;
+	bool ev;
 
-	if (!n->pfrec_armed)
+	/* Fable 023 §2.2: il primo ingresso con il VMCS12 dell'episodio, su qualunque vCPU, lo chiude */
+	s = NESTED_E0SLOT(n->current_vmcs12);
+	if (s->vmcs12 != n->current_vmcs12 || s->pending == 0 ||
+	    !atomic_cmpset_int(&s->pending, 1, 0))
 		return;
-	/* Fable 022 §3.1d: l'episodio si chiude solo rientrando con lo stesso VMCS12 */
-	if (n->current_vmcs12 != p->vmcs12_0) {
-		atomic_add_long(&nested_diag_e0c_altrovmcs, 1);
-		return;
-	}
-	n->pfrec_armed = false;
+	n0 = s->n0;
+	migr = vcpu->vcpuid != s->vcpu0;
 	info = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO);
-	{
-		bool ev = (info & 0x80000000) != 0;
-		int cls;
-		u_int a;
-
-		p->rip_next = vmcs12_read_field(c, VMCS_GUEST_RIP);
-		cls = p->rip_next == p->rip0 + p->ilen0 ? 0 : p->rip_next == p->rip0 ? 2 : 1;
-		atomic_add_long(cls == 0 ? (ev ? &nested_diag_e0c_ilen_ev : &nested_diag_e0c_ilen) :
-		    cls == 1 ? (ev ? &nested_diag_e0c_altro_ev : &nested_diag_e0c_altro) :
-		    (ev ? &nested_diag_e0c_fermo_ev : &nested_diag_e0c_fermo), 1);
-		if ((cls == 1 || (cls == 2 && !ev)) && nested_diag_oprec != 0 &&
-		    (a = atomic_fetchadd_int(&nested_pfrec_anom_n, 1)) < NESTED_ANOM_MAX) {
-			p->kind = 2 + (cls == 2);
-			p->info2 = info;
-			p->t2 = rdtsc();
-			p->done = 0;
-			memcpy(&nested_pfrec_anom[a], p, sizeof(*p));
-			nested_oprec_copy(n, &nested_pfrec_anom[a]);
-			atomic_store_rel_int(&nested_pfrec_anom[a].done, 1);
-		}
+	ev = (info & 0x80000000) != 0;
+	rip = vmcs12_read_field(c, VMCS_GUEST_RIP);
+	cr3 = vmcs12_read_field(c, VMCS_GUEST_CR3);
+	cls = rip == s->rip0 + s->ilen0 ? 0 : rip == s->rip0 ? 2 : 1;
+	atomic_add_long(cls == 0 ? (ev ? &nested_diag_e0c_ilen_ev : &nested_diag_e0c_ilen) :
+	    cls == 1 ? (ev ? &nested_diag_e0c_altro_ev : &nested_diag_e0c_altro) :
+	    (ev ? &nested_diag_e0c_fermo_ev : &nested_diag_e0c_fermo), 1);
+	if (migr)
+		atomic_add_long(cls == 0 ? (ev ? &nested_diag_e0c_ilen_ev_migr : &nested_diag_e0c_ilen_migr) :
+		    cls == 1 ? (ev ? &nested_diag_e0c_altro_ev_migr : &nested_diag_e0c_altro_migr) :
+		    (ev ? &nested_diag_e0c_fermo_ev_migr : &nested_diag_e0c_fermo_migr), 1);
+	/* §2.3a: maschera delle voci sorvegliate assenti a E0 */
+	m = 0;
+	for (w = 0; w < NESTED_E12W; w++)
+		if (s->e12_0[w] != ~0ULL && (s->e12_0[w] & 0x7) == 0)
+			m |= 1 << w;
+	if (cls == 0 && !ev)
+		atomic_add_long(&nested_e0_mask[0][m], 1);
+	else if (cls == 2)
+		atomic_add_long(&nested_e0_mask[ev ? 2 : 1][m], 1);
+	/* §2.3b: serie di fermi senza evento sullo stesso rip0 (lo stesso VMCS12 non gira su due vCPU insieme) */
+	if (cls == 2 && !ev && s->run_len > 0 && s->run_rip == s->rip0) {
+		s->run_len++;
+	} else {
+		if (s->run_len > 0)
+			atomic_add_long(&nested_e0_runs[MIN(s->run_len, 4) - 1], 1);
+		s->run_len = (cls == 2 && !ev) ? 1 : 0;
+		s->run_rip = s->rip0;
 	}
-	if ((info & 0x800007ff) != 0x8000030e) {	/* non #PF valido */
-		atomic_add_long((info & 0x80000000) ? &nested_diag_pfrec_other :
-		    &nested_diag_pfrec_ok, 1);
+	/* §2.3c: record anomali, posti riservati per classe; il pfst e' quello del vCPU di E0 */
+	if ((cls == 1 || (cls == 2 && !ev)) && nested_diag_oprec != 0 &&
+	    (a = atomic_fetchadd_int(&nested_pfrec_anom_n[cls == 2], 1)) < NESTED_ANOM_MAX) {
+		r = &nested_pfrec_anom[cls == 2][a];
+		memcpy(r, &n0->pfst, sizeof(*r));
+		r->done = 0;
+		r->kind = 2 + (cls == 2);
+		r->info2 = info;
+		r->t2 = rdtsc();
+		r->rip_next = rip;
+		r->cr3_2 = cr3;
+		r->migr = migr;
+		r->vcpu_close = vcpu->vcpuid;
+		r->pfst_stale = r->seq != s->seq;
+		for (w = 0; w < NESTED_E12W; w++)		/* §2.4.3 */
+			r->e12_2[w] = n0->e12w[w].ptr != NULL ? atomic_load_64(n0->e12w[w].ptr) : ~0ULL;
+		nested_oprec_copy(n, r);
+		atomic_store_rel_int(&r->done, 1);
+	}
+	/* §2.1i: un #PF risponde all'emulazione solo con il RIP fermo e lo stesso CR3 */
+	if ((info & 0x800007ff) != 0x8000030e || cls != 2 || cr3 != s->cr3_0) {
+		if ((info & 0x800007ff) == 0x8000030e)
+			atomic_add_long(&nested_diag_pfrec_pf_esclusi, 1);
+		else
+			atomic_add_long(ev ? &nested_diag_pfrec_other : &nested_diag_pfrec_ok, 1);
 		/* Fable 018 §4.1: un episodio normale ogni N, per confronto */
-		if (nested_diag_oprec != 0 && nested_diag_oprec_every != 0 &&
+		if (cls == 0 && nested_diag_oprec != 0 && nested_diag_oprec_every != 0 &&
 		    ++n->oprec_ok % nested_diag_oprec_every == 0 &&
 		    atomic_cmpset_int(&nested_pfrec_norm_busy, 0, 1)) {
-			p->kind = 1;
-			p->t2 = rdtsc();
-			p->info2 = info;
-			p->rip2 = vmcs12_read_field(c, VMCS_GUEST_RIP);
-			p->cr3_2 = vmcs12_read_field(c, VMCS_GUEST_CR3);
 			atomic_store_rel_int(&nested_pfrec_norm.done, 0);
-			memcpy(&nested_pfrec_norm, p, sizeof(*p));
+			memcpy(&nested_pfrec_norm, &n0->pfst, sizeof(nested_pfrec_norm));
+			nested_pfrec_norm.kind = 1;
+			nested_pfrec_norm.t2 = rdtsc();
+			nested_pfrec_norm.info2 = info;
+			nested_pfrec_norm.rip2 = nested_pfrec_norm.rip_next = rip;
+			nested_pfrec_norm.cr3_2 = cr3;
+			nested_pfrec_norm.migr = migr;
+			nested_pfrec_norm.vcpu_close = vcpu->vcpuid;
+			nested_pfrec_norm.pfst_stale = nested_pfrec_norm.seq != s->seq;
 			nested_oprec_copy(n, &nested_pfrec_norm);
 			atomic_store_rel_int(&nested_pfrec_norm.done, 1);
 			atomic_store_rel_int(&nested_pfrec_norm_busy, 0);
 		}
 		return;
 	}
+	/* il #PF dell'emulazione: record completo (pfst del vCPU di E0, E2 da questo vCPU) */
 	err = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_EXCEPTION_ERROR);
 	atomic_add_long((err & PGEX_I) ? &nested_diag_pfrec_pf_fetch :
 	    &nested_diag_pfrec_pf_data, 1);
-	cr2 = vcpu->ctx.guest_cr2;	/* CR2 che l'L1 prepara per l'L2 */
-	rip = vmcs12_read_field(c, VMCS_GUEST_RIP);
-	cr3 = vmcs12_read_field(c, VMCS_GUEST_CR3);
 	eptp12 = vmcs12_read_field(c, VMCS_EPTP);
-	p->t2 = rdtsc();
-	p->info2 = info;
-	p->err2 = err;
-	p->cr2_2 = cr2;
-	p->rip2 = rip;
-	p->cr3_2 = cr3;
-	nested_pfrec_gpr(vcpu, p->gpr2);
-	vmx_vept_diag_code(vcpu, eptp12, cr3, rip, &p->c2);
-	p->inv_seq = n->diag_invept_seq;
-	p->inv_tsc = n->diag_invept_tsc;
-	p->inv_type = n->diag_invept_type;
-	p->inv_eptp = n->diag_invept_eptp;
-	p->inv_kept = n->diag_invept_kept;
-	p->inv_wiped = n->diag_invept_wiped;
-	/* committa in un anello (prenotazione atomica dello slot) */
-	p->kind = 0;
-	{
-		int w;
-
-		for (w = 0; w < NESTED_E12W; w++)
-			p->e12_2[w] = n->e12w[w].ptr != NULL ? atomic_load_64(n->e12w[w].ptr) : ~0ULL;
-	}
 	slot = atomic_fetchadd_int(&nested_pfrec_n, 1) % NESTED_PFREC_MAX;
-	p->done = 0;
-	memcpy(&nested_pfrecs[slot], p, sizeof(*p));
-	nested_oprec_copy(n, &nested_pfrecs[slot]);	/* Fable 018 §4.1 */
+	r = &nested_pfrecs[slot];
+	atomic_store_rel_int(&r->done, 0);
+	memcpy(r, &n0->pfst, sizeof(*r));
+	r->done = 0;
+	r->kind = 0;
+	r->migr = migr;
+	r->vcpu_close = vcpu->vcpuid;
+	r->pfst_stale = r->seq != s->seq;
+	r->rip_next = rip;
+	r->t2 = rdtsc();
+	r->info2 = info;
+	r->err2 = err;
+	r->cr2_2 = vcpu->ctx.guest_cr2;	/* CR2 che l'L1 prepara per l'L2 */
+	r->rip2 = rip;
+	r->cr3_2 = cr3;
+	nested_pfrec_gpr(vcpu, r->gpr2);
+	vmx_vept_diag_code(vcpu, eptp12, cr3, rip, &r->c2);
+	r->inv_seq = n0->diag_invept_seq;
+	r->inv_tsc = n0->diag_invept_tsc;
+	r->inv_type = n0->diag_invept_type;
+	r->inv_eptp = n0->diag_invept_eptp;
+	r->inv_kept = n0->diag_invept_kept;
+	r->inv_wiped = n0->diag_invept_wiped;
+	for (w = 0; w < NESTED_E12W; w++)
+		r->e12_2[w] = n0->e12w[w].ptr != NULL ? atomic_load_64(n0->e12w[w].ptr) : ~0ULL;
+	nested_oprec_copy(n0, r);	/* l'anello del vCPU di E0 */
 	/*
 	 * Fable 022 §3.1b: gli anelli di tutti i vCPU, letti mentre gli altri continuano a scrivere (una voce a
 	 * meta' e' possibile e innocua: e' diagnostica). Il TSC e' lo stesso su tutte le CPU dell'host.
@@ -5650,7 +5782,6 @@ nested_diag_pfrec_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 		struct vm *vm = vcpu->vmx->vm;
 		struct vcpu *ov;
 		struct vmx_vcpu *ox;
-		u_int v, k, cnt, oi;
 
 		for (v = 0; v < NESTED_ALLV && v < vm_get_maxcpus(vm); v++) {
 			nested_pfrec_all_n[slot][v] = 0;
@@ -5665,7 +5796,7 @@ nested_diag_pfrec_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 			nested_pfrec_all_n[slot][v] = cnt;
 		}
 	}
-	atomic_store_rel_int(&nested_pfrecs[slot].done, 1);
+	atomic_store_rel_int(&r->done, 1);
 }
 
 static void
@@ -5897,6 +6028,7 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 		int w;
 
 		n->pfrec_need_walk = false;
+		n->e12w_reval++;
 		/* Fable 022 §3.1a: voci EPT12 a puntatore fisso, una volta per EPTP12 e L2-GPA */
 		for (w = 0; w < NESTED_E12W; w++) {
 			if (nested_diag_e12w_gpa[w] == 0) {
@@ -5904,8 +6036,22 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 				continue;
 			}
 			if (n->e12w[w].ptr != NULL && n->e12w[w].eptp12 == n->pfrec_eptp12 &&
-			    n->e12w[w].l2gpa == nested_diag_e12w_gpa[w])
+			    n->e12w[w].l2gpa == nested_diag_e12w_gpa[w] &&
+			    n->e12w[w].lvl == 0 &&		/* Fable 023 §2.4.1: ramo non ancora popolato */
+			    (n->e12w_reval & 4095) != 0)	/* §2.4.2: riconvalida ogni 4096 passaggi */
 				continue;
+			if (n->e12w[w].ptr != NULL && n->e12w[w].eptp12 == n->pfrec_eptp12 &&
+			    n->e12w[w].l2gpa == nested_diag_e12w_gpa[w]) {
+				uint64_t old = n->e12w[w].egpa;
+				volatile uint64_t *np;
+
+				np = vmx_vept_ept12_entry_ptr(vcpu, n->pfrec_eptp12,
+				    nested_diag_e12w_gpa[w], &n->e12w[w].egpa, &n->e12w[w].lvl);
+				if (np != NULL && n->e12w[w].egpa != old)
+					atomic_add_long(&nested_diag_e12w_stale, 1);
+				n->e12w[w].ptr = np;
+				continue;
+			}
 			n->e12w[w].eptp12 = n->pfrec_eptp12;
 			n->e12w[w].l2gpa = nested_diag_e12w_gpa[w];
 			n->e12w[w].ptr = vmx_vept_ept12_entry_ptr(vcpu, n->pfrec_eptp12,

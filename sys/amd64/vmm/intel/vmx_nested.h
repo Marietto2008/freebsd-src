@@ -187,6 +187,8 @@ struct nested_pfrec {
 	uint64_t	e12_0[NESTED_E12W], e12_2[NESTED_E12W], e12_egpa[NESTED_E12W];
 	int		e12_lvl[NESTED_E12W];
 	uint64_t	rip_next;	/* RIP all'ingresso successivo (classificazione d) */
+	/* Fable 023 §2.2: chiusura su un altro vCPU; pfst del vCPU di E0 riscritto nel frattempo */
+	int		migr, pfst_stale, vcpu_close;
 };
 
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
@@ -668,6 +670,7 @@ struct vmx_nested {
 		volatile uint64_t *ptr;	/* DMAP della voce (memoria dell'L1 wired) */
 		int		lvl;
 	} e12w[NESTED_E12W];
+	u_int		e12w_reval;	/* Fable 023 §2.4.2: passaggi del percorso lento, per la riconvalida */
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 
