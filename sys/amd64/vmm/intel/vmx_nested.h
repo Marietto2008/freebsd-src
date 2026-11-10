@@ -149,9 +149,21 @@ struct vept_diag_code {
 	int		r, fail_lvl, nbytes, ok_l1, ok_sh;
 	uint8_t		b_l1[16], b_sh[16];
 };
+/*
+ * Diagnosi Fable 018 §4.1: una operazione VMX dell'L1 (o una riflessione verso
+ * l'L1) nell'anello per vCPU del registratore (nested_diag_oprec).
+ */
+#define	NESTED_OPREC_N	256
+struct nested_oprec {
+	uint64_t	tsc;
+	uint64_t	val;		/* valore restituito/scritto, indirizzo, qual */
+	uint32_t	field;		/* campo VMCS, tipo INVEPT/INVVPID, motivo */
+	uint32_t	type;		/* OPR_* in vmx_nested.c */
+};
 struct nested_pfrec {
 	volatile int	done;
 	int		vcpu;
+	int		kind;		/* 0 = #PF iniettato, 1 = episodio normale */
 	uint64_t	seq;		/* progressivo delle uscite E0 del vCPU */
 	uint64_t	t0, rip0, cr3_0, gpa0, gla0, qual0, gpr0[16];
 	struct vept_diag_code c0;
@@ -161,6 +173,11 @@ struct nested_pfrec {
 	struct vept_diag_code c2;
 	uint64_t	inv_seq, inv_tsc, inv_type, inv_eptp;
 	int		inv_kept, inv_wiped;
+	/* Fable 018 §4.1: E0 dal VMCS02, oltre a rip/cr3/gpa/gla/qual */
+	uint64_t	cr0_0, cr4_0, efer0, rflags0;
+	uint32_t	csar0, ssar0, intr0, act0, idtv0, idte0, ilen0;
+	u_int		ops_n;		/* anello copiato al congelamento */
+	struct nested_oprec ops[NESTED_OPREC_N];
 };
 
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
@@ -630,6 +647,10 @@ struct vmx_nested {
 	uint64_t	pfrec_eptp12;	/* EPTP12 per il walk differito */
 	bool		pfrec_armed;	/* E0+E1 fatti, si attende l'ingresso */
 	uint64_t	pfrec_seq;
+	/* Fable 018 §4.1: registratore delle operazioni VMX dell'L1 */
+	struct nested_oprec oprec[NESTED_OPREC_N];
+	u_int		oprec_i;
+	uint64_t	oprec_ok;	/* episodi normali, per "uno ogni N" */
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 

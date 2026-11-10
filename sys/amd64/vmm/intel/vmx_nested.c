@@ -333,6 +333,122 @@ NESTED_CTR(nested_diag_pfrec_other, "nested: episodi con altro evento");
 #define	NESTED_PFREC_MAX	8
 static struct nested_pfrec nested_pfrecs[NESTED_PFREC_MAX];
 static u_int nested_pfrec_n;
+/*
+ * Diagnosi Fable 018 §4.1: registratore delle operazioni VMX dell'L1. Senza
+ * shadow VMCS ogni VMREAD di Hyper-V esce verso L0: un anello per vCPU tiene
+ * le ultime NESTED_OPREC_N operazioni (VMREAD con il valore DAVVERO restituito,
+ * VMWRITE, VMPTRLD, VMCLEAR, INVEPT, INVVPID, VMLAUNCH/VMRESUME con l'evento
+ * iniettato e il CR2, riflessioni verso l'L1 con motivo, qualificazione e RIP
+ * dell'L2). Quando l'L1 inietta il #PF di un episodio E0/E1 l'anello si copia
+ * nel record di nested_diag_pfrec; nel dump ogni VMREAD dopo l'ultima
+ * riflessione 48 si confronta con E0 (VMCS02). Comportamento invariato: un
+ * rdtsc e quattro store per operazione, nessuna attesa, nessun lock. Spento di
+ * base; serve anche nested_diag_pfrec=1 (E0/E1/E2 e il congelamento).
+ */
+static int nested_diag_oprec = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag_oprec, CTLFLAG_RWTUN,
+    &nested_diag_oprec, 0,
+    "nested: registratore delle operazioni VMX dell'L1 (Fable 018 par. 4.1)");
+static u_int nested_diag_oprec_every = 0;
+SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_oprec_every, CTLFLAG_RWTUN,
+    &nested_diag_oprec_every, 0,
+    "nested: copia anche un episodio normale ogni N (0 = mai)");
+enum {
+	OPR_VMREAD = 1, OPR_VMWRITE, OPR_VMPTRLD, OPR_VMCLEAR, OPR_INVEPT,
+	OPR_INVVPID, OPR_LAUNCH, OPR_RESUME, OPR_RIFL, OPR_RIFL_RIP
+};
+static const char *const nested_oprec_nome[] = {
+	"?", "VMREAD", "VMWRITE", "VMPTRLD", "VMCLEAR", "INVEPT", "INVVPID",
+	"VMLAUNCH", "VMRESUME", "RIFLESSA", "  rip L2"
+};
+static struct nested_pfrec nested_pfrec_norm;	/* ultimo episodio normale */
+static volatile u_int nested_pfrec_norm_busy;
+
+static __inline void
+nested_oprec_note(struct vmx_nested *n, uint32_t type, uint32_t field,
+    uint64_t val)
+{
+	struct nested_oprec *o;
+
+	if (__predict_true(nested_diag_oprec == 0))
+		return;
+	o = &n->oprec[n->oprec_i++ % NESTED_OPREC_N];	/* solo il thread del vCPU */
+	o->tsc = rdtsc();
+	o->type = type;
+	o->field = field;
+	o->val = val;
+}
+
+/* l'anello del vCPU nel record, dalla piu' vecchia alla piu' recente */
+static void
+nested_oprec_copy(struct vmx_nested *n, struct nested_pfrec *p)
+{
+	u_int i, cnt;
+
+	cnt = MIN(n->oprec_i, NESTED_OPREC_N);
+	for (i = 0; i < cnt; i++)
+		p->ops[i] = n->oprec[(n->oprec_i - cnt + i) % NESTED_OPREC_N];
+	p->ops_n = cnt;
+}
+
+/* VMREAD dell'episodio contro E0 (VMCS02 prima della riflessione) */
+static const char *
+nested_oprec_confronta(const struct nested_pfrec *p, uint32_t field,
+    uint64_t v)
+{
+	uint64_t e;
+	bool info = false;
+
+	switch (field) {
+	case VMCS_GUEST_RIP:			e = p->rip0; break;
+	case VMCS_GUEST_CR3:			e = p->cr3_0; break;
+	case VMCS_GUEST_RFLAGS:			e = p->rflags0; break;
+	case VMCS_GUEST_CS_ACCESS_RIGHTS:	e = p->csar0; break;
+	case VMCS_GUEST_SS_ACCESS_RIGHTS:	e = p->ssar0; break;
+	case VMCS_GUEST_LINEAR_ADDRESS:		e = p->gla0; break;
+	case VMCS_GUEST_PHYSICAL_ADDRESS:	e = p->gpa0; break;
+	case VMCS_EXIT_INSTRUCTION_LENGTH:	e = p->ilen0; break;
+	case VMCS_IDT_VECTORING_INFO:		e = p->idtv0; break;
+	case VMCS_GUEST_INTERRUPTIBILITY:	e = p->intr0; break;
+	case VMCS_GUEST_ACTIVITY:		e = p->act0; break;
+	case VMCS_EXIT_QUALIFICATION:	/* i bit 5:3 sono i permessi dell'EPT12 */
+		return (((v ^ p->qual0) & ~0x38ULL) != 0 ?
+		    "  <-- DIVERSO da E0 (fuori dai bit 5:3)" : "  = E0 (salvo 5:3)");
+	case VMCS_GUEST_CR0:			e = p->cr0_0; info = true; break;
+	case VMCS_GUEST_CR4:			e = p->cr4_0; info = true; break;
+	case VMCS_GUEST_IA32_EFER:		e = p->efer0; info = true; break;
+	default:
+		return ("");
+	}
+	if (v == e)
+		return ("  = E0");
+	return (info ? "  (diverso dal VMCS02: maschere/LOAD_EFER, da guardare)" :
+	    "  <-- DIVERSO da E0");
+}
+
+static void
+nested_oprec_sbuf(struct sbuf *sb, const struct nested_pfrec *p)
+{
+	const struct nested_oprec *o;
+	u_int i, last48 = UINT_MAX;
+
+	for (i = 0; i < p->ops_n; i++)
+		if (p->ops[i].type == OPR_RIFL &&
+		    (p->ops[i].field & 0xffff) == EXIT_REASON_EPT_FAULT)
+			last48 = i;
+	sbuf_printf(sb, " operazioni VMX dell'L1 su questo vCPU: %u, dalla piu' "
+	    "vecchia (* = dall'ultima riflessione 48 in poi)\n", p->ops_n);
+	for (i = 0; i < p->ops_n; i++) {
+		o = &p->ops[i];
+		sbuf_printf(sb, "  %c%3u +%lu %s campo=%#x val=%#lx%s\n",
+		    (last48 != UINT_MAX && i >= last48) ? '*' : ' ', i,
+		    (u_long)(o->tsc - p->ops[0].tsc),
+		    o->type < nitems(nested_oprec_nome) ?
+		    nested_oprec_nome[o->type] : "?", o->field, (u_long)o->val,
+		    (o->type == OPR_VMREAD && last48 != UINT_MAX && i > last48) ?
+		    nested_oprec_confronta(p, o->field, o->val) : "");
+	}
+}
 
 static void
 nested_pfrec_code_sbuf(struct sbuf *sb, const char *tag,
@@ -371,11 +487,47 @@ nested_pfrec_gpr_sbuf(struct sbuf *sb, const char *tag, const uint64_t *g)
 	    (u_long)g[13], (u_long)g[14], (u_long)g[15]);
 }
 
+static void
+nested_pfrec_rec_sbuf(struct sbuf *sb, const struct nested_pfrec *p, u_int i)
+{
+	sbuf_printf(sb, "== episodio %u vcpu%d seq %lu (%s): E1-E0 %lu tsc, "
+	    "E2-E0 %lu tsc\n", i, p->vcpu, (u_long)p->seq,
+	    p->kind == 1 ? "NORMALE, per confronto" : "#PF iniettato",
+	    (u_long)(p->t1 - p->t0), (u_long)(p->t2 - p->t0));
+	sbuf_printf(sb, " E0 uscita: rip=%#lx cr3=%#lx gpa=%#lx gla=%#lx "
+	    "qual=%#lx\n", (u_long)p->rip0, (u_long)p->cr3_0,
+	    (u_long)p->gpa0, (u_long)p->gla0, (u_long)p->qual0);
+	sbuf_printf(sb, " E0 VMCS02: cr0=%#lx cr4=%#lx efer=%#lx rflags=%#lx "
+	    "cs_ar=%#x ss_ar=%#x interr=%#x activity=%#x idt_vec=%#x/%#x "
+	    "ilen=%u\n", (u_long)p->cr0_0, (u_long)p->cr4_0, (u_long)p->efer0,
+	    (u_long)p->rflags0, p->csar0, p->ssar0, p->intr0, p->act0,
+	    p->idtv0, p->idte0, p->ilen0);
+	nested_pfrec_gpr_sbuf(sb, "E0", p->gpr0);
+	nested_pfrec_code_sbuf(sb, "E0", &p->c0);
+	sbuf_printf(sb, " E1 all'L1: motivo=%#lx rip=%#lx gpa=%#lx "
+	    "gla=%#lx qual=%#lx\n", (u_long)p->reason1, (u_long)p->rip1,
+	    (u_long)p->gpa1, (u_long)p->gla1, (u_long)p->qual1);
+	nested_pfrec_gpr_sbuf(sb, "E1", p->gpr1);
+	sbuf_printf(sb, " E2 ingresso: info=%#x err=%#x%s cr2=%#lx "
+	    "rip=%#lx cr3=%#lx\n", p->info2, p->err2,
+	    (p->info2 & (1U << 11)) ? "" : " (codice d'errore NON valido)",
+	    (u_long)p->cr2_2, (u_long)p->rip2, (u_long)p->cr3_2);
+	if (p->kind == 0) {
+		nested_pfrec_gpr_sbuf(sb, "E2", p->gpr2);
+		nested_pfrec_code_sbuf(sb, "E2", &p->c2);
+		sbuf_printf(sb, " ultimo INVEPT dell'L1 su questo vCPU: #%lu "
+		    "tipo=%lu eptp=%#lx %lu tsc prima di E0, radici conservate=%d "
+		    "svuotate=%d\n", (u_long)p->inv_seq, (u_long)p->inv_type,
+		    (u_long)p->inv_eptp, (u_long)(p->t0 - p->inv_tsc),
+		    p->inv_kept, p->inv_wiped);
+	}
+	nested_oprec_sbuf(sb, p);
+}
+
 static int
 sysctl_nested_pfrec_dump(SYSCTL_HANDLER_ARGS)
 {
 	struct sbuf *sb;
-	struct nested_pfrec *p;
 	u_int i, n;
 	int error;
 
@@ -385,33 +537,12 @@ sysctl_nested_pfrec_dump(SYSCTL_HANDLER_ARGS)
 		n = NESTED_PFREC_MAX;
 	sbuf_printf(sb, "\n%u record (max %d)\n", n, NESTED_PFREC_MAX);
 	for (i = 0; i < n; i++) {
-		p = &nested_pfrecs[i];
-		if (atomic_load_acq_int(&p->done) == 0)
+		if (atomic_load_acq_int(&nested_pfrecs[i].done) == 0)
 			continue;
-		sbuf_printf(sb, "== episodio %u vcpu%d seq %lu: E1-E0 %lu tsc, "
-		    "E2-E0 %lu tsc\n", i, p->vcpu, (u_long)p->seq,
-		    (u_long)(p->t1 - p->t0), (u_long)(p->t2 - p->t0));
-		sbuf_printf(sb, " E0 uscita: rip=%#lx cr3=%#lx gpa=%#lx gla=%#lx "
-		    "qual=%#lx\n", (u_long)p->rip0, (u_long)p->cr3_0,
-		    (u_long)p->gpa0, (u_long)p->gla0, (u_long)p->qual0);
-		nested_pfrec_gpr_sbuf(sb, "E0", p->gpr0);
-		nested_pfrec_code_sbuf(sb, "E0", &p->c0);
-		sbuf_printf(sb, " E1 all'L1: motivo=%#lx rip=%#lx gpa=%#lx "
-		    "gla=%#lx qual=%#lx\n", (u_long)p->reason1, (u_long)p->rip1,
-		    (u_long)p->gpa1, (u_long)p->gla1, (u_long)p->qual1);
-		nested_pfrec_gpr_sbuf(sb, "E1", p->gpr1);
-		sbuf_printf(sb, " E2 ingresso: info=%#x err=%#x%s cr2=%#lx "
-		    "rip=%#lx cr3=%#lx\n", p->info2, p->err2,
-		    (p->info2 & (1U << 11)) ? "" : " (codice d'errore NON valido)",
-		    (u_long)p->cr2_2, (u_long)p->rip2, (u_long)p->cr3_2);
-		nested_pfrec_gpr_sbuf(sb, "E2", p->gpr2);
-		nested_pfrec_code_sbuf(sb, "E2", &p->c2);
-		sbuf_printf(sb, " ultimo INVEPT dell'L1 su questo vCPU: #%lu tipo=%lu "
-		    "eptp=%#lx %lu tsc prima di E0, radici conservate=%d "
-		    "svuotate=%d\n", (u_long)p->inv_seq, (u_long)p->inv_type,
-		    (u_long)p->inv_eptp, (u_long)(p->t0 - p->inv_tsc),
-		    p->inv_kept, p->inv_wiped);
+		nested_pfrec_rec_sbuf(sb, &nested_pfrecs[i], i);
 	}
+	if (atomic_load_acq_int(&nested_pfrec_norm.done) != 0)
+		nested_pfrec_rec_sbuf(sb, &nested_pfrec_norm, NESTED_PFREC_MAX);
 	error = sbuf_finish(sb);
 	sbuf_delete(sb);
 	return (error);
@@ -1480,6 +1611,7 @@ nested_vmclear(struct vmx_vcpu *vcpu)
 	case NOPND_CONTESO:
 		return (nested_operand_conteso(vcpu));
 	}
+	nested_oprec_note(n, OPR_VMCLEAR, 0, vmcs12);	/* Fable 018 §4.1 */
 	if ((vmcs12 & PAGE_MASK) != 0 || (vmcs12 >> cpu_maxphyaddr) != 0) {
 		nested_vmx_result(vcpu, VMXERR_VMCLEAR_INVALID_ADDRESS);
 		goto done;
@@ -1536,6 +1668,7 @@ nested_vmptrld(struct vmx_vcpu *vcpu)
 	case NOPND_CONTESO:
 		return (nested_operand_conteso(vcpu));
 	}
+	nested_oprec_note(n, OPR_VMPTRLD, 0, vmcs12);	/* Fable 018 §4.1 */
 	if ((vmcs12 & PAGE_MASK) != 0 || (vmcs12 >> cpu_maxphyaddr) != 0) {
 		nested_vmx_result(vcpu, VMXERR_VMPTRLD_INVALID_ADDRESS);
 		goto done;
@@ -2561,6 +2694,7 @@ nested_vmread(struct vmx_vcpu *vcpu)
 	if (len == 4)
 		val &= 0xffffffffULL;
 
+	nested_oprec_note(n, OPR_VMREAD, field, val);	/* Fable 018 §4.1 */
 	if ((info >> 10) & 0x1) {
 		vmx_set_guest_reg(vcpu, (info >> 3) & 0xf, val);
 	} else {
@@ -2639,6 +2773,7 @@ nested_vmwrite(struct vmx_vcpu *vcpu)
 		goto done;
 	}
 	shvmcs_mark(n, c, field);	/* campo RO dello shadow: va ricopiato */
+	nested_oprec_note(n, OPR_VMWRITE, field, val);	/* Fable 018 §4.1 */
 	c->control_dirty = true;
 	c->host_dirty = true;
 	nested_vmx_result(vcpu, VMXR_SUCCEED);
@@ -3138,6 +3273,10 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 	if (vmcs12_proc2(c) &
 	    PROCBASED2_ENABLE_EPT)
 		vmx_vept_prepare(vcpu);
+	/* Fable 018 §4.1: ingresso, con l'evento iniettato e il CR2 dell'L1 */
+	nested_oprec_note(n, is_resume ? OPR_RESUME : OPR_LAUNCH,
+	    (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_INTR_INFO),
+	    vcpu->ctx.guest_cr2);
 	/* diagpf2: #PF iniettato dall'L1 (qui si puo' dormire: vm_gpa_hold) */
 	if (__predict_false(nested_diag_pfinj != 0))
 		nested_diag_pfinj_note(vcpu, c);
@@ -3398,6 +3537,14 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	 * vmx_host_state_area_test: 1411 + 537 fallimenti in gran parte a
 	 * catena).
 	 */
+	/* Fable 018 §4.1: la riflessione nell'anello (VMCS02 corrente) */
+	if (__predict_false(nested_diag_oprec != 0)) {
+		nested_oprec_note(vcpu->nested, OPR_RIFL,
+		    vmexit->u.vmx.exit_reason, vcpu->nested->synth ?
+		    vcpu->nested->synth_qual : vmcs_read(VMCS_EXIT_QUALIFICATION));
+		nested_oprec_note(vcpu->nested, OPR_RIFL_RIP, 0,
+		    vmcs_read(VMCS_GUEST_RIP));
+	}
 	if ((vmexit->u.vmx.exit_reason & 0x80000000) != 0 &&
 	    vcpu->nested->launching)
 		c->launched = 0;
@@ -4943,6 +5090,7 @@ nested_invvpid(struct vmx_vcpu *vcpu)
 	case NOPND_CONTESO:
 		return (nested_operand_conteso(vcpu));
 	}
+	nested_oprec_note(n, OPR_INVVPID, (uint32_t)type, q[0]);	/* Fable 018 §4.1 */
 	if ((q[0] >> 16) != 0 ||				/* riservati */
 	    (type != 2 && (q[0] & 0xffff) == 0) ||		/* VPID 0 */
 	    (type == 0 && !nested_canonical(q[1]))) {		/* indirizzo */
@@ -5008,6 +5156,7 @@ nested_invept(struct vmx_vcpu *vcpu)
 	case NOPND_CONTESO:
 		return (nested_operand_conteso(vcpu));
 	}
+	nested_oprec_note(n, OPR_INVEPT, (uint32_t)type, desc[0]);	/* Fable 018 §4.1 */
 	if (type == 1) {
 		eptp = desc[0];
 		/* #162: EPTP che farebbe fallire un VM entry -> VMfail 28, nessuna
@@ -5275,6 +5424,17 @@ nested_pfrec_cap_e0(struct vmx_vcpu *vcpu)
 	p->gpa0 = n->ept_gpa;
 	p->gla0 = vmcs_read(VMCS_GUEST_LINEAR_ADDRESS);
 	p->qual0 = n->ept_qual;
+	p->cr0_0 = vmcs_read(VMCS_GUEST_CR0);
+	p->cr4_0 = vmcs_read(VMCS_GUEST_CR4);
+	p->efer0 = vmcs_read(VMCS_GUEST_IA32_EFER);
+	p->rflags0 = vmcs_read(VMCS_GUEST_RFLAGS);
+	p->csar0 = (uint32_t)vmcs_read(VMCS_GUEST_CS_ACCESS_RIGHTS);
+	p->ssar0 = (uint32_t)vmcs_read(VMCS_GUEST_SS_ACCESS_RIGHTS);
+	p->intr0 = (uint32_t)vmcs_read(VMCS_GUEST_INTERRUPTIBILITY);
+	p->act0 = (uint32_t)vmcs_read(VMCS_GUEST_ACTIVITY);
+	p->idtv0 = (uint32_t)vmcs_read(VMCS_IDT_VECTORING_INFO);
+	p->idte0 = (uint32_t)vmcs_read(VMCS_IDT_VECTORING_ERROR);
+	p->ilen0 = (uint32_t)vmcs_read(VMCS_EXIT_INSTRUCTION_LENGTH);
 	nested_pfrec_gpr(vcpu, p->gpr0);
 	n->pfrec_eptp12 = c != NULL ? vmcs12_read_field(c, VMCS_EPTP) : 0;
 	n->pfrec_building = true;
@@ -5330,6 +5490,21 @@ nested_diag_pfrec_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	if ((info & 0x800007ff) != 0x8000030e) {	/* non #PF valido */
 		atomic_add_long((info & 0x80000000) ? &nested_diag_pfrec_other :
 		    &nested_diag_pfrec_ok, 1);
+		/* Fable 018 §4.1: un episodio normale ogni N, per confronto */
+		if (nested_diag_oprec != 0 && nested_diag_oprec_every != 0 &&
+		    ++n->oprec_ok % nested_diag_oprec_every == 0 &&
+		    atomic_cmpset_int(&nested_pfrec_norm_busy, 0, 1)) {
+			p->kind = 1;
+			p->t2 = rdtsc();
+			p->info2 = info;
+			p->rip2 = vmcs12_read_field(c, VMCS_GUEST_RIP);
+			p->cr3_2 = vmcs12_read_field(c, VMCS_GUEST_CR3);
+			atomic_store_rel_int(&nested_pfrec_norm.done, 0);
+			memcpy(&nested_pfrec_norm, p, sizeof(*p));
+			nested_oprec_copy(n, &nested_pfrec_norm);
+			atomic_store_rel_int(&nested_pfrec_norm.done, 1);
+			atomic_store_rel_int(&nested_pfrec_norm_busy, 0);
+		}
 		return;
 	}
 	err = (uint32_t)vmcs12_read_field(c, VMCS_ENTRY_EXCEPTION_ERROR);
@@ -5354,9 +5529,11 @@ nested_diag_pfrec_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	p->inv_kept = n->diag_invept_kept;
 	p->inv_wiped = n->diag_invept_wiped;
 	/* committa in un anello (prenotazione atomica dello slot) */
+	p->kind = 0;
 	slot = atomic_fetchadd_int(&nested_pfrec_n, 1) % NESTED_PFREC_MAX;
 	p->done = 0;
 	memcpy(&nested_pfrecs[slot], p, sizeof(*p));
+	nested_oprec_copy(n, &nested_pfrecs[slot]);	/* Fable 018 §4.1 */
 	atomic_store_rel_int(&nested_pfrecs[slot].done, 1);
 }
 
