@@ -2508,6 +2508,44 @@ vmx_vept_diag_code(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
 }
 
 /*
+ * Diagnosi Fable 022 §3.1a: indirizzo della voce EPT12 che traduce l2gpa (la
+ * foglia, o la voce di livello superiore dove il walk si ferma: assente o
+ * grande), per leggerla poi con UN solo accesso in memoria a ogni E0 e accanto
+ * a ogni operazione dell'anello. La memoria dell'L1 e' wired: la pagina della
+ * tabella non si sposta finche' la VM vive, quindi il puntatore DMAP resta
+ * valido anche dopo vm_gpa_release (si rifiuta se la memoria non e' wired). Se
+ * Hyper-V sostituisce la tabella, il puntatore resta su quella vecchia: lo dice
+ * il confronto con il walk di E2. Puo' dormire (vm_gpa_hold).
+ */
+uint64_t *
+vmx_vept_ept12_entry_ptr(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
+    uint64_t *egpa, int *lvlp)
+{
+	uint64_t t, v, *p;
+	void *ck;
+	int lvl, idx;
+
+	t = eptp12 & VEPT_EPTP_BASE;
+	for (lvl = 3; lvl >= 0; lvl--) {
+		idx = (int)((l2gpa >> (12 + 9 * lvl)) & 0x1ff);
+		if (!vm_mem_wired(vcpu->vmx->vm, t))
+			return (NULL);
+		p = vm_gpa_hold(vcpu->vcpu, t, PAGE_SIZE, VM_PROT_READ, &ck);
+		if (p == NULL)
+			return (NULL);
+		v = atomic_load_64(&p[idx]);
+		vm_gpa_release(ck);
+		if (lvl == 0 || (v & EPT_RWX) == 0 || (v & EPT_PG_PS) != 0) {
+			*egpa = t + (uint64_t)idx * sizeof(uint64_t);
+			*lvlp = lvl;
+			return (&p[idx]);
+		}
+		t = EPT_ADDR(v);
+	}
+	return (NULL);
+}
+
+/*
  * Parere Opus WSL2-FreeBSD 009 §1: per la pagina L2-GPA (quella del codice al
  * #PF di fetch iniettato dall'L1), la tabella PT dell'EPT12 e la sua voce VIVA
  * contro la FOTOGRAFIA della conservazione B1 (o "non tracciata"), con i flag

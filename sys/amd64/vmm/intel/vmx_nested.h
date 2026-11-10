@@ -159,7 +159,11 @@ struct nested_oprec {
 	uint64_t	val;		/* valore restituito/scritto, indirizzo, qual */
 	uint32_t	field;		/* campo VMCS, tipo INVEPT/INVVPID, motivo */
 	uint32_t	type;		/* OPR_* in vmx_nested.c */
+	uint64_t	e12;		/* Fable 022 §3.1a: voce EPT12 del codice in quell'istante */
 };
+/* Fable 022 §3.1a/b: voci EPT12 sorvegliate a puntatore fisso, anelli di tutti i vCPU */
+#define	NESTED_E12W	3
+#define	NESTED_ALLV	8
 struct nested_pfrec {
 	volatile int	done;
 	int		vcpu;
@@ -178,6 +182,11 @@ struct nested_pfrec {
 	uint32_t	csar0, ssar0, intr0, act0, idtv0, idte0, ilen0;
 	u_int		ops_n;		/* anello copiato al congelamento */
 	struct nested_oprec ops[NESTED_OPREC_N];
+	/* Fable 022 §3.1: VMCS12 dell'episodio; voci EPT12 sorvegliate a E0 e a E2 */
+	uint64_t	vmcs12_0;
+	uint64_t	e12_0[NESTED_E12W], e12_2[NESTED_E12W], e12_egpa[NESTED_E12W];
+	int		e12_lvl[NESTED_E12W];
+	uint64_t	rip_next;	/* RIP all'ingresso successivo (classificazione d) */
 };
 
 int	vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
@@ -187,6 +196,8 @@ void	vmx_vept_diag_keepstate(struct vmx_vcpu *vcpu, uint64_t eptp12,
 	    uint64_t l2gpa);
 int	vmx_vept_diag_code(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
 	    uint64_t gla, struct vept_diag_code *o);
+uint64_t *vmx_vept_ept12_entry_ptr(struct vmx_vcpu *vcpu, uint64_t eptp12,
+	    uint64_t l2gpa, uint64_t *egpa, int *lvl);	/* Fable 022, puo' dormire */
 uint64_t vmx_vept_diag_walk(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t cr3,
 	    uint64_t gla, const char *tag);
 int	vmx_vept_l1gpa(struct vmx_vcpu *vcpu, uint64_t gpa, int prot,
@@ -651,6 +662,12 @@ struct vmx_nested {
 	struct nested_oprec oprec[NESTED_OPREC_N];
 	u_int		oprec_i;
 	uint64_t	oprec_ok;	/* episodi normali, per "uno ogni N" */
+	/* Fable 022 §3.1a: voci EPT12 sorvegliate, risolte una volta per EPTP12 */
+	struct {
+		uint64_t	eptp12, l2gpa, egpa;
+		volatile uint64_t *ptr;	/* DMAP della voce (memoria dell'L1 wired) */
+		int		lvl;
+	} e12w[NESTED_E12W];
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 
