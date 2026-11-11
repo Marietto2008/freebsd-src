@@ -158,7 +158,8 @@ struct nested_oprec {
 	uint64_t	tsc;
 	uint64_t	val;		/* valore restituito/scritto, indirizzo, qual */
 	uint32_t	field;		/* campo VMCS, tipo INVEPT/INVVPID, motivo */
-	uint32_t	type;		/* OPR_* in vmx_nested.c */
+	uint16_t	type;		/* OPR_* in vmx_nested.c */
+	uint16_t	cpu;		/* Fable 027 §3.2: CPU fisica dell'operazione */
 	uint64_t	e12;		/* Fable 022 §3.1a: voce EPT12 del codice in quell'istante */
 };
 /* Fable 022 §3.1a/b: voci EPT12 sorvegliate a puntatore fisso, anelli di tutti i vCPU */

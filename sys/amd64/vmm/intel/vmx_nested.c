@@ -406,6 +406,7 @@ struct nested_e0slot {
 	uint32_t	ilen0, idtv0;
 	uint64_t	e12_0[NESTED_E12W];
 	uint64_t	run_rip;	/* §2.3b: serie di «fermi» consecutivi sullo stesso rip0 */
+	uint64_t	t_cr3;		/* Fable 030 §5 d.9: tsc della prima VMREAD di GUEST_CR3 (0 = non ancora) */
 	u_int		run_len;
 } __aligned(CACHE_LINE_SIZE);
 static struct nested_e0slot nested_e0tab[64];
@@ -423,6 +424,97 @@ NESTED_CTR(nested_diag_e12w_stale, "nested: riconvalide del puntatore EPT12 che 
 static u_long nested_e0_mask[3][8];
 /* §2.3b serie di fermi consecutivi dello stesso VMCS12 sullo stesso rip0: lunghezza 1, 2, 3, >= 4 */
 static u_long nested_e0_runs[4];
+/*
+ * Fable 030 §3.1 e §5 d.9: durata dell'emulazione divisa in due tratti, da E0 alla prima VMREAD di GUEST_CR3 (fino
+ * all'inizio del walk delle tabelle dell'L2) e da li' alla chiusura, per classe (0 ilen, 1 altro, 2 fermo), in classi
+ * log2 di microsecondi (0 = sotto 1 us, k = [2^(k-1), 2^k) us). L'esposizione e' la somma del primo tratto.
+ */
+#define	NESTED_DUR_N	20
+static u_long nested_e0_dur[3][2][NESTED_DUR_N];
+static u_long nested_e0_expo_tsc[3];
+NESTED_CTR(nested_diag_e0c_senza_cr3, "nested: episodi chiusi senza una VMREAD di GUEST_CR3 (niente durata)");
+/*
+ * Fable 030 §3.1: amplificatore di tempo. Ritardo attivo (DELAY) nella prima VMREAD di GUEST_CR3 di un episodio E0
+ * sorvegliato, cioe' prima che l'emulatore dell'L1 percorra le tabelle; un episodio ogni nested_diag_amp_every.
+ * Solo diagnostica, spento di base (0 us). Lo slow path gira a vCPU congelato, fuori dalla sezione critica.
+ */
+static u_int nested_diag_amp_us = 0;
+SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_amp_us, CTLFLAG_RWTUN, &nested_diag_amp_us, 0,
+    "nested, diagnostica: ritardo in us sulla prima VMREAD di GUEST_CR3 di un episodio E0 (0 = spento)");
+static u_int nested_diag_amp_every = 1;
+SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_amp_every, CTLFLAG_RWTUN, &nested_diag_amp_every, 0,
+    "nested, diagnostica: amplificatore su un episodio E0 ogni N");
+static u_int nested_amp_seq;
+NESTED_CTR(nested_diag_amp_applied, "nested: episodi E0 allungati dall'amplificatore");
+NESTED_CTR(nested_diag_amp_us_total, "nested: microsecondi aggiunti dall'amplificatore");
+
+static int
+nested_dur_classe(uint64_t d)
+{
+	uint64_t us = tsc_freq != 0 ? d * 1000000 / tsc_freq : 0;
+
+	return (us == 0 ? 0 : MIN(flsll(us), NESTED_DUR_N - 1));
+}
+
+/* prima VMREAD di GUEST_CR3 con l'episodio del VMCS12 corrente pendente */
+static void
+nested_e0_cr3_read(struct vmx_nested *n)
+{
+	struct nested_e0slot *s = NESTED_E0SLOT(n->current_vmcs12);
+	u_int us = nested_diag_amp_us, every = nested_diag_amp_every;
+
+	if (s->vmcs12 != n->current_vmcs12 || s->pending == 0 || s->t_cr3 != 0)
+		return;
+	if (us != 0 && (every <= 1 ||
+	    atomic_fetchadd_int(&nested_amp_seq, 1) % every == 0)) {
+		DELAY(us);
+		atomic_add_long(&nested_diag_amp_applied, 1);
+		atomic_add_long(&nested_diag_amp_us_total, us);
+	}
+	s->t_cr3 = rdtsc();
+}
+
+static void
+nested_e0_durata(struct nested_e0slot *s, int cls, uint64_t t2)
+{
+	uint64_t a = s->t_cr3;
+
+	if (a == 0 || a < s->t0 || t2 < a) {
+		atomic_add_long(&nested_diag_e0c_senza_cr3, 1);
+		return;
+	}
+	atomic_add_long(&nested_e0_expo_tsc[cls], a - s->t0);
+	atomic_add_long(&nested_e0_dur[cls][0][nested_dur_classe(a - s->t0)], 1);
+	atomic_add_long(&nested_e0_dur[cls][1][nested_dur_classe(t2 - a)], 1);
+}
+
+static int
+sysctl_nested_e0_durata(SYSCTL_HANDLER_ARGS)
+{
+	static const char *const nome[3] = { "ilen", "altro", "fermo" };
+	static const char *const tratto[2] = { "E0->CR3", "CR3->chiusura" };
+	struct sbuf *sb;
+	int error, k, t, b;
+
+	sb = sbuf_new_for_sysctl(NULL, NULL, 4096, req);
+	sbuf_printf(sb, "\ndurata per classe, classi log2 di us (0 = <1 us, k = [2^(k-1),2^k) us):\n");
+	for (k = 0; k < 3; k++) {
+		sbuf_printf(sb, "  %-5s esposizione E0->CR3 = %lu ms\n", nome[k], tsc_freq != 0 ?
+		    (u_long)(atomic_load_long(&nested_e0_expo_tsc[k]) / (tsc_freq / 1000)) : 0);
+		for (t = 0; t < 2; t++) {
+			sbuf_printf(sb, "    %-13s", tratto[t]);
+			for (b = 0; b < NESTED_DUR_N; b++)
+				if (atomic_load_long(&nested_e0_dur[k][t][b]) != 0)
+					sbuf_printf(sb, " %d:%lu", b, atomic_load_long(&nested_e0_dur[k][t][b]));
+			sbuf_printf(sb, "\n");
+		}
+	}
+	error = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (error);
+}
+SYSCTL_PROC(_hw_vmm_vmx, OID_AUTO, nested_diag_e0_durata, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_nested_e0_durata, "A", "nested: durata degli episodi E0 per classe in due tratti (Fable 030)");
 
 static int
 sysctl_nested_e0c_maschere(SYSCTL_HANDLER_ARGS)
@@ -460,6 +552,7 @@ nested_oprec_note(struct vmx_nested *n, uint32_t type, uint32_t field,
 	o = &n->oprec[n->oprec_i++ % NESTED_OPREC_N];	/* solo il thread del vCPU */
 	o->tsc = rdtsc();
 	o->type = type;
+	o->cpu = curcpu;
 	o->field = field;
 	o->val = val;
 	/* Fable 022 §3.1a: la voce EPT12 del codice in questo istante (un accesso) */
@@ -527,9 +620,10 @@ nested_oprec_sbuf(struct sbuf *sb, const struct nested_pfrec *p)
 	    "vecchia (* = dall'ultima riflessione 48 in poi)\n", p->ops_n);
 	for (i = 0; i < p->ops_n; i++) {
 		o = &p->ops[i];
-		sbuf_printf(sb, "  %c%3u %+ld %s campo=%#x val=%#lx e12=%#lx%s\n",
+		sbuf_printf(sb, "  %c%3u %+ld cpu%u %s campo=%#x val=%#lx e12=%#lx%s\n",
 		    (last48 != UINT_MAX && i >= last48) ? '*' : ' ', i,
 		    (long)(o->tsc - p->t0),	/* tsc rispetto a E0: confrontabile fra vCPU */
+		    (u_int)o->cpu,
 		    o->type < nitems(nested_oprec_nome) ?
 		    nested_oprec_nome[o->type] : "?", o->field, (u_long)o->val,
 		    (u_long)o->e12,
@@ -2819,6 +2913,8 @@ nested_vmread(struct vmx_vcpu *vcpu)
 	if (len == 4)
 		val &= 0xffffffffULL;
 
+	if (__predict_false(nested_diag_pfrec != 0) && field == VMCS_GUEST_CR3)
+		nested_e0_cr3_read(n);		/* Fable 030: durata e amplificatore */
 	nested_oprec_note(n, OPR_VMREAD, field, val);	/* Fable 018 §4.1 */
 	if ((info >> 10) & 0x1) {
 		vmx_set_guest_reg(vcpu, (info >> 3) & 0xf, val);
@@ -5608,6 +5704,7 @@ nested_pfrec_cap_e0(struct vmx_vcpu *vcpu)
 		s->t0 = p->t0;
 		s->ilen0 = p->ilen0;
 		s->idtv0 = p->idtv0;
+		s->t_cr3 = 0;
 		for (w = 0; w < NESTED_E12W; w++)
 			s->e12_0[w] = p->e12_0[w];
 		atomic_store_rel_int(&s->pending, 1);
@@ -5675,6 +5772,7 @@ nested_diag_pfrec_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	atomic_add_long(cls == 0 ? (ev ? &nested_diag_e0c_ilen_ev : &nested_diag_e0c_ilen) :
 	    cls == 1 ? (ev ? &nested_diag_e0c_altro_ev : &nested_diag_e0c_altro) :
 	    (ev ? &nested_diag_e0c_fermo_ev : &nested_diag_e0c_fermo), 1);
+	nested_e0_durata(s, cls, rdtsc());	/* Fable 030 */
 	if (migr)
 		atomic_add_long(cls == 0 ? (ev ? &nested_diag_e0c_ilen_ev_migr : &nested_diag_e0c_ilen_migr) :
 		    cls == 1 ? (ev ? &nested_diag_e0c_altro_ev_migr : &nested_diag_e0c_altro_migr) :
