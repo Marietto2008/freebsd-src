@@ -78,6 +78,7 @@ static int	nested_vpid_test_off;
 static u_long	vpid02_off_vcpus;
 static int	nested_vpid_d4_arm;
 static void	nested_diag_pf_arm(struct vmx_vcpu *vcpu);
+static __inline void nested_oprec_note(struct vmx_nested *n, uint32_t type, uint32_t field, uint64_t val);
 static void	nested_diag_pfrec_entry(struct vmx_vcpu *vcpu,
 		    struct vmcs12_cache *c);
 static void	nested_pfrec_cap_e0(struct vmx_vcpu *vcpu);
@@ -356,12 +357,13 @@ SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_oprec_every, CTLFLAG_RWTUN,
     "nested: copia anche un episodio normale ogni N (0 = mai)");
 enum {
 	OPR_VMREAD = 1, OPR_VMWRITE, OPR_VMPTRLD, OPR_VMCLEAR, OPR_INVEPT,
-	OPR_INVVPID, OPR_LAUNCH, OPR_RESUME, OPR_RIFL, OPR_RIFL_RIP, OPR_RIFL_INFO, OPR_RIFL_IDTV
+	OPR_INVVPID, OPR_LAUNCH, OPR_RESUME, OPR_RIFL, OPR_RIFL_RIP, OPR_RIFL_INFO, OPR_RIFL_IDTV, OPR_INIEZ
 };
 static const char *const nested_oprec_nome[] = {
 	"?", "VMREAD", "VMWRITE", "VMPTRLD", "VMCLEAR", "INVEPT", "INVVPID",
 	"VMLAUNCH", "VMRESUME", "RIFLESSA", "  rip L2", "  info",	/* 18: RCX; 48: GPA */
-	"  idt-vect"	/* Fable 023 §2.1ii: campo = IDT-vectoring info valida, val = codice d'errore */
+	"  idt-vect",	/* Fable 023 §2.1ii: campo = IDT-vectoring info valida, val = codice d'errore */
+	"INIEZIONE L0->L1"	/* Fable 034 §4.1: campo = interruption info scritta nel VMCS01 */
 };
 static struct nested_pfrec nested_pfrec_norm;	/* ultimo episodio normale */
 static volatile u_int nested_pfrec_norm_busy;
@@ -432,6 +434,91 @@ static u_long nested_e0_runs[4];
 #define	NESTED_DUR_N	20
 static u_long nested_e0_dur[3][2][NESTED_DUR_N];
 static u_long nested_e0_expo_tsc[3];
+/* Fable 034 §3 d.4: tempo da E0 all'ultimo INVEPT dell'L1 su quel vCPU, per classe, classi log2 di us */
+static u_long nested_e0_invept[3][NESTED_DUR_N];
+/*
+ * Fable 034 §4.3: amplificatore Mk, migrazione senza prelazione. Alla chiusura di un episodio normale (emulazione
+ * riuscita, RIP+ILEN, all'ingresso del VMRESUME, prima del VMPTRLD: nessun VMCS attivo, si puo' dormire), un episodio
+ * ogni N: modo 1 = il thread del vCPU passa sull'altra CPU logica dello stesso core (CPU ^ 1), l'L2 entra li', e al
+ * primo percorso lento dopo l'uscita torna sulla CPU di partenza (X, Y, X); modo 2 = solo andata; modo 3 = nessuno
+ * spostamento prima dell'ingresso, spostamento sull'altra CPU logica fra la prossima uscita dell'L2 e la riflessione.
+ * Solo diagnostica, spento di base.
+ */
+static u_int nested_diag_mk_modo = 0;
+SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_mk_modo, CTLFLAG_RWTUN, &nested_diag_mk_modo, 0,
+    "nested, diagnostica: migrazione forzata attorno agli episodi E0 (0 spento, 1 X-Y-X, 2 solo andata, 3 uscita->riflessione)");
+static u_int nested_diag_mk_every = 1;
+SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_mk_every, CTLFLAG_RWTUN, &nested_diag_mk_every, 0,
+    "nested, diagnostica: migrazione forzata su un episodio normale ogni N");
+static u_int nested_mk_seq;
+NESTED_CTR(nested_diag_mk_andate, "nested: Mk, spostamenti sull'altra CPU logica prima dell'ingresso in L2");
+NESTED_CTR(nested_diag_mk_ritorni, "nested: Mk, ritorni sulla CPU di partenza");
+NESTED_CTR(nested_diag_mk_uscita, "nested: Mk modo 3, spostamenti fra uscita dell'L2 e riflessione");
+
+static void
+nested_mk_lega(int cpu)
+{
+	thread_lock(curthread);
+	sched_bind(curthread, cpu);
+	thread_unlock(curthread);
+}
+
+static void
+nested_mk_slega(void)
+{
+	thread_lock(curthread);
+	sched_unbind(curthread);
+	thread_unlock(curthread);
+}
+
+/* all'inizio del percorso lento: ritorno (modo 1), scioglimento (modo 2), spostamento uscita->riflessione (modo 3) */
+static void
+nested_mk_percorso_lento(struct vmx_nested *n)
+{
+	if (n->mk_ret != 0) {
+		nested_mk_lega(n->mk_ret - 1);
+		n->mk_ret = 0;
+		atomic_add_long(&nested_diag_mk_ritorni, 1);
+	}
+	if (n->mk_armato3 && n->in_l2) {
+		n->mk_armato3 = false;
+		nested_mk_lega(curcpu ^ 1);
+		n->mk_slegare = true;
+		atomic_add_long(&nested_diag_mk_uscita, 1);
+	}
+	if (n->mk_slegare) {
+		n->mk_slegare = false;
+		nested_mk_slega();
+	}
+}
+
+/* alla chiusura di un episodio normale, prima dell'ingresso in L2 */
+static void
+nested_mk_ingresso(struct vmx_nested *n)
+{
+	u_int modo = nested_diag_mk_modo, every = nested_diag_mk_every;
+	int x;
+
+	if (modo == 0 || (every > 1 && atomic_fetchadd_int(&nested_mk_seq, 1) % every != 0))
+		return;
+	if (modo == 3) {
+		n->mk_armato3 = true;
+		return;
+	}
+	x = curcpu;
+	nested_mk_lega(x ^ 1);
+	atomic_add_long(&nested_diag_mk_andate, 1);
+	if (modo == 1)
+		n->mk_ret = x + 1;
+	n->mk_slegare = true;
+}
+
+void
+vmx_nested_oprec_inj(struct vmx_vcpu *vcpu, uint32_t info)
+{
+	if (vcpu->nested != NULL && !vcpu->nested->in_l2)
+		nested_oprec_note(vcpu->nested, OPR_INIEZ, info, curcpu);
+}
 NESTED_CTR(nested_diag_e0c_senza_cr3, "nested: episodi chiusi senza una VMREAD di GUEST_CR3 (niente durata)");
 /*
  * Fable 030 §3.1: amplificatore di tempo. Ritardo attivo (DELAY) nella prima VMREAD di GUEST_CR3 di un episodio E0
@@ -508,6 +595,11 @@ sysctl_nested_e0_durata(SYSCTL_HANDLER_ARGS)
 					sbuf_printf(sb, " %d:%lu", b, atomic_load_long(&nested_e0_dur[k][t][b]));
 			sbuf_printf(sb, "\n");
 		}
+		sbuf_printf(sb, "    E0-ultimo INVEPT");
+		for (b = 0; b < NESTED_DUR_N; b++)
+			if (atomic_load_long(&nested_e0_invept[k][b]) != 0)
+				sbuf_printf(sb, " %d:%lu", b, atomic_load_long(&nested_e0_invept[k][b]));
+		sbuf_printf(sb, "\n");
 	}
 	error = sbuf_finish(sb);
 	sbuf_delete(sb);
@@ -3836,6 +3928,8 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		    vcpu->nested->synth_qual : vmcs_read(VMCS_EXIT_QUALIFICATION));
 		nested_oprec_note(vcpu->nested, OPR_RIFL_RIP, 0,
 		    vmcs_read(VMCS_GUEST_RIP));
+		/* Fable 034 §4.1: CPU fisica dell'uscita dell'L2 (campo 0xc0) */
+		nested_oprec_note(vcpu->nested, OPR_RIFL_INFO, 0xc0, vcpu->nested->l2x_cpu);
 		/* Fable 023 §2.1ii: IDT-vectoring valido (consegna interrotta: #PF reiniettato contro originato) */
 		{
 			uint32_t idtv = (uint32_t)vmcs_read(VMCS_IDT_VECTORING_INFO);
@@ -5112,6 +5206,7 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 {
 	uint32_t reason = vmexit->u.vmx.exit_reason & 0xffff;
 
+	vcpu->nested->l2x_cpu = curcpu;		/* Fable 034 §4.1 */
 	n_exit_rip_record(vcpu, vmexit);
 	/* WSL2-FreeBSD 003: l'ingresso senza intercetto e' passato, si riarma */
 	if (__predict_false(vcpu->nested->diag_pf_rearm)) {
@@ -5851,6 +5946,10 @@ nested_diag_pfrec_entry(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	    cls == 1 ? (ev ? &nested_diag_e0c_altro_ev : &nested_diag_e0c_altro) :
 	    (ev ? &nested_diag_e0c_fermo_ev : &nested_diag_e0c_fermo), 1);
 	nested_e0_durata(s, cls, rdtsc());	/* Fable 030 */
+	if (n0->diag_invept_tsc != 0 && s->t0 > n0->diag_invept_tsc)	/* Fable 034 §3 d.4 */
+		atomic_add_long(&nested_e0_invept[cls][nested_dur_classe(s->t0 - n0->diag_invept_tsc)], 1);
+	if (cls == 0 && !ev)			/* Fable 034 §4.3 */
+		nested_mk_ingresso(n);
 	if (migr)
 		atomic_add_long(cls == 0 ? (ev ? &nested_diag_e0c_ilen_ev_migr : &nested_diag_e0c_ilen_migr) :
 		    cls == 1 ? (ev ? &nested_diag_e0c_altro_ev_migr : &nested_diag_e0c_altro_migr) :
@@ -6335,6 +6434,8 @@ vmx_nested_exit(void *vcpui)
 
 	SDT_PROBE1(vmm, vmx, nested, slowpath, vcpu);
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
+	if (vcpu->nested != NULL)		/* Fable 034 §4.3, amplificatore Mk */
+		nested_mk_percorso_lento(vcpu->nested);
 	if (vcpu->nested != NULL)
 		nested_stats_flush(vcpu);
 

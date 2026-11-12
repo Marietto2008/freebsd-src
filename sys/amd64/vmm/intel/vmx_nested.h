@@ -265,6 +265,7 @@ bool	vmx_vept_keep_enabled(void);		/* hw.vmm.vmx.vept_keep */
 int	vmx_vept_ad_policy(void);		/* hw.vmm.vmx.nested_ept_ad && host A/D */
 bool	vmx_nested_apicacc_policy(void);	/* hw.vmm.vmx.nested_apic_access && host */
 bool	vmx_nested_qualkvm_policy(void);	/* hw.vmm.vmx.nested_qual_kvm (Fable 032) */
+void	vmx_nested_oprec_inj(struct vmx_vcpu *vcpu, uint32_t info);	/* Fable 034 §4.1 */
 void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
 int	vmx_vept_cur_slot(struct vmx_nested *n);	/* parere #53 §8: slot corrente o -1 */
 bool	vmx_vept_memgen_stale(struct vmx_vcpu *vcpu);	/* non dorme */
@@ -673,6 +674,10 @@ struct vmx_nested {
 		int		lvl;
 	} e12w[NESTED_E12W];
 	u_int		e12w_reval;	/* Fable 023 §2.4.2: passaggi del percorso lento, per la riconvalida */
+	int		l2x_cpu;	/* Fable 034 §4.1: CPU fisica dell'ultima uscita dell'L2 (dentro vmx_run) */
+	int		mk_ret;		/* Fable 034 §4.3: CPU di partenza + 1 a cui tornare (0 = niente) */
+	bool		mk_slegare;	/* Mk: thread legato da sciogliere al prossimo percorso lento */
+	bool		mk_armato3;	/* Mk modo 3: spostamento fra la prossima uscita dell'L2 e la riflessione */
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 

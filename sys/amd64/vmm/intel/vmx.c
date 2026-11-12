@@ -1818,6 +1818,7 @@ vmx_inject_nmi(struct vmx_vcpu *vcpu)
 	 */
 	info = IDT_NMI | VMCS_INTR_T_NMI | VMCS_INTR_VALID;
 	vmcs_write(VMCS_ENTRY_INTR_INFO, info);
+	vmx_nested_oprec_inj(vcpu, info);	/* Fable 034 §4.1 */
 
 	VMX_CTR0(vcpu, "Injecting vNMI");
 
@@ -1918,6 +1919,7 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 			vmcs_write(VMCS_ENTRY_EXCEPTION_ERROR, entryinfo >> 32);
 
 		vmcs_write(VMCS_ENTRY_INTR_INFO, info);
+		vmx_nested_oprec_inj(vcpu, info);	/* Fable 034 §4.1 */
 	}
 
 	if (vm_nmi_pending(vcpu->vcpu)) {
@@ -2106,6 +2108,7 @@ vmx_inject_interrupts(struct vmx_vcpu *vcpu, struct vlapic *vlapic,
 	info = VMCS_INTR_T_HWINTR | VMCS_INTR_VALID;
 	info |= vector;
 	vmcs_write(VMCS_ENTRY_INTR_INFO, info);
+	vmx_nested_oprec_inj(vcpu, info);	/* Fable 034 §4.1 */
 
 	if (!extint_pending) {
 		/* Update the Local APIC ISR */
