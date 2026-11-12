@@ -455,40 +455,34 @@ NESTED_CTR(nested_diag_mk_andate, "nested: Mk, spostamenti sull'altra CPU logica
 NESTED_CTR(nested_diag_mk_ritorni, "nested: Mk, ritorni sulla CPU di partenza");
 NESTED_CTR(nested_diag_mk_uscita, "nested: Mk modo 3, spostamenti fra uscita dell'L2 e riflessione");
 
+/*
+ * 12/11 10:19: il primo Mk lasciava il thread legato (sched_bind) fino al percorso lento successivo; con ULE
+ * sched_bind fa anche sched_pin, e alla prima uscita di vm_run verso QEMU l'host e' andato in panic («userret:
+ * Returning with pinned thread», /var/crash/vmcore.4). Ora lo spostamento e' istantaneo: bind e unbind subito, il
+ * thread resta sulla CPU nuova finche' lo scheduler non lo muove, senza nessun legame che sopravviva al percorso lento.
+ */
 static void
-nested_mk_lega(int cpu)
+nested_mk_sposta(int cpu)
 {
 	thread_lock(curthread);
 	sched_bind(curthread, cpu);
-	thread_unlock(curthread);
-}
-
-static void
-nested_mk_slega(void)
-{
-	thread_lock(curthread);
 	sched_unbind(curthread);
 	thread_unlock(curthread);
 }
 
-/* all'inizio del percorso lento: ritorno (modo 1), scioglimento (modo 2), spostamento uscita->riflessione (modo 3) */
+/* all'inizio del percorso lento: ritorno (modo 1), spostamento uscita->riflessione (modo 3) */
 static void
 nested_mk_percorso_lento(struct vmx_nested *n)
 {
 	if (n->mk_ret != 0) {
-		nested_mk_lega(n->mk_ret - 1);
+		nested_mk_sposta(n->mk_ret - 1);
 		n->mk_ret = 0;
 		atomic_add_long(&nested_diag_mk_ritorni, 1);
 	}
 	if (n->mk_armato3 && n->in_l2) {
 		n->mk_armato3 = false;
-		nested_mk_lega(curcpu ^ 1);
-		n->mk_slegare = true;
+		nested_mk_sposta(curcpu ^ 1);
 		atomic_add_long(&nested_diag_mk_uscita, 1);
-	}
-	if (n->mk_slegare) {
-		n->mk_slegare = false;
-		nested_mk_slega();
 	}
 }
 
@@ -506,11 +500,10 @@ nested_mk_ingresso(struct vmx_nested *n)
 		return;
 	}
 	x = curcpu;
-	nested_mk_lega(x ^ 1);
+	nested_mk_sposta(x ^ 1);
 	atomic_add_long(&nested_diag_mk_andate, 1);
 	if (modo == 1)
 		n->mk_ret = x + 1;
-	n->mk_slegare = true;
 }
 
 void
