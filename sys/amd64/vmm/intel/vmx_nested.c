@@ -826,7 +826,8 @@ VMM_STAT_INTEL(VMX_NESTED_VEPT_WIPED, "radici shadow EPT svuotate da INVEPT");
  * essere rifiniti dopo quel test: vedi docs/nested/T1.4.md.
  */
 static void
-vmx_nested_init_msrs(struct vmx_nested *n, bool ad_policy, bool apicacc_policy)
+vmx_nested_init_msrs(struct vmx_nested *n, bool ad_policy, bool apicacc_policy,
+    bool qualkvm_policy)
 {
 	uint64_t basic, misc, proc2, eptcap;
 	uint64_t *m = n->vmx_msr;
@@ -915,6 +916,9 @@ vmx_nested_init_msrs(struct vmx_nested *n, bool ad_policy, bool apicacc_policy)
 	m[0x48c - 0x480] = eptcap & ~(1ULL << 7);
 	if (!ad_policy)
 		m[0x48c - 0x480] &= ~(1ULL << 21);
+	/* Fable 032 §5.2: advanced EPT-violation info tolta, come KVM */
+	if (qualkvm_policy)
+		m[0x48c - 0x480] &= ~(1ULL << 22);
 
 	/* IA32_FEATURE_CONTROL: LOCK + VMX outside SMX (niente SMX). */
 	n->feature_control = IA32_FEATURE_CONTROL_LOCK |
@@ -937,7 +941,12 @@ vmx_nested_init(struct vmx_vcpu *vcpu)
 	n->current_vmcs12 = VMCS12_GPA_NONE;
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++)
 		n->cache[i].vmcs12_gpa = VMCS12_GPA_NONE;
-	vmx_nested_init_msrs(n, vcpu->vmx->nested_ad, vcpu->vmx->nested_apicacc);
+	vmx_nested_init_msrs(n, vcpu->vmx->nested_ad, vcpu->vmx->nested_apicacc,
+	    vcpu->vmx->nested_qualkvm);
+	if (vcpu->vcpuid == 0)		/* Fable 032 §5.2: verifica di cio' che l'L1 leggera' */
+		printf("vmm nested: 0x48B offerto %#lx, 0x48C offerto %#lx (qual_kvm=%d apic_access=%d)\n",
+		    (u_long)n->vmx_msr[0x48b - 0x480], (u_long)n->vmx_msr[0x48c - 0x480],
+		    vcpu->vmx->nested_qualkvm, vcpu->vmx->nested_apicacc);
 	n->vpid2 = vpid_alloc(vcpu->vcpuid);	/* VPID distinto L2 (T2.8) */
 	/*
 	 * Bitmap MSR del VMCS02 (T6.3): una pagina per vCPU, allineata e
@@ -2424,6 +2433,68 @@ NESTED_CTR(nested_apicacc_stop_vapic,
     "virtual-APIC non e' RAM");
 NESTED_CTR(nested_apicacc_exits,
     "APIC-access: uscite 44 dell'L2 riflesse all'L1");
+
+/*
+ * Fable 032 §5.2 (braccio T): qualificazione riflessa come KVM e b22 non offerto. Politica per VM, 0 di base.
+ */
+static int nested_qual_kvm = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_qual_kvm, CTLFLAG_RWTUN, &nested_qual_kvm, 0,
+    "nested: qualificazione delle EPT violation riflesse come KVM e 0x48C b22 tolto (letta alla creazione della VM)");
+/* Fable 032 §5.1: qualificazioni delle EPT violation riflesse, come le riceve l'L1; 0 pagina LAPIC, 1 le altre */
+#define	NESTED_Q48_N	64
+static struct { volatile uint64_t k; u_long n; } nested_q48[2][NESTED_Q48_N];	/* k = qual + 1, 0 = libero */
+NESTED_CTR(nested_diag_q48_pieno, "nested: qualificazioni 48 riflesse non contate (tabella piena)");
+/* Fable 032 §4.2: uscite 44 riflesse per registro (EOI, LVT timer, Initial Count, ICR, altro) e tipo (lettura/scrittura) */
+static u_long nested_q44[5][2];
+
+static void
+nested_q48_conta(int lapic, uint64_t q)
+{
+	u_int h = (u_int)(q ^ (q >> 7)) % NESTED_Q48_N, i;
+
+	for (i = 0; i < NESTED_Q48_N; i++) {
+		typeof(&nested_q48[0][0]) s = &nested_q48[lapic][(h + i) % NESTED_Q48_N];
+
+		if (s->k == q + 1 || (s->k == 0 && atomic_cmpset_64(&s->k, 0, q + 1)) || s->k == q + 1) {
+			atomic_add_long(&s->n, 1);
+			return;
+		}
+	}
+	atomic_add_long(&nested_diag_q48_pieno, 1);
+}
+
+static int
+sysctl_nested_q48(SYSCTL_HANDLER_ARGS)
+{
+	static const char *const reg[5] = { "EOI b0", "LVT 320", "ICNT 380", "ICR 300/310", "altro" };
+	struct sbuf *sb;
+	int error, l, i;
+
+	sb = sbuf_new_for_sysctl(NULL, NULL, 4096, req);
+	for (l = 0; l < 2; l++) {
+		sbuf_printf(sb, "\nqualificazioni 48 riflesse, %s:", l == 0 ? "pagina LAPIC" : "altre pagine");
+		for (i = 0; i < NESTED_Q48_N; i++)
+			if (nested_q48[l][i].k != 0)
+				sbuf_printf(sb, " %#lx:%lu", (u_long)(nested_q48[l][i].k - 1),
+				    atomic_load_long(&nested_q48[l][i].n));
+	}
+	sbuf_printf(sb, "\nuscite 44 riflesse (lettura/scrittura):");
+	for (i = 0; i < 5; i++)
+		sbuf_printf(sb, " %s %lu/%lu", reg[i], atomic_load_long(&nested_q44[i][0]),
+		    atomic_load_long(&nested_q44[i][1]));
+	sbuf_printf(sb, "\n");
+	error = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (error);
+}
+SYSCTL_PROC(_hw_vmm_vmx, OID_AUTO, nested_diag_q48, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_nested_q48, "A", "nested: qualificazioni 48 riflesse e uscite 44 per registro (Fable 032)");
+
+bool
+vmx_nested_qualkvm_policy(void)
+{
+	return (nested_qual_kvm != 0);
+}
 
 bool
 vmx_nested_apicacc_policy(void)
@@ -5279,6 +5350,13 @@ nested_l2_exit(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		 * (vmx_handle_apic_access agirebbe sul vlapic dell'L1).
 		 */
 		atomic_add_long(&nested_apicacc_exits, 1);
+		{
+			uint64_t q = vmcs_read(VMCS_EXIT_QUALIFICATION);
+			u_int off = q & 0xfff, t = (q >> 12) & 0xf;
+
+			atomic_add_long(&nested_q44[off == 0xb0 ? 0 : off == 0x320 ? 1 : off == 0x380 ? 2 :
+			    (off == 0x300 || off == 0x310) ? 3 : 4][t == 1 ? 1 : 0], 1);
+		}
 		break;
 	default:
 		break;
@@ -6112,10 +6190,17 @@ nested_ept_slow(struct vmx_vcpu *vcpu)
 	if (__predict_false(nested_diag_pfrec != 0) && n->pfrec_building)
 		nested_pfrec_cap_e1(vcpu);
 	c = nested_current_cache(n);
-	if (c != NULL)
-		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION,
-		    (r == VEPT_MISCONF) ? 0 :
-		    ((n->ept_qual & ~0x38ULL) | ((perm & 0x7) << 3)));
+	if (c != NULL) {
+		uint64_t q = (r == VEPT_MISCONF) ? 0 :
+		    ((n->ept_qual & ~0x38ULL) | ((perm & 0x7) << 3));
+
+		/* Fable 032 §5.2: come KVM, bit 0-5, 7, 8 e 12; niente 6, 9-11, 13 e oltre */
+		if (r != VEPT_MISCONF && vcpu->vmx->nested_qualkvm)
+			q &= 0x11bfULL;
+		vmcs12_write_field(c, VMCS_EXIT_QUALIFICATION, q);
+		if (r != VEPT_MISCONF)
+			nested_q48_conta((n->ept_gpa & ~0xfffUL) == 0xfee00000UL ? 0 : 1, q);
+	}
 	VMCLEAR(vcpu->vmcs01);			/* niente VMCS attivo nello slow path */
 	/*
 	 * Parere di Astra 010 §4: ora fuori dalla sezione critica (il VMCLEAR

@@ -1330,6 +1330,7 @@ vmx_init(struct vm *vm, pmap_t pmap)
 	vmx->pmap = pmap;
 	vmx->nested_ad = vmx_vept_ad_policy();  /* fase A: congelata per VM */
 	vmx->nested_apicacc = vmx_nested_apicacc_policy();	/* idem */
+	vmx->nested_qualkvm = vmx_nested_qualkvm_policy();	/* idem, Fable 032 */
 	return (vmx);
 }
 

@@ -168,6 +168,12 @@ struct vmx {
 	 * della VM e uguale per tutti i vCPU (hw.vmm.vmx.nested_apic_access).
 	 */
 	bool		nested_apicacc;
+	/*
+	 * Fable 032 §5.2, braccio T: qualificazione delle EPT violation riflesse come KVM (bit 0-5, 7, 8, 12) e advanced
+	 * EPT-violation info (0x48C b22) non offerta. Stessa regola: letta una volta alla creazione della VM
+	 * (hw.vmm.vmx.nested_qual_kvm).
+	 */
+	bool		nested_qualkvm;
 };
 
 extern bool vmx_have_msr_tsc_aux;
