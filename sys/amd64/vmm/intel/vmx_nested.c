@@ -1815,6 +1815,9 @@ NESTED_CTR(vpid02_invvpid_novpid12_slow,
     "VPID: di cui con l'uscita riflessa dallo slow path");
 NESTED_CTR(vpid01_slowpath_claim,
     "VPID: uscite L2->L1 dallo slow path con lastcpu != curcpu (VPID01 non invalidato)");
+NESTED_CTR(vpid01_inrun_lastcpu_altro,
+    "nested: riflessioni in vmx_run con lastcpu ne' curcpu ne' NOCPU (deve restare 0)");
+static u_int vpid01_inrun_avvisato;
 NESTED_CTR(nested_sh_push, "nested shadow: copie VMCS12 -> shadow");
 NESTED_CTR(nested_sh_push_fields, "nested shadow: campi copiati verso lo shadow");
 NESTED_CTR(nested_sh_push_tsc, "nested shadow: cicli TSC delle copie verso lo shadow");
@@ -3265,9 +3268,37 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	vmcs_write(VMCS_HOST_TR_BASE, vmm_get_host_trbase());
 	vmcs_write(VMCS_HOST_GDTR_BASE, vmm_get_host_gdtrbase());
 	vmcs_write(VMCS_HOST_GS_BASE, vmm_get_host_gsbase());
-	if (!n->in_run && vcpu->state.lastcpu != curcpu)
-		atomic_add_long(&vpid01_slowpath_claim, 1);	/* audit VPID, D3 */
-	vcpu->state.lastcpu = curcpu;
+	/*
+	 * D3 (audit VPID del 25/10; chiuso allora solo per vpid_track=1 dal
+	 * parere #52 di Astra; diagnosi 038 di Fable, rapporto 039): la
+	 * riflessione dal percorso lento (nested_ept_slow: tutte le 48
+	 * riflesse) scriveva lastcpu = curcpu. Se il thread non e' sulla CPU
+	 * dell'ingresso in L2, il VPID01 qui non e' mai stato invalidato:
+	 * il vmx_run successivo trovava lastcpu == curcpu e l'L1 ripartiva
+	 * con le traduzioni lasciate su questa CPU prima di girare altrove
+	 * (#PF falso di Hyper-V a lapic_et_start, panic dell'L2). Regola:
+	 * fuori da vmx_set_pcpu_defaults a lastcpu si scrive solo NOCPU.
+	 * Dal percorso lento si lascia NOCPU: il vmx_run successivo, sulla
+	 * CPU vera, riscrive i campi host e invalida il VPID01. Dentro
+	 * vmx_run la CPU e' quella dell'ingresso in L2 e lastcpu e' gia'
+	 * allineato: non si tocca.
+	 */
+	if (n->in_run) {
+		if (__predict_false(vcpu->state.lastcpu != curcpu &&
+		    vcpu->state.lastcpu != NOCPU)) {
+			atomic_add_long(&vpid01_inrun_lastcpu_altro, 1);
+			if (atomic_cmpset_int(&vpid01_inrun_avvisato, 0, 1))
+				printf("vmm nested: riflessione in vmx_run con "
+				    "lastcpu %d su cpu %d (vcpu %d)\n",
+				    vcpu->state.lastcpu, curcpu, vcpu->vcpuid);
+		}
+	} else {
+		if (vcpu->state.lastcpu != curcpu)
+			atomic_add_long(&vpid01_slowpath_claim, 1);	/* audit VPID, D3 */
+		if (vcpu->state.lastcpu != NOCPU)	/* non coprire una richiesta differita */
+			vcpu->state.nocpu_why = VMX_NOCPU_SLOW_REFLECT;
+		vcpu->state.lastcpu = NOCPU;
+	}
 	}
 
 	/* 6. Loading Host State: host di VMCS12 -> guest di VMCS01 */
