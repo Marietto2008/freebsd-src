@@ -358,7 +358,7 @@ SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_oprec_every, CTLFLAG_RWTUN,
 enum {
 	OPR_VMREAD = 1, OPR_VMWRITE, OPR_VMPTRLD, OPR_VMCLEAR, OPR_INVEPT,
 	OPR_INVVPID, OPR_LAUNCH, OPR_RESUME, OPR_RIFL, OPR_RIFL_RIP, OPR_RIFL_INFO, OPR_RIFL_IDTV, OPR_INIEZ,
-	OPR_RIVEND, OPR_VIOL01
+	OPR_RIVEND, OPR_VIOL01, OPR_MK2
 };
 static const char *const nested_oprec_nome[] = {
 	"?", "VMREAD", "VMWRITE", "VMPTRLD", "VMCLEAR", "INVEPT", "INVVPID",
@@ -366,7 +366,8 @@ static const char *const nested_oprec_nome[] = {
 	"  idt-vect",	/* Fable 023 §2.1ii: campo = IDT-vectoring info valida, val = codice d'errore */
 	"INIEZIONE L0->L1",	/* Fable 034 §4.1: campo = interruption info scritta nel VMCS01 */
 	"RIVENDICA CPU",	/* Fable 038 §3.1: riflessione lenta su un'altra CPU, campo = lastcpu di prima, val = curcpu */
-	"VIOLAZIONE VPID01"	/* Fable 038 §3.1: ingresso dell'L1, campo = CPU dell'ultima esecuzione + 1, val = curcpu */
+	"VIOLAZIONE VPID01",	/* Fable 038 §3.1: ingresso dell'L1, campo = CPU dell'ultima esecuzione + 1, val = curcpu */
+	"MK2"			/* Fable 038 §3.4: campo = 1 andata (val = CPU d'arrivo), 2 ritorno (val = CPU) */
 };
 static struct nested_pfrec nested_pfrec_norm;	/* ultimo episodio normale */
 static volatile u_int nested_pfrec_norm_busy;
@@ -560,6 +561,83 @@ vmx_nested_entry_check(struct vmx_vcpu *vcpu)
 	    !vlapic_pending_intr(vm_lapic(vcpu->vcpu), &vec))
 		return;
 	atomic_add_long(n->imm_armed ? &nested_l2entry_l1intr_imm : &nested_l2entry_l1intr, 1);
+}
+
+/*
+ * Collaudo di D3 (Fable 040 §2-3), solo diagnostica, spenti di base. nested_diag_d3_break=1 rimette il comportamento
+ * difettoso (la riflessione dal percorso lento rivendica la CPU senza invalidare il VPID01): serve solo a dimostrare
+ * che il controllo positivo funziona ancora. Procedura: Mk2 con d3_break=1 -> panic dell'L2 in pochi minuti
+ * (13/11: 3 su 3, entro 2 min); Mk2 con d3_break=0 -> tre tempeste pulite e vpid01_invariant_viol fermo.
+ */
+static int nested_diag_d3_break = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_diag_d3_break, CTLFLAG_RWTUN, &nested_diag_d3_break, 0,
+    "nested, solo collaudo: rimette il difetto D3 (la riflessione lenta rivendica la CPU); 0 = corretto");
+/*
+ * Fable 038 §3.4, amplificatore Mk2. Durante l'emulazione di un episodio sorvegliato (riflessione 48 sulla pagina
+ * del LAPIC con RIP a ...ripoff), nel percorso lento di una VMREAD o VMWRITE dell'L1 scelta a caso (una su every),
+ * il thread passa su Y: Hyper-V finisce il gestore su Y, e l'L2 entra ed esce su Y. Al percorso lento della prossima
+ * EPT violation dell'L2 (prima che nested_ept_slow rifletta) il thread torna su X. Modo 1: Y = l'altra CPU logica
+ * del core; modo 2: Y su un altro core.
+ */
+static u_int nested_diag_mk2 = 0;
+SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_mk2, CTLFLAG_RWTUN, &nested_diag_mk2, 0,
+    "nested, diagnostica: Mk2 (0 spento, 1 CPU sorella, 2 altro core; Fable 038 par. 3.4)");
+static u_int nested_diag_mk2_every = 4;
+SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_mk2_every, CTLFLAG_RWTUN, &nested_diag_mk2_every, 0,
+    "nested, diagnostica: Mk2 sposta il thread su una VMREAD/VMWRITE dell'emulazione ogni N (a caso)");
+static u_int nested_diag_mk2_ripoff = 0x831;
+SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_mk2_ripoff, CTLFLAG_RWTUN, &nested_diag_mk2_ripoff, 0,
+    "nested, diagnostica: Mk2 solo sugli episodi con RIP dell'L2 a questo offset nella pagina (0 = tutti)");
+NESTED_CTR(nested_diag_mk2_andate, "nested: Mk2, spostamenti su Y durante l'emulazione");
+NESTED_CTR(nested_diag_mk2_ritorni, "nested: Mk2, ritorni su X prima della riflessione lenta");
+NESTED_CTR(nested_diag_mk2_abbandoni, "nested: Mk2, ritorni non fatti (uscita dell'L2 riflessa dentro vmx_run)");
+
+/* all'apertura di un episodio (nested_pfrec_cap_e0) */
+static void
+nested_mk2_episodio(struct vmx_nested *n, uint64_t rip)
+{
+	n->mk2_ep = nested_diag_mk2 != 0 && n->mk2_ret == 0 &&
+	    (nested_diag_mk2_ripoff == 0 || (rip & PAGE_MASK) == nested_diag_mk2_ripoff);
+}
+
+/* all'inizio del percorso lento (nessun VMCS attivo, come Mk) */
+static void
+nested_mk2_percorso_lento(struct vmx_nested *n, uint32_t reason)
+{
+	int x, y;
+
+	if (n->mk2_ret != 0) {
+		if (!n->in_l2) {
+			/* ancora l'L1 su Y (resto dell'emulazione), oppure l'L2 e' gia' tornata in L1 dentro vmx_run */
+			if (n->mk2_in_l2) {
+				n->mk2_ret = 0;
+				n->mk2_in_l2 = false;
+				atomic_add_long(&nested_diag_mk2_abbandoni, 1);
+			}
+			return;
+		}
+		if (!n->ept_pending)	/* uscita dell'L2 che non sara' una riflessione lenta: si aspetta */
+			return;
+		nested_mk_sposta(n->mk2_ret - 1);
+		nested_oprec_note(n, OPR_MK2, 2, curcpu);
+		n->mk2_ret = 0;
+		n->mk2_in_l2 = false;
+		atomic_add_long(&nested_diag_mk2_ritorni, 1);
+		return;
+	}
+	if (!n->mk2_ep || n->in_l2 ||
+	    (reason != EXIT_REASON_VMREAD && reason != EXIT_REASON_VMWRITE))
+		return;
+	if (nested_diag_mk2_every > 1 && (rdtsc() >> 4) % nested_diag_mk2_every != 0)
+		return;
+	x = curcpu;
+	y = nested_diag_mk2 == 2 ? (x + 2) % mp_ncpus : (x ^ 1);
+	nested_mk_sposta(y);
+	n->mk2_ep = false;
+	n->mk2_ret = x + 1;
+	n->mk2_in_l2 = false;
+	nested_oprec_note(n, OPR_MK2, 1, curcpu);
+	atomic_add_long(&nested_diag_mk2_andate, 1);
 }
 
 void
@@ -3718,6 +3796,10 @@ nested_vmlaunch(struct vmx_vcpu *vcpu, bool is_resume)
 		nested_diag_pfinj_note(vcpu, c);
 	if (__predict_false(nested_diag_pfrec != 0))
 		nested_diag_pfrec_entry(vcpu, c);
+	/* Fable 038 §3.4: l'emulazione e' finita; da qui Mk2 aspetta l'uscita dell'L2 */
+	n->mk2_ep = false;
+	if (n->mk2_ret != 0)
+		n->mk2_in_l2 = true;
 
 	VMPTRLD(vmcs02);
 	nested_compose_vmcs02(vcpu);
@@ -4245,9 +4327,13 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 			nested_oprec_note(n, OPR_RIVEND,
 			    (uint32_t)vcpu->state.lastcpu, curcpu);	/* Fable 038 §3.1 */
 		}
-		if (vcpu->state.lastcpu != NOCPU)	/* non coprire una richiesta differita */
-			vcpu->state.nocpu_why = VMX_NOCPU_SLOW_REFLECT;
-		vcpu->state.lastcpu = NOCPU;
+		if (__predict_false(nested_diag_d3_break))
+			vcpu->state.lastcpu = curcpu;	/* collaudo: il difetto D3 */
+		else {
+			if (vcpu->state.lastcpu != NOCPU)	/* non coprire una richiesta differita */
+				vcpu->state.nocpu_why = VMX_NOCPU_SLOW_REFLECT;
+			vcpu->state.lastcpu = NOCPU;
+		}
 	}
 	}
 
@@ -5913,6 +5999,7 @@ nested_pfrec_cap_e0(struct vmx_vcpu *vcpu)
 	p->seq = ++n->pfrec_seq;
 	p->t0 = rdtsc();
 	p->rip0 = rip;
+	nested_mk2_episodio(n, rip);		/* Fable 038 §3.4 */
 	p->cr3_0 = vmcs_read(VMCS_GUEST_CR3);
 	p->gpa0 = n->ept_gpa;
 	p->gla0 = vmcs_read(VMCS_GUEST_LINEAR_ADDRESS);
@@ -6521,6 +6608,8 @@ vmx_nested_exit(void *vcpui)
 	vmm_stat_incr(vcpu->vcpu, VMX_NESTED_SLOWPATH, 1);
 	if (vcpu->nested != NULL)		/* Fable 034 §4.3, amplificatore Mk */
 		nested_mk_percorso_lento(vcpu->nested);
+	if (vcpu->nested != NULL)		/* Fable 038 §3.4, Mk2 */
+		nested_mk2_percorso_lento(vcpu->nested, reason);
 	if (vcpu->nested != NULL)
 		nested_stats_flush(vcpu);
 

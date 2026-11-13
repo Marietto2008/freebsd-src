@@ -686,6 +686,10 @@ struct vmx_nested {
 	 */
 	int		l1_last_cpu1;
 	cpuset_t	l1_flushed;
+	/* Fable 038 §3.4, Mk2: episodio sorvegliato aperto, l'L2 e' rientrata dopo lo spostamento, CPU di partenza + 1 */
+	bool		mk2_ep;
+	bool		mk2_in_l2;
+	int		mk2_ret;
 };
 void	nested_stats_flush(struct vmx_vcpu *vcpu);
 
