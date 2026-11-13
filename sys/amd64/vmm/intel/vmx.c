@@ -277,6 +277,8 @@ VPID_CTR(vpid01_invvpid_pending,
 VPID_CTR(vpid01_invvpid_nested_entry,
     "VPID01 invalidato per il NOCPU di nested_vmlaunch (falsa migrazione)");
 VPID_CTR(vpid01_invvpid_other, "VPID01 invalidato al primo vmx_run del vCPU");
+VPID_CTR(vpid01_invvpid_slow_reflect,
+    "VPID01 invalidato dopo una riflessione L2->L1 dal percorso lento (D3)");
 VPID_CTR(vpid_invvpid_saved_eptgen,
     "INVVPID risparmiati perche' segue un INVEPT (pm_eptgen cambiato)");
 VPID_CTR(vmcs02_host_state_rewrites,
@@ -1635,6 +1637,8 @@ vmx_set_pcpu_defaults(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap)
 		atomic_add_long(&vpid_flush_completed, 1);
 	} else if (vmxstate->nocpu_why == VMX_NOCPU_NESTED_ENTRY)
 		atomic_add_long(&vpid01_invvpid_nested_entry, 1);
+	else if (vmxstate->nocpu_why == VMX_NOCPU_SLOW_REFLECT)
+		atomic_add_long(&vpid01_invvpid_slow_reflect, 1);
 	else
 		atomic_add_long(&vpid01_invvpid_other, 1);
 	vmxstate->nocpu_why = VMX_NOCPU_INIT;

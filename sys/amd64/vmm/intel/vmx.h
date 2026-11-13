@@ -104,6 +104,7 @@ struct vmxstate {
 #define	VMX_NOCPU_INIT		0	/* vCPU nuovo */
 #define	VMX_NOCPU_DEFERRED	1	/* vmx_invvpid(running=0): invalidazione differita */
 #define	VMX_NOCPU_NESTED_ENTRY	2	/* nested_vmlaunch: riscrittura dei campi host del VMCS02 */
+#define	VMX_NOCPU_SLOW_REFLECT	3	/* riflessione L2->L1 dal percorso lento (D3, Fable 038) */
 
 struct apic_page {
 	uint32_t reg[PAGE_SIZE / 4];
