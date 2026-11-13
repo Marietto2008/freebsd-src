@@ -1555,6 +1555,8 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		invvpid_desc.linear_addr = 0;
 		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, invvpid_desc);
 		vmm_stat_incr(vcpu->vcpu, VCPU_INVVPID_DONE, 1);
+		if (vcpu->nested != NULL)	/* Fable 038 §3.1 */
+			vmx_nested_vpid01_flushed(vcpu);
 	} else {
 		/*
 		 * The invvpid can be skipped if an invept is going to
@@ -3752,7 +3754,8 @@ vmx_dr_leave_guest(struct vmxctx *vmxctx)
 	write_rflags(read_rflags() | vmxctx->host_tf);
 }
 
-static __inline void
+/* true se ha invalidato l'EPT01 su questa CPU (Fable 038 §3.1: vale anche per il VPID01) */
+static __inline bool
 vmx_pmap_activate(struct vmx *vmx, pmap_t pmap)
 {
 	long eptgen;
@@ -3767,7 +3770,9 @@ vmx_pmap_activate(struct vmx *vmx, pmap_t pmap)
 		vmx->eptgen[cpu] = eptgen;
 		invept(INVEPT_TYPE_SINGLE_CONTEXT,
 		    (struct invept_desc){ .eptp = vmx->eptp, ._res = 0 });
+		return (true);
 	}
+	return (false);
 }
 
 static __inline void
@@ -4125,7 +4130,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * Mark the EPT as active on this host CPU and invalidate
 		 * EPTP-tagged TLB entries if required.
 		 */
-		vmx_pmap_activate(vmx, pmap);
+		if (vmx_pmap_activate(vmx, pmap) && vcpu->nested != NULL)
+			vmx_nested_vpid01_flushed(vcpu);	/* Fable 038 §3.1 */
 
 		vmx_run_trace(vcpu);
 		{
@@ -4248,6 +4254,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 			    vmx_vept_shadow_entry(vcpu, nested_diag58_gpa) : 0;
 			SDT_PROBE1(vmm, vmx, nested, diag58ent, &e);
 		}
+		if (vcpu->nested != NULL)	/* Fable 038 §3.1 e 036 §5.1, solo contatori */
+			vmx_nested_entry_check(vcpu);
 		rc = vmx_enter_guest(vmxctx, vmx, launched);
 		/*
 		 * VM-entry hardware fallito in L2 (parere #51 §9, caso B): rc

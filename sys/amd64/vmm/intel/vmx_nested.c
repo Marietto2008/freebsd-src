@@ -357,13 +357,16 @@ SYSCTL_UINT(_hw_vmm_vmx, OID_AUTO, nested_diag_oprec_every, CTLFLAG_RWTUN,
     "nested: copia anche un episodio normale ogni N (0 = mai)");
 enum {
 	OPR_VMREAD = 1, OPR_VMWRITE, OPR_VMPTRLD, OPR_VMCLEAR, OPR_INVEPT,
-	OPR_INVVPID, OPR_LAUNCH, OPR_RESUME, OPR_RIFL, OPR_RIFL_RIP, OPR_RIFL_INFO, OPR_RIFL_IDTV, OPR_INIEZ
+	OPR_INVVPID, OPR_LAUNCH, OPR_RESUME, OPR_RIFL, OPR_RIFL_RIP, OPR_RIFL_INFO, OPR_RIFL_IDTV, OPR_INIEZ,
+	OPR_RIVEND, OPR_VIOL01
 };
 static const char *const nested_oprec_nome[] = {
 	"?", "VMREAD", "VMWRITE", "VMPTRLD", "VMCLEAR", "INVEPT", "INVVPID",
 	"VMLAUNCH", "VMRESUME", "RIFLESSA", "  rip L2", "  info",	/* 18: RCX; 48: GPA */
 	"  idt-vect",	/* Fable 023 §2.1ii: campo = IDT-vectoring info valida, val = codice d'errore */
-	"INIEZIONE L0->L1"	/* Fable 034 §4.1: campo = interruption info scritta nel VMCS01 */
+	"INIEZIONE L0->L1",	/* Fable 034 §4.1: campo = interruption info scritta nel VMCS01 */
+	"RIVENDICA CPU",	/* Fable 038 §3.1: riflessione lenta su un'altra CPU, campo = lastcpu di prima, val = curcpu */
+	"VIOLAZIONE VPID01"	/* Fable 038 §3.1: ingresso dell'L1, campo = CPU dell'ultima esecuzione + 1, val = curcpu */
 };
 static struct nested_pfrec nested_pfrec_norm;	/* ultimo episodio normale */
 static volatile u_int nested_pfrec_norm_busy;
@@ -504,6 +507,59 @@ nested_mk_ingresso(struct vmx_nested *n)
 	atomic_add_long(&nested_diag_mk_andate, 1);
 	if (modo == 1)
 		n->mk_ret = x + 1;
+}
+
+/*
+ * Fable 038 §3.1 e 040 §3, invariante del VPID01, sempre acceso, solo contatore: a ogni ingresso hardware dell'L1
+ * sulla CPU c, o l'L1 ha girato per ultimo su c, o il VPID01 e' stato invalidato su c (INVVPID, o INVEPT dell'EPT01)
+ * dopo l'ultima esecuzione dell'L1. Una violazione e' un ingresso dell'L1 con traduzioni che possono essere vecchie
+ * (difetto D3: con la correzione deve restare a zero). Alla prima, un messaggio con le due CPU.
+ */
+NESTED_CTR(vpid01_invariant_viol, "nested: ingressi dell'L1 con il VPID01 non coerente su quella CPU (Fable 038)");
+static u_int vpid01_invariant_avvisato;
+/* Fable 036 §5.1: ingressi hardware in L2 con un interrupt dell'L1 pendente e consegnabile, con EXTINT exiting */
+NESTED_CTR(nested_l2entry_l1intr, "nested: ingressi in L2 con interrupt dell'L1 pendente, senza uscita immediata");
+NESTED_CTR(nested_l2entry_l1intr_imm, "nested: ingressi in L2 con interrupt dell'L1 pendente e uscita immediata armata");
+/* Fable 038 §4 punto 2: rinvii senza ripiego (l'uscita immediata non si arma) */
+NESTED_CTR(nested_immexit_noarm_l1timer, "nested: rinvio senza uscita immediata, l'L1 usa il suo timer di preemption");
+NESTED_CTR(nested_immexit_noarm_noimm, "nested: rinvio senza uscita immediata, timer di preemption non disponibile");
+
+/* le invalidazioni del VPID01 sulla CPU corrente (sezione critica di vmx_run) */
+void
+vmx_nested_vpid01_flushed(struct vmx_vcpu *vcpu)
+{
+	CPU_SET(curcpu, &vcpu->nested->l1_flushed);
+}
+
+/* subito prima dell'ingresso hardware, interrupt chiusi */
+void
+vmx_nested_entry_check(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	int me = curcpu, vec;
+
+	if (!n->in_l2) {
+		if (n->l1_last_cpu1 != 0 && n->l1_last_cpu1 != me + 1 &&
+		    !CPU_ISSET(me, &n->l1_flushed)) {
+			atomic_add_long(&vpid01_invariant_viol, 1);
+			nested_oprec_note(n, OPR_VIOL01, n->l1_last_cpu1, me);
+			if (atomic_cmpset_int(&vpid01_invariant_avvisato, 0, 1))
+				printf("vmm nested: VPID01 non invalidato: vcpu %d "
+				    "entra in L1 su cpu %d, ultima esecuzione su "
+				    "cpu %d (Fable 038, D3)\n", vcpu->vcpuid, me,
+				    n->l1_last_cpu1 - 1);
+		}
+		n->l1_last_cpu1 = me + 1;
+		CPU_ZERO(&n->l1_flushed);
+		return;
+	}
+	c = nested_current_cache(n);
+	if (c == NULL ||
+	    (vmcs12_read_field(c, VMCS_PIN_BASED_CTLS) & PINBASED_EXTINT_EXITING) == 0 ||
+	    !vlapic_pending_intr(vm_lapic(vcpu->vcpu), &vec))
+		return;
+	atomic_add_long(n->imm_armed ? &nested_l2entry_l1intr_imm : &nested_l2entry_l1intr, 1);
 }
 
 void
@@ -4184,8 +4240,11 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 				    vcpu->state.lastcpu, curcpu, vcpu->vcpuid);
 		}
 	} else {
-		if (vcpu->state.lastcpu != curcpu)
+		if (vcpu->state.lastcpu != curcpu) {
 			atomic_add_long(&vpid01_slowpath_claim, 1);	/* audit VPID, D3 */
+			nested_oprec_note(n, OPR_RIVEND,
+			    (uint32_t)vcpu->state.lastcpu, curcpu);	/* Fable 038 §3.1 */
+		}
 		if (vcpu->state.lastcpu != NOCPU)	/* non coprire una richiesta differita */
 			vcpu->state.nocpu_why = VMX_NOCPU_SLOW_REFLECT;
 		vcpu->state.lastcpu = NOCPU;
@@ -4381,10 +4440,12 @@ nested_immexit_arm(struct vmx_vcpu *vcpu, int kind)
 	struct vmx_nested *n = vcpu->nested;
 
 	if (!n->imm_ok) {
+		atomic_add_long(&nested_immexit_noarm_noimm, 1);	/* Fable 038 §4 */
 		SDT_PROBE3(vmm, vmx, nested, immexit, vcpu->vcpuid, 4, kind);
 		return;
 	}
 	if (n->preempt_on) {
+		atomic_add_long(&nested_immexit_noarm_l1timer, 1);	/* Fable 038 §4 */
 		vmm_stat_incr(vcpu->vcpu, VMX_NESTED_IMMEXIT_L1TIMER, 1);
 		SDT_PROBE3(vmm, vmx, nested, immexit, vcpu->vcpuid, 3, kind);
 		return;
