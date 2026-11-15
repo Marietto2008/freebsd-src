@@ -267,6 +267,77 @@ vcpu_init(struct vcpu *vcpu)
 }
 
 /*
+ * claude 15/11/2026 (R2, diagnosi Fable 044 §2 e 046 §4): reset SUL POSTO di un vCPU, per il reset di sistema di
+ * QEMU (0xCF9), che non ricrea la VM. Prima tutto lo stato tenuto dal modulo sopravviveva: le MTRR (OVMF in
+ * ASSERT su MtrrDefType.FE dopo ogni riavvio, diagnosi del 15/11), gli MSR del guest, il LAPIC, gli eventi
+ * pendenti e lo stato VMX annidato (vmxon, VMCS12 corrente e cache, VMCS02, VPID). Qui la parte per-vCPU
+ * dell'architettura e il vlapic si ricreano come in vcpu_init, cioe' come al primo avvio; le capacita' impostate
+ * dall'utente (getcap che risponde) si riapplicano. NON si toccano: memoria, dispositivi in passthrough,
+ * statistiche, tsc_offset di vmm, stato x2APIC diverso dal valore di reset. Chiamante: VM_RESET_INPLACE, con
+ * tutti i vCPU congelati (VMMDEV_IOCTL_LOCK_ALL_VCPUS).
+ */
+static u_long vm_reset_inplace_n;
+SYSCTL_ULONG(_hw_vmm, OID_AUTO, reset_inplace, CTLFLAG_RD, &vm_reset_inplace_n, 0,
+    "reset sul posto dei vCPU (VM_RESET_INPLACE): vCPU ricreati");
+
+static void
+vcpu_reset_inplace(struct vcpu *vcpu, struct vm_reset_inplace *r)
+{
+	int cap[VM_CAP_MAX], valida[VM_CAP_MAX], nuovo, t;
+	uint64_t livello;
+
+	if (vm_get_register(vcpu, VM_REG_GUEST_NESTED_LEVEL, &livello) == 0 && livello == 2)
+		r->vcpus_l2++;
+	for (t = 0; t < VM_CAP_MAX; t++)
+		valida[t] = vmmops_getcap(vcpu->cookie, t, &cap[t]) == 0;
+
+	vmmops_vlapic_cleanup(vcpu->vlapic);
+	vmmops_vcpu_cleanup(vcpu->cookie);
+	vcpu->cookie = vmmops_vcpu_init(vcpu->vm->cookie, vcpu, vcpu->vcpuid);
+	vcpu->vlapic = vmmops_vlapic_init(vcpu->cookie);
+	vm_set_x2apic_state(vcpu, X2APIC_DISABLED);
+	vcpu->reqidle = 0;
+	vcpu->exitintinfo = 0;
+	vcpu->nmi_pending = 0;
+	vcpu->extint_pending = 0;
+	vcpu->exception_pending = 0;
+	vcpu->guest_xcr0 = XFEATURE_ENABLED_X87;
+	fpu_save_area_reset(vcpu->guestfpu);
+	memset(&vcpu->fatal, 0, sizeof(vcpu->fatal));
+	vcpu->gla2gpa_conteso = false;
+
+	for (t = 0; t < VM_CAP_MAX; t++) {
+		if (!valida[t] || vmmops_getcap(vcpu->cookie, t, &nuovo) != 0 || nuovo == cap[t])
+			continue;
+		if (vmmops_setcap(vcpu->cookie, t, cap[t]) != 0)
+			r->cap_errori++;
+	}
+	r->vcpus++;
+	atomic_add_long(&vm_reset_inplace_n, 1);
+}
+
+int
+vm_reset_inplace(struct vm *vm, struct vm_reset_inplace *r)
+{
+	struct vcpu *vcpu;
+	int i;
+
+	memset(r, 0, sizeof(*r));
+	for (i = 0; i < vm_get_maxcpus(vm); i++) {
+		vcpu = vm->vcpu[i];
+		if (vcpu == NULL)
+			continue;
+		KASSERT(vcpu_get_state(vcpu, NULL) == VCPU_FROZEN,
+		    ("vm_reset_inplace: vcpu %d non congelato", i));
+		vcpu_reset_inplace(vcpu, r);
+	}
+	/* stato programmabile dei dispositivi di VM; i livelli delle linee (acnt) restano dei dispositivi */
+	vioapic_reset(vm->vioapic);
+	vatpic_reset(vm->vatpic);
+	return (0);
+}
+
+/*
  * #135 K2: chiude il latch fatale del vCPU (una volta: il primo errore conserva la diagnosi) e restituisce
  * ENOTRECOVERABLE. Registra rip, nextrip e lunghezza PRIMA che il chiamante li ripristini. Una riga di log al
  * secondo al massimo, piu' il contatore hw.vmm.fatal_latches e la sonda SDT vmm:::fatal-latch.

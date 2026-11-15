@@ -562,6 +562,24 @@ vioapic_init(struct vm *vm)
 	return (vioapic);
 }
 
+/*
+ * claude 15/11/2026 (R2, Fable 046 §4): reset sul posto (VM_RESET_INPLACE), ricavato da vioapic_init: tutte le
+ * voci mascherate, id e ioregsel a zero. Gli acnt (livelli delle linee, asserzioni dei dispositivi di QEMU) NON si
+ * toccano: un deassert successivo li porterebbe sotto zero e un'asserzione vera andrebbe persa.
+ */
+void
+vioapic_reset(struct vioapic *vioapic)
+{
+	int i;
+
+	VIOAPIC_LOCK(vioapic);
+	vioapic->id = 0;
+	vioapic->ioregsel = 0;
+	for (i = 0; i < REDIR_ENTRIES; i++)
+		vioapic->rtbl[i].reg = 0x0001000000010000UL;
+	VIOAPIC_UNLOCK(vioapic);
+}
+
 void
 vioapic_cleanup(struct vioapic *vioapic)
 {

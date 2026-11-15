@@ -38,6 +38,7 @@ struct vm_snapshot_meta;
 
 struct vatpic *vatpic_init(struct vm *vm);
 void vatpic_cleanup(struct vatpic *vatpic);
+void vatpic_reset(struct vatpic *vatpic);
 
 int vatpic_master_handler(struct vm *vm, bool in, int port, int bytes,
     uint32_t *eax);
