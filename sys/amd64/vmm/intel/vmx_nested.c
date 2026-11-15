@@ -532,6 +532,35 @@ vmx_nested_vpid01_flushed(struct vmx_vcpu *vcpu)
 	CPU_SET(curcpu, &vcpu->nested->l1_flushed);
 }
 
+/*
+ * claude 15/11/2026 (R2, diagnosi Fable 044 §2 e 046 §5): invarianti del reset sul posto, sempre accesi, devono
+ * restare a zero. (1) VMXON eseguito con vmxon gia' acceso (nested_vmxon). (2) ingresso al vettore di reset
+ * (RIP 0xfff0 con base di CS 0xffff0000) mentre vmxon o in_l2 sono accesi: lo stato VMX di prima del reset e'
+ * sopravvissuto. Il controllo (2) costa un confronto per ingresso; il VMCS corrente e' gia' caricato.
+ */
+NESTED_CTR(nested_inv_vmxon_doppio,
+    "nested: VMXON con vmxon gia' acceso (invariante del reset sul posto, R2)");
+NESTED_CTR(nested_inv_reset_in_vmx,
+    "nested: ingresso dell'L1 al vettore di reset con vmxon acceso (invariante R2)");
+static volatile u_int nested_inv_vmxon_avvisato, nested_inv_reset_avvisato;
+
+void
+vmx_nested_reset_vector_check(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+
+	/* Fable 050 §1c: un L2 fermo al proprio vettore di reset (VM di prima generazione) e' legittimo: solo in L1 */
+	if (!n->vmxon || n->in_l2)
+		return;
+	if (vmcs_read(VMCS_GUEST_CS_BASE) != 0xffff0000UL)
+		return;
+	atomic_add_long(&nested_inv_reset_in_vmx, 1);
+	if (atomic_cmpset_int(&nested_inv_reset_avvisato, 0, 1))
+		printf("vmm nested: vcpu %d entra al vettore di reset con vmxon=%d "
+		    "in_l2=%d (stato VMX sopravvissuto al reset, R2)\n", vcpu->vcpuid,
+		    n->vmxon, n->in_l2);
+}
+
 /* subito prima dell'ingresso hardware, interrupt chiusi */
 void
 vmx_nested_entry_check(struct vmx_vcpu *vcpu)
@@ -1767,6 +1796,11 @@ nested_vmxon(struct vmx_vcpu *vcpu)
 		return (0);
 	}
 	if (n->vmxon) {
+		/* claude 15/11/2026 (R2, Fable 044 §2): invariante, deve restare a zero */
+		atomic_add_long(&nested_inv_vmxon_doppio, 1);
+		if (atomic_cmpset_int(&nested_inv_vmxon_avvisato, 0, 1))
+			printf("vmm nested: VMXON con vmxon gia' acceso: vcpu %d "
+			    "(stato VMX rimasto da un reset? R2)\n", vcpu->vcpuid);
 		nested_vmx_result(vcpu, VMXERR_VMXON_IN_VMX_ROOT);
 		goto done;
 	}

@@ -357,6 +357,9 @@ enum {
 
 	/* nested, prova d'iniezione della generazione dei mapping (B1) */
 	IOCNUM_NESTED_MEMGEN_BUMP = 131,
+
+	/* claude 15/11/2026 (R2): reset sul posto dei vCPU e dei dispositivi di VM */
+	IOCNUM_RESET_INPLACE = 132,
 };
 
 #define	VM_RUN		\
@@ -499,4 +502,18 @@ enum {
 	_IOW('v', IOCNUM_LAPIC_CLEAR_IRR, struct vm_lapic_clear_irr)
 #define	VM_NESTED_MEMGEN_BUMP \
 	_IOR('v', IOCNUM_NESTED_MEMGEN_BUMP, uint64_t)
+/*
+ * claude 15/11/2026 (R2, diagnosi Fable 044 e 046): reset sul posto per il reset di sistema di QEMU (0xCF9),
+ * che non ricrea la VM. Ricrea lo stato per-vCPU del modulo (VMCS, MSR e MTRR del guest, LAPIC, eventi pendenti,
+ * stato VMX annidato) e lo stato programmabile di vioapic e vatpic; non tocca memoria, passthrough, statistiche.
+ * Restituisce quanti vCPU sono stati ricreati, quanti erano in L2 e quante capacita' non si sono riapplicate.
+ */
+struct vm_reset_inplace {
+	int	vcpus;
+	int	vcpus_l2;
+	int	cap_errori;
+	int	riservato;
+};
+#define	VM_RESET_INPLACE \
+	_IOR('v', IOCNUM_RESET_INPLACE, struct vm_reset_inplace)
 #endif

@@ -267,6 +267,7 @@ bool	vmx_nested_apicacc_policy(void);	/* hw.vmm.vmx.nested_apic_access && host *
 bool	vmx_nested_qualkvm_policy(void);	/* hw.vmm.vmx.nested_qual_kvm (Fable 032) */
 void	vmx_nested_oprec_inj(struct vmx_vcpu *vcpu, uint32_t info);	/* Fable 034 §4.1 */
 void	vmx_nested_vpid01_flushed(struct vmx_vcpu *vcpu);		/* Fable 038 §3.1 */
+void	vmx_nested_reset_vector_check(struct vmx_vcpu *vcpu);	/* R2, 15/11 */
 void	vmx_nested_entry_check(struct vmx_vcpu *vcpu);		/* Fable 038 §3.1, 036 §5.1 */
 void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
 int	vmx_vept_cur_slot(struct vmx_nested *n);	/* parere #53 §8: slot corrente o -1 */

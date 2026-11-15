@@ -804,6 +804,27 @@ vatpic_init(struct vm *vm)
 	return (vatpic);
 }
 
+/*
+ * claude 15/11/2026 (R2, Fable 046 §4): reset sul posto (VM_RESET_INPLACE), ricavato da vatpic_init (tutto a
+ * zero): stato programmabile dei due 8259 ed ELCR. Gli acnt (livelli delle linee) restano, come nel vioapic.
+ */
+void
+vatpic_reset(struct vatpic *vatpic)
+{
+	struct atpic *atpic;
+	int acnt[8], i;
+
+	VATPIC_LOCK(vatpic);
+	for (i = 0; i < 2; i++) {
+		atpic = &vatpic->atpic[i];
+		memcpy(acnt, atpic->acnt, sizeof(acnt));
+		memset(atpic, 0, sizeof(*atpic));
+		memcpy(atpic->acnt, acnt, sizeof(acnt));
+		vatpic->elc[i] = 0;
+	}
+	VATPIC_UNLOCK(vatpic);
+}
+
 void
 vatpic_cleanup(struct vatpic *vatpic)
 {

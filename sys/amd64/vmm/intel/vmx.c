@@ -3827,6 +3827,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 	vmcs_write(VMCS_HOST_CR3, rcr3());
 
 	vmcs_write(VMCS_GUEST_RIP, rip);
+	if (vcpu->nested != NULL && rip == 0xfff0)	/* invariante R2 (15/11) */
+		vmx_nested_reset_vector_check(vcpu);
 	if (vcpu->nested != NULL && vcpu->nested->vpid_track)
 		vmx_set_pcpu_defaults_track(vmx, vcpu, pmap);
 	else

@@ -203,6 +203,8 @@ const struct vmmdev_ioctl vmmdev_machdep_ioctls[] = {
 	/* gli stessi lock di VM_MMAP_MEMSEG: nessun vCPU in esecuzione */
 	VMMDEV_IOCTL(VM_NESTED_MEMGEN_BUMP,
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
+	/* claude 15/11/2026 (R2): reset sul posto, tutti i vCPU congelati come le altre operazioni di VM */
+	VMMDEV_IOCTL(VM_RESET_INPLACE, VMMDEV_IOCTL_LOCK_ALL_VCPUS),
 };
 const size_t vmmdev_machdep_ioctl_count = nitems(vmmdev_machdep_ioctls);
 
@@ -691,6 +693,10 @@ vmmdev_machdep_ioctl(struct vm *vm, struct vcpu *vcpu, u_long cmd, caddr_t data,
 		vm_memmap_generation_bump(vm);
 		*(uint64_t *)data = vm_memmap_generation(vm);
 		error = 0;
+		break;
+	case VM_RESET_INPLACE:
+		/* claude 15/11/2026 (R2, Fable 046 §4): dal gestore di reset della macchina in QEMU */
+		error = vm_reset_inplace(vm, (struct vm_reset_inplace *)data);
 		break;
 	default:
 		error = ENOTTY;

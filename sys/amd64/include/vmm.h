@@ -384,6 +384,9 @@ void vm_exit_astpending(struct vcpu *vcpu, uint64_t rip);
 void vm_exit_reqidle(struct vcpu *vcpu, uint64_t rip);
 int vm_snapshot_req(struct vm *vm, struct vm_snapshot_meta *meta);
 int vm_restore_time(struct vm *vm);
+struct vm_reset_inplace;
+/* claude 15/11/2026 (R2): reset sul posto dei vCPU e dei dispositivi di VM, a vCPU congelati */
+int vm_reset_inplace(struct vm *vm, struct vm_reset_inplace *r);
 
 #ifdef _SYS__CPUSET_H_
 cpuset_t vm_start_cpus(struct vm *vm, const cpuset_t *tostart);
