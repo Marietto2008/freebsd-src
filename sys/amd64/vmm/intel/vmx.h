@@ -155,6 +155,9 @@ struct vmx {
 	char		*msr_bitmap;
 	uint64_t	eptp;
 	long		eptgen[MAXCPU];		/* cached pmap->pm_eptgen */
+	/* claude 15/11 (Fable 050 §5.5): INVEPT dell'EPT01 eseguiti da vmx_pmap_activate, per CPU (solo con la sezione
+	 * critica di quella CPU: nessuna scrittura concorrente sullo stesso indice) */
+	u_long		invept01_n[MAXCPU];
 	pmap_t		pmap;
 	/*
 	 * Fase A (parere Astra 012): politica EPT A/D offerta all'L1, CONGELATA

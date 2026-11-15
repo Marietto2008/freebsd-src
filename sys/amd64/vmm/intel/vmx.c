@@ -1555,8 +1555,10 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		invvpid_desc.linear_addr = 0;
 		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, invvpid_desc);
 		vmm_stat_incr(vcpu->vcpu, VCPU_INVVPID_DONE, 1);
-		if (vcpu->nested != NULL)	/* Fable 038 §3.1 */
+		if (vcpu->nested != NULL) {	/* Fable 038 §3.1 */
 			vmx_nested_vpid01_flushed(vcpu);
+			vmx_nested_note_l0(vcpu, VMX_OPR_L0_INVVPID, curcpu, 0);
+		}
 	} else {
 		/*
 		 * The invvpid can be skipped if an invept is going to
@@ -1566,6 +1568,9 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		 */
 		vmm_stat_incr(vcpu->vcpu, VCPU_INVVPID_SAVED, 1);
 		atomic_add_long(&vpid_invvpid_saved_eptgen, 1);
+		/* Fable 050 §5.5: se si esce prima di vmx_pmap_activate, l'INVEPT puo' farlo un altro vCPU su questa CPU */
+		if (vcpu->nested != NULL)
+			vmx_nested_vpid01_saltato(vcpu, vmx->invept01_n[curcpu]);
 	}
 }
 
@@ -3770,6 +3775,7 @@ vmx_pmap_activate(struct vmx *vmx, pmap_t pmap)
 		vmx->eptgen[cpu] = eptgen;
 		invept(INVEPT_TYPE_SINGLE_CONTEXT,
 		    (struct invept_desc){ .eptp = vmx->eptp, ._res = 0 });
+		vmx->invept01_n[cpu]++;		/* Fable 050 §5.5 */
 		return (true);
 	}
 	return (false);
@@ -4132,8 +4138,10 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * Mark the EPT as active on this host CPU and invalidate
 		 * EPTP-tagged TLB entries if required.
 		 */
-		if (vmx_pmap_activate(vmx, pmap) && vcpu->nested != NULL)
+		if (vmx_pmap_activate(vmx, pmap) && vcpu->nested != NULL) {
 			vmx_nested_vpid01_flushed(vcpu);	/* Fable 038 §3.1 */
+			vmx_nested_note_l0(vcpu, VMX_OPR_L0_INVEPT, curcpu, vmx->invept01_n[curcpu]);
+		}
 
 		vmx_run_trace(vcpu);
 		{
