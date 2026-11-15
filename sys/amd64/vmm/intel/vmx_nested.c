@@ -367,8 +367,13 @@ static const char *const nested_oprec_nome[] = {
 	"INIEZIONE L0->L1",	/* Fable 034 §4.1: campo = interruption info scritta nel VMCS01 */
 	"RIVENDICA CPU",	/* Fable 038 §3.1: riflessione lenta su un'altra CPU, campo = lastcpu di prima, val = curcpu */
 	"VIOLAZIONE VPID01",	/* Fable 038 §3.1: ingresso dell'L1, campo = CPU dell'ultima esecuzione + 1, val = curcpu */
-	"MK2"			/* Fable 038 §3.4: campo = 1 andata (val = CPU d'arrivo), 2 ritorno (val = CPU) */
+	"MK2",			/* Fable 038 §3.4: campo = 1 andata (val = CPU d'arrivo), 2 ritorno (val = CPU) */
+	"L0 INVVPID01 RISPARMIATO",	/* 17, Fable 050 §5.5: campo = CPU, val = invept01_n su quella CPU */
+	"L0 INVEPT01",		/* 18: vmx_pmap_activate, campo = CPU, val = invept01_n dopo */
+	"L0 INVVPID01",		/* 19: vmx_invvpid eseguito, campo = CPU */
+	"COPERTO DA INVEPT"	/* 20: violazione apparente coperta, campo = CPU ultima + 1, val = CPU */
 };
+CTASSERT(VMX_OPR_COPERTO == nitems(nested_oprec_nome) - 1);
 static struct nested_pfrec nested_pfrec_norm;	/* ultimo episodio normale */
 static volatile u_int nested_pfrec_norm_busy;
 /*
@@ -517,7 +522,7 @@ nested_mk_ingresso(struct vmx_nested *n)
  * (difetto D3: con la correzione deve restare a zero). Alla prima, un messaggio con le due CPU.
  */
 NESTED_CTR(vpid01_invariant_viol, "nested: ingressi dell'L1 con il VPID01 non coerente su quella CPU (Fable 038)");
-static u_int vpid01_invariant_avvisato;
+/* la stampa ora vale per le prime otto violazioni vere (vpid01_violazione), non solo la prima */
 /* Fable 036 §5.1: ingressi hardware in L2 con un interrupt dell'L1 pendente e consegnabile, con EXTINT exiting */
 NESTED_CTR(nested_l2entry_l1intr, "nested: ingressi in L2 con interrupt dell'L1 pendente, senza uscita immediata");
 NESTED_CTR(nested_l2entry_l1intr_imm, "nested: ingressi in L2 con interrupt dell'L1 pendente e uscita immediata armata");
@@ -533,6 +538,30 @@ vmx_nested_vpid01_flushed(struct vmx_vcpu *vcpu)
 }
 
 /*
+ * claude 15/11/2026 (Fable 050 §5.5): vmx_invvpid ha risparmiato l'INVVPID del VPID01 su questa CPU perche' l'eptgen
+ * e' cambiata: lo sostituira' l'INVEPT di vmx_pmap_activate. Se vmx_run esce prima, quell'INVEPT puo' eseguirlo un
+ * ALTRO vCPU sulla stessa CPU (invalida per tutti i VPID) e il segno finisce nel suo invariante: si ricorda la CPU e
+ * il contatore degli INVEPT per riconoscere il caso all'ingresso (vpid01_coperto_da_invept, non una violazione).
+ */
+void
+vmx_nested_vpid01_saltato(struct vmx_vcpu *vcpu, u_long invept)
+{
+	struct vmx_nested *n = vcpu->nested;
+
+	n->saltato_cpu1 = curcpu + 1;
+	n->saltato_invept = invept;
+	nested_oprec_note(n, VMX_OPR_L0_SALTATO, curcpu, invept);
+}
+
+/* eventi di L0 nell'anello delle operazioni del vCPU (Fable 049 §2.2b) */
+void
+vmx_nested_note_l0(struct vmx_vcpu *vcpu, uint32_t type, uint32_t field, uint64_t val)
+{
+	if (vcpu->nested != NULL)
+		nested_oprec_note(vcpu->nested, type, field, val);
+}
+
+/*
  * claude 15/11/2026 (R2, diagnosi Fable 044 §2 e 046 §5): invarianti del reset sul posto, sempre accesi, devono
  * restare a zero. (1) VMXON eseguito con vmxon gia' acceso (nested_vmxon). (2) ingresso al vettore di reset
  * (RIP 0xfff0 con base di CS 0xffff0000) mentre vmxon o in_l2 sono accesi: lo stato VMX di prima del reset e'
@@ -541,7 +570,7 @@ vmx_nested_vpid01_flushed(struct vmx_vcpu *vcpu)
 NESTED_CTR(nested_inv_vmxon_doppio,
     "nested: VMXON con vmxon gia' acceso (invariante del reset sul posto, R2)");
 NESTED_CTR(nested_inv_reset_in_vmx,
-    "nested: ingresso al vettore di reset con vmxon o in_l2 accesi (invariante R2)");
+    "nested: ingresso dell'L1 al vettore di reset con vmxon acceso (invariante R2)");
 static volatile u_int nested_inv_vmxon_avvisato, nested_inv_reset_avvisato;
 
 void
@@ -549,7 +578,8 @@ vmx_nested_reset_vector_check(struct vmx_vcpu *vcpu)
 {
 	struct vmx_nested *n = vcpu->nested;
 
-	if (!n->vmxon && !n->in_l2)
+	/* Fable 050 §1c: un L2 fermo al proprio vettore di reset (VM di prima generazione) e' legittimo: solo in L1 */
+	if (!n->vmxon || n->in_l2)
 		return;
 	if (vmcs_read(VMCS_GUEST_CS_BASE) != 0xffff0000UL)
 		return;
@@ -559,6 +589,98 @@ vmx_nested_reset_vector_check(struct vmx_vcpu *vcpu)
 		    "in_l2=%d (stato VMX sopravvissuto al reset, R2)\n", vcpu->vcpuid,
 		    n->vmxon, n->in_l2);
 }
+
+/*
+ * claude 15/11/2026 (Fable 049 §2.2 e 050 §5.5): violazione VERA dell'invariante (non coperta da un INVEPT). Si conta,
+ * si stampa per le prime otto, si congela l'anello delle operazioni del vCPU (se nested_diag_oprec e' acceso) e, rete di
+ * sicurezza, si esegue qui l'INVVPID del VPID01 prima dell'ingresso: un buco vero smette di poter fare danni, ma il
+ * contatore e la stampa restano e la causa va trovata lo stesso.
+ */
+NESTED_CTR(vpid01_coperto_da_invept,
+    "nested: violazioni apparenti del VPID01 coperte da un INVEPT dell'EPT01 di un altro vCPU (Fable 050 §5.2)");
+NESTED_CTR(vpid01_rete_invvpid,
+    "nested: INVVPID del VPID01 eseguiti dalla rete di sicurezza alla violazione (Fable 049 §2.2c)");
+#define	NESTED_VIOL01_MAX	4
+static struct nested_viol01 {
+	volatile u_int	done;
+	int		vcpuid, cpu, ultima;
+	uint64_t	tsc;
+	u_int		ops_n;
+	struct nested_oprec ops[NESTED_OPREC_N];
+} nested_viol01_rec[NESTED_VIOL01_MAX];
+static volatile u_int nested_viol01_n;
+
+static void
+vpid01_violazione(struct vmx_vcpu *vcpu, int me)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct nested_viol01 *r;
+	struct invvpid_desc d;
+	u_long k;
+	u_int a, i, cnt;
+
+	k = atomic_fetchadd_long(&vpid01_invariant_viol, 1);
+	nested_oprec_note(n, OPR_VIOL01, n->l1_last_cpu1, me);
+	if (k < 8)
+		printf("vmm nested: VPID01 non invalidato: vcpu %d entra in L1 su cpu %d, ultima "
+		    "esecuzione su cpu %d, INVVPID risparmiato su cpu %d (Fable 038, D3; violazione %lu)\n",
+		    vcpu->vcpuid, me, n->l1_last_cpu1 - 1, n->saltato_cpu1 - 1, k + 1);
+	if (nested_diag_oprec != 0 &&
+	    (a = atomic_fetchadd_int(&nested_viol01_n, 1)) < NESTED_VIOL01_MAX) {
+		r = &nested_viol01_rec[a];
+		r->vcpuid = vcpu->vcpuid;
+		r->cpu = me;
+		r->ultima = n->l1_last_cpu1 - 1;
+		r->tsc = rdtsc();
+		cnt = MIN(n->oprec_i, NESTED_OPREC_N);
+		for (i = 0; i < cnt; i++)
+			r->ops[i] = n->oprec[(n->oprec_i - cnt + i) % NESTED_OPREC_N];
+		r->ops_n = cnt;
+		atomic_store_rel_int(&r->done, 1);
+	}
+	if (vcpu->state.vpid != 0) {
+		d._res1 = 0;
+		d._res2 = 0;
+		d.vpid = vcpu->state.vpid;
+		d.linear_addr = 0;
+		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
+		atomic_add_long(&vpid01_rete_invvpid, 1);
+		CPU_SET(me, &n->l1_flushed);
+	}
+}
+
+static int
+sysctl_nested_viol01(SYSCTL_HANDLER_ARGS)
+{
+	struct nested_viol01 *r;
+	struct sbuf *sb;
+	u_int a, i, t;
+	int error;
+
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error != 0)
+		return (error);
+	sb = sbuf_new_for_sysctl(NULL, NULL, 4096, req);
+	for (a = 0; a < MIN(nested_viol01_n, NESTED_VIOL01_MAX); a++) {
+		r = &nested_viol01_rec[a];
+		if (atomic_load_acq_int(&r->done) == 0)
+			continue;
+		sbuf_printf(sb, "\n=== violazione %u: vcpu %d entra in L1 su cpu %d, ultima su cpu %d, %u operazioni\n",
+		    a + 1, r->vcpuid, r->cpu, r->ultima, r->ops_n);
+		for (i = 0; i < r->ops_n; i++) {
+			t = r->ops[i].type;
+			sbuf_printf(sb, "  -%12ju cpu %3u %-26s campo %#x val %#jx\n",
+			    (uintmax_t)(r->tsc - r->ops[i].tsc), r->ops[i].cpu,
+			    t < nitems(nested_oprec_nome) ? nested_oprec_nome[t] : "?",
+			    r->ops[i].field, (uintmax_t)r->ops[i].val);
+		}
+	}
+	error = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (error);
+}
+SYSCTL_PROC(_hw_vmm_vmx, OID_AUTO, nested_diag_viol01, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_nested_viol01, "A", "nested: anelli delle operazioni congelati alle violazioni del VPID01 (Fable 049 §2.2b)");
 
 /* subito prima dell'ingresso hardware, interrupt chiusi */
 void
@@ -571,15 +693,18 @@ vmx_nested_entry_check(struct vmx_vcpu *vcpu)
 	if (!n->in_l2) {
 		if (n->l1_last_cpu1 != 0 && n->l1_last_cpu1 != me + 1 &&
 		    !CPU_ISSET(me, &n->l1_flushed)) {
-			atomic_add_long(&vpid01_invariant_viol, 1);
-			nested_oprec_note(n, OPR_VIOL01, n->l1_last_cpu1, me);
-			if (atomic_cmpset_int(&vpid01_invariant_avvisato, 0, 1))
-				printf("vmm nested: VPID01 non invalidato: vcpu %d "
-				    "entra in L1 su cpu %d, ultima esecuzione su "
-				    "cpu %d (Fable 038, D3)\n", vcpu->vcpuid, me,
-				    n->l1_last_cpu1 - 1);
+			if (n->saltato_cpu1 == me + 1 &&
+			    vcpu->vmx->invept01_n[me] != n->saltato_invept) {
+				/* Fable 050 §5.2: INVVPID risparmiato qui, INVEPT dell'EPT01 eseguito qui da un altro
+				 * vCPU dopo: le traduzioni sono invalidate, non e' una violazione */
+				atomic_add_long(&vpid01_coperto_da_invept, 1);
+				nested_oprec_note(n, VMX_OPR_COPERTO, n->l1_last_cpu1, me);
+			} else {
+				vpid01_violazione(vcpu, me);
+			}
 		}
 		n->l1_last_cpu1 = me + 1;
+		n->saltato_cpu1 = 0;
 		CPU_ZERO(&n->l1_flushed);
 		return;
 	}
@@ -1305,8 +1430,10 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
 		nested_bitmaps_unmap(&n->cache[i]);
-		if (n->cache[i].vmcs02 != NULL)
+		if (n->cache[i].vmcs02 != NULL) {
+			vmcs_controlla_libero(n->cache[i].vmcs02, "VMCS02");	/* Fable 050 §2 */
 			free(n->cache[i].vmcs02, M_VMX_NESTED);
+		}
 	}
 	vmx_vept_flush(n);
 	if (n->vpid02_flush_pending)
@@ -1315,9 +1442,11 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 		vpid_free(n->vpid2);
 	if (n->msr_bitmap != NULL)
 		free(n->msr_bitmap, M_VMX_NESTED);
-	/* lo shadow non e' attivo da nessuna parte: vmx_run lo chiude sempre */
-	if (n->sh_vmcs != NULL)
+	/* lo shadow non e' attivo da nessuna parte: vmx_run lo chiude sempre (Fable 050 §2: ora si controlla) */
+	if (n->sh_vmcs != NULL) {
+		vmcs_controlla_libero(n->sh_vmcs, "VMCS shadow");
 		free(n->sh_vmcs, M_VMX_NESTED);
+	}
 	if (n->diag_simp_ck != NULL)
 		vm_gpa_release(n->diag_simp_ck);
 	nested_apic_pages_release(n);

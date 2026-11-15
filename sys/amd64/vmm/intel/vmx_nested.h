@@ -268,6 +268,12 @@ bool	vmx_nested_qualkvm_policy(void);	/* hw.vmm.vmx.nested_qual_kvm (Fable 032) 
 void	vmx_nested_oprec_inj(struct vmx_vcpu *vcpu, uint32_t info);	/* Fable 034 §4.1 */
 void	vmx_nested_vpid01_flushed(struct vmx_vcpu *vcpu);		/* Fable 038 §3.1 */
 void	vmx_nested_reset_vector_check(struct vmx_vcpu *vcpu);	/* R2, 15/11 */
+void	vmx_nested_vpid01_saltato(struct vmx_vcpu *vcpu, u_long invept);	/* Fable 050 §5.5 */
+void	vmx_nested_note_l0(struct vmx_vcpu *vcpu, uint32_t type, uint32_t field, uint64_t val);
+#define	VMX_OPR_L0_SALTATO	17	/* nested_oprec: INVVPID del VPID01 risparmiato (campo CPU, val invept01_n) */
+#define	VMX_OPR_L0_INVEPT	18	/* INVEPT dell'EPT01 in vmx_pmap_activate (campo CPU, val invept01_n) */
+#define	VMX_OPR_L0_INVVPID	19	/* INVVPID del VPID01 eseguito da vmx_invvpid (campo CPU) */
+#define	VMX_OPR_COPERTO		20	/* violazione coperta da un INVEPT (campo CPU dell'ultima esecuzione + 1, val CPU) */
 void	vmx_nested_entry_check(struct vmx_vcpu *vcpu);		/* Fable 038 §3.1, 036 §5.1 */
 void	vmx_vept_memgen_sync(struct vmx_vcpu *vcpu);	/* slow path */
 int	vmx_vept_cur_slot(struct vmx_nested *n);	/* parere #53 §8: slot corrente o -1 */
@@ -687,6 +693,10 @@ struct vmx_nested {
 	 */
 	int		l1_last_cpu1;
 	cpuset_t	l1_flushed;
+	/* claude 15/11 (Fable 050 §5.5): ultimo INVVPID del VPID01 risparmiato da vmx_invvpid (eptgen cambiata): CPU + 1
+	 * (0 = nessuno) e valore di vmx->invept01_n[] su quella CPU in quel momento */
+	int		saltato_cpu1;
+	u_long		saltato_invept;
 	/* Fable 038 §3.4, Mk2: episodio sorvegliato aperto, l'L2 e' rientrata dopo lo spostamento, CPU di partenza + 1 */
 	bool		mk2_ep;
 	bool		mk2_in_l2;

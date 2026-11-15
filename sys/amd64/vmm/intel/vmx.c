@@ -281,6 +281,73 @@ VPID_CTR(vpid01_invvpid_slow_reflect,
     "VPID01 invalidato dopo una riflessione L2->L1 dal percorso lento (D3)");
 VPID_CTR(vpid_invvpid_saved_eptgen,
     "INVVPID risparmiati perche' segue un INVEPT (pm_eptgen cambiato)");
+
+/*
+ * claude 15/11/2026 (Fable 050 §2): VMCS ATTIVI per CPU. vmptrld()/vmclear() (vmx_cpufunc.h) li registrano con la
+ * sezione critica della CPU che esegue l'istruzione; vmcs_controlla_libero() si chiama prima di ogni free di un VMCS.
+ * Righe scritte dalla propria CPU; la scansione di tutte le righe (vmclear su un'altra CPU, controllo al free) e' solo
+ * diagnostica. Devono restare a zero: vmcs_liberato_attivo (pagina liberata con il VMCS ancora attivo),
+ * vmcs_clear_altra_cpu (VMCLEAR su una CPU diversa da quella dove era attivo), vmcs_attivi_pieno (riga piena).
+ */
+#define	VMCS_ATTIVI_SLOT	8
+static struct vmcs *vmcs_attivi[MAXCPU][VMCS_ATTIVI_SLOT];
+VPID_CTR(vmcs_liberato_attivo, "VMCS liberati mentre erano ancora attivi su una CPU (Fable 050 §2)");
+VPID_CTR(vmcs_clear_altra_cpu, "VMCLEAR eseguiti su una CPU diversa da quella dove il VMCS era attivo");
+VPID_CTR(vmcs_attivi_pieno, "VMPTRLD non registrati: riga della CPU piena");
+
+void
+vmcs_attivo_carica(struct vmcs *vmcs)
+{
+	int c = curcpu, i, libero = -1;
+
+	for (i = 0; i < VMCS_ATTIVI_SLOT; i++) {
+		if (vmcs_attivi[c][i] == vmcs)
+			return;
+		if (vmcs_attivi[c][i] == NULL && libero < 0)
+			libero = i;
+	}
+	if (libero < 0)
+		atomic_add_long(&vmcs_attivi_pieno, 1);
+	else
+		vmcs_attivi[c][libero] = vmcs;
+}
+
+void
+vmcs_attivo_pulisci(struct vmcs *vmcs)
+{
+	int c = curcpu, i, k;
+
+	for (i = 0; i < VMCS_ATTIVI_SLOT; i++) {
+		if (vmcs_attivi[c][i] == vmcs) {
+			vmcs_attivi[c][i] = NULL;
+			return;
+		}
+	}
+	/* mai caricato (VMCLEAR iniziale) oppure attivo altrove */
+	for (k = 0; k <= mp_maxid; k++)
+		for (i = 0; i < VMCS_ATTIVI_SLOT; i++)
+			if (vmcs_attivi[k][i] == vmcs) {
+				vmcs_attivi[k][i] = NULL;
+				atomic_add_long(&vmcs_clear_altra_cpu, 1);
+			}
+}
+
+void
+vmcs_controlla_libero(struct vmcs *vmcs, const char *chi)
+{
+	int i, k;
+
+	if (vmcs == NULL)
+		return;
+	for (k = 0; k <= mp_maxid; k++)
+		for (i = 0; i < VMCS_ATTIVI_SLOT; i++)
+			if (vmcs_attivi[k][i] == vmcs) {
+				vmcs_attivi[k][i] = NULL;	/* la pagina potra' tornare come altro VMCS */
+				if (atomic_fetchadd_long(&vmcs_liberato_attivo, 1) < 8)
+					printf("vmm: %s %p liberato mentre e' ATTIVO su cpu %d "
+					    "(Fable 050 §2)\n", chi, vmcs, k);
+			}
+}
 VPID_CTR(vmcs02_host_state_rewrites,
     "campi host per-CPU riscritti da vmx_set_pcpu_defaults nel VMCS02");
 VPID_CTR(vpid_flush_deferred, "richieste d'invalidazione differite del VPID01");
@@ -1555,8 +1622,10 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		invvpid_desc.linear_addr = 0;
 		invvpid(INVVPID_TYPE_SINGLE_CONTEXT, invvpid_desc);
 		vmm_stat_incr(vcpu->vcpu, VCPU_INVVPID_DONE, 1);
-		if (vcpu->nested != NULL)	/* Fable 038 §3.1 */
+		if (vcpu->nested != NULL) {	/* Fable 038 §3.1 */
 			vmx_nested_vpid01_flushed(vcpu);
+			vmx_nested_note_l0(vcpu, VMX_OPR_L0_INVVPID, curcpu, 0);
+		}
 	} else {
 		/*
 		 * The invvpid can be skipped if an invept is going to
@@ -1566,6 +1635,9 @@ vmx_invvpid(struct vmx *vmx, struct vmx_vcpu *vcpu, pmap_t pmap, int running)
 		 */
 		vmm_stat_incr(vcpu->vcpu, VCPU_INVVPID_SAVED, 1);
 		atomic_add_long(&vpid_invvpid_saved_eptgen, 1);
+		/* Fable 050 §5.5: se si esce prima di vmx_pmap_activate, l'INVEPT puo' farlo un altro vCPU su questa CPU */
+		if (vcpu->nested != NULL)
+			vmx_nested_vpid01_saltato(vcpu, vmx->invept01_n[curcpu]);
 	}
 }
 
@@ -3770,6 +3842,7 @@ vmx_pmap_activate(struct vmx *vmx, pmap_t pmap)
 		vmx->eptgen[cpu] = eptgen;
 		invept(INVEPT_TYPE_SINGLE_CONTEXT,
 		    (struct invept_desc){ .eptp = vmx->eptp, ._res = 0 });
+		vmx->invept01_n[cpu]++;		/* Fable 050 §5.5 */
 		return (true);
 	}
 	return (false);
@@ -4132,8 +4205,10 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		 * Mark the EPT as active on this host CPU and invalidate
 		 * EPTP-tagged TLB entries if required.
 		 */
-		if (vmx_pmap_activate(vmx, pmap) && vcpu->nested != NULL)
+		if (vmx_pmap_activate(vmx, pmap) && vcpu->nested != NULL) {
 			vmx_nested_vpid01_flushed(vcpu);	/* Fable 038 §3.1 */
+			vmx_nested_note_l0(vcpu, VMX_OPR_L0_INVEPT, curcpu, vmx->invept01_n[curcpu]);
+		}
 
 		vmx_run_trace(vcpu);
 		{
@@ -4449,6 +4524,7 @@ vmx_vcpu_cleanup(void *vcpui)
 	 * ... malloc-4096", spegnimento durante kvm-unit-tests F2a) e perdeva
 	 * il VMCS01.
 	 */
+	vmcs_controlla_libero(vcpu->vmcs01, "VMCS01");	/* Fable 050 §2 */
 	free(vcpu->vmcs01, M_VMX);
 	vmx_nested_free(vcpu);
 	free(vcpu, M_VMX);

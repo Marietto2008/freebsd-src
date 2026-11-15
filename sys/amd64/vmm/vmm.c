@@ -284,18 +284,22 @@ static void
 vcpu_reset_inplace(struct vcpu *vcpu, struct vm_reset_inplace *r)
 {
 	int cap[VM_CAP_MAX], valida[VM_CAP_MAX], nuovo, t;
+	enum x2apic_state x2;
 	uint64_t livello;
 
 	if (vm_get_register(vcpu, VM_REG_GUEST_NESTED_LEVEL, &livello) == 0 && livello == 2)
 		r->vcpus_l2++;
 	for (t = 0; t < VM_CAP_MAX; t++)
 		valida[t] = vmmops_getcap(vcpu->cookie, t, &cap[t]) == 0;
+	/* Fable 050 §1a: lo stato x2APIC lo sceglie chi crea il vCPU, come le capacita': si rilegge e si riapplica */
+	if (vm_get_x2apic_state(vcpu, &x2) != 0)
+		x2 = X2APIC_DISABLED;
 
 	vmmops_vlapic_cleanup(vcpu->vlapic);
 	vmmops_vcpu_cleanup(vcpu->cookie);
 	vcpu->cookie = vmmops_vcpu_init(vcpu->vm->cookie, vcpu, vcpu->vcpuid);
 	vcpu->vlapic = vmmops_vlapic_init(vcpu->cookie);
-	vm_set_x2apic_state(vcpu, X2APIC_DISABLED);
+	vm_set_x2apic_state(vcpu, x2);
 	vcpu->reqidle = 0;
 	vcpu->exitintinfo = 0;
 	vcpu->nmi_pending = 0;
@@ -305,6 +309,9 @@ vcpu_reset_inplace(struct vcpu *vcpu, struct vm_reset_inplace *r)
 	fpu_save_area_reset(vcpu->guestfpu);
 	memset(&vcpu->fatal, 0, sizeof(vcpu->fatal));
 	vcpu->gla2gpa_conteso = false;
+	/* Fable 050 §3: TSC dell'host, offset zero (il VMCS nuovo ha TSC_OFFSET 0 e offsetting spento), come al primo
+	 * avvio; si azzera anche la copia di vmm */
+	vcpu->tsc_offset = 0;
 
 	for (t = 0; t < VM_CAP_MAX; t++) {
 		if (!valida[t] || vmmops_getcap(vcpu->cookie, t, &nuovo) != 0 || nuovo == cap[t])
@@ -323,6 +330,15 @@ vm_reset_inplace(struct vm *vm, struct vm_reset_inplace *r)
 	int i;
 
 	memset(r, 0, sizeof(*r));
+	/*
+	 * Fable 050 §1b: le iniezioni a livello di VM (VM_LAPIC_MSI, VM_IOAPIC_*, VM_ISA_*) non prendono il blocco dei
+	 * vCPU e arrivano al vlapic, che qui si libera e si ricrea. Da QEMU le serializza il BQL (il reset gira col BQL e
+	 * i vCPU fermi; vatpit, vhpet, vrtc e vpmtmr in modo QEMU sono spenti). Ma i dispositivi in passthrough iniettano
+	 * i loro MSI dal gestore d'interrupt dell'host, fuori da ogni blocco: con ppt assegnati il reset sul posto non si
+	 * fa (EBUSY; QEMU lo stampa e prosegue col comportamento di prima).
+	 */
+	if (ppt_assigned_devices(vm) > 0)
+		return (EBUSY);
 	for (i = 0; i < vm_get_maxcpus(vm); i++) {
 		vcpu = vm->vcpu[i];
 		if (vcpu == NULL)
