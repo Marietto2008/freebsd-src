@@ -291,6 +291,12 @@ VPID_CTR(vpid_invvpid_saved_eptgen,
  */
 #define	VMCS_ATTIVI_SLOT	8
 static struct vmcs *vmcs_attivi[MAXCPU][VMCS_ATTIVI_SLOT];
+/*
+ * Fable 052 §1.4: per lo SHADOW VMCS questo contatore non dimostra nulla. Collegato dal link pointer il processore lo
+ * usa senza VMPTRLD (la tabella non lo vede) e con nested_shadow_vmcs=0 non e' in uso. KVM esegue un VMCLEAR anche sullo
+ * shadow quando scarica il VMCS principale (__loaded_vmcs_clear, v6.8): controllare che il nostro faccia lo stesso
+ * PRIMA di riaccendere lo shadow.
+ */
 VPID_CTR(vmcs_liberato_attivo, "VMCS liberati mentre erano ancora attivi su una CPU (Fable 050 §2)");
 VPID_CTR(vmcs_clear_altra_cpu, "VMCLEAR eseguiti su una CPU diversa da quella dove il VMCS era attivo");
 VPID_CTR(vmcs_attivi_pieno, "VMPTRLD non registrati: riga della CPU piena");
@@ -2457,10 +2463,58 @@ vmx_set_guest_reg(struct vmx_vcpu *vcpu, int ident, uint64_t regval)
 	}
 }
 
+/*
+ * claude 15/11/2026 (diagnosi Fable 054 §3, prova A): una MOV CR0/CR4 che L0 emula al posto del guest non esegue
+ * nessuna MOV sull'hardware, quindi non fa l'invalidazione che l'istruzione avrebbe fatto (SDM vol. 3A, 4.10.4.1). La
+ * prova A: il trampolino d'avvio degli AP di Windows accende PG con SMEP gia' acceso; la MOV CR0 esce (NE/CD/NW diversi
+ * dall'ombra di reset 0x60000010 scritta da QEMU) e il primo prelievo usava una voce messa in cache a paginazione
+ * spenta (di tipo utente): #PF 0x11, tabelle mai percorse (bit A a zero), triple fault. Con INVVPID: 4 avvii su 4.
+ * Regola: si rifa' un INVVPID single-context (toglie anche le voci globali e le cache delle tabelle della VPID):
+ *   CR0: quando cambia PG, in tutti e due i versi (il caso 0->1 non e' nell'SDM ma serve con l'EPT, vedi sopra);
+ *   CR4: quando cambia PGE, PAE o PCIDE, o SMEP passa da 0 a 1 (insieme un po' piu' largo dell'SDM: nessun danno).
+ * Vale per l'L1 (VPID01). In L2 il VMCS02 ha il VPID02 e l'EPT02 si invalida a ogni ingresso. Le stesse scritture
+ * fatte da QEMU (vmx_setreg) fanno l'invalidazione differita, come CR3. Contatori: cr0_pg_emulato, cr4_inval_emulato,
+ * cr_inval_setreg.
+ */
+#define	CR4_BIT_INVALIDA	(CR4_PGE | CR4_PAE | CR4_PCIDE)
+static u_long cr0_pg_emulato, cr4_inval_emulato, cr_inval_setreg;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, cr0_pg_emulato, CTLFLAG_RD, &cr0_pg_emulato, 0,
+    "MOV CR0 emulate da L0 che cambiano CR0.PG, con INVVPID (Fable 054)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, cr4_inval_emulato, CTLFLAG_RD, &cr4_inval_emulato, 0,
+    "MOV CR4 emulate da L0 che cambiano PGE/PAE/PCIDE o accendono SMEP, con INVVPID (Fable 054)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, cr_inval_setreg, CTLFLAG_RD, &cr_inval_setreg, 0,
+    "scritture di CR0/CR4 da userspace con invalidazione differita (Fable 054)");
+
+static bool
+vmx_cr4_invalida(uint64_t vecchio, uint64_t nuovo)
+{
+	return (((vecchio ^ nuovo) & CR4_BIT_INVALIDA) != 0 ||
+	    ((nuovo & ~vecchio) & CR4_SMEP) != 0);
+}
+
+/* INVVPID single-context della VPID corrente dell'L1, nella sezione critica di vmx_run */
+static void
+vmx_cr_invvpid(struct vmx_vcpu *vcpu)
+{
+	struct invvpid_desc d;
+
+	if (vcpu->nested != NULL && vcpu->nested->in_l2)
+		return;
+	if (vcpu->state.vpid == 0)
+		return;		/* senza VPID ogni ingresso e uscita invalidano gia' */
+	d._res1 = 0;
+	d._res2 = 0;
+	d.vpid = vcpu->state.vpid;
+	d.linear_addr = 0;
+	invvpid(INVVPID_TYPE_SINGLE_CONTEXT, d);
+	if (vcpu->nested != NULL)
+		vmx_nested_vpid01_flushed(vcpu);
+}
+
 static int
 vmx_emulate_cr0_access(struct vmx_vcpu *vcpu, uint64_t exitqual)
 {
-	uint64_t crval, efer, entry_ctls, regval;
+	uint64_t crval, efer, entry_ctls, regval, vecchio;
 
 	/* We only handle mov to %cr0 at this time */
 	if ((exitqual & 0xf0) != 0x00)
@@ -2472,7 +2526,14 @@ vmx_emulate_cr0_access(struct vmx_vcpu *vcpu, uint64_t exitqual)
 
 	crval = regval | cr0_ones_mask;
 	crval &= ~cr0_zeros_mask;
+	vecchio = vmcs_read(VMCS_GUEST_CR0);
 	vmcs_write(VMCS_GUEST_CR0, crval);
+
+	/* Fable 054 §3: l'invalidazione che la MOV CR0 avrebbe fatto */
+	if (((vecchio ^ crval) & CR0_PG) != 0) {
+		atomic_add_long(&cr0_pg_emulato, 1);
+		vmx_cr_invvpid(vcpu);
+	}
 
 	/*
 	 * Keep EFER.LMA and the IA-32e guest VM-entry control in sync
@@ -2496,7 +2557,7 @@ vmx_emulate_cr0_access(struct vmx_vcpu *vcpu, uint64_t exitqual)
 static int
 vmx_emulate_cr4_access(struct vmx_vcpu *vcpu, uint64_t exitqual)
 {
-	uint64_t crval, regval;
+	uint64_t crval, regval, vecchio;
 
 	/* We only handle mov to %cr4 at this time */
 	if ((exitqual & 0xf0) != 0x00)
@@ -2519,7 +2580,14 @@ vmx_emulate_cr4_access(struct vmx_vcpu *vcpu, uint64_t exitqual)
 
 	crval = regval | cr4_ones_mask;
 	crval &= ~cr4_zeros_mask;
+	vecchio = vmcs_read(VMCS_GUEST_CR4);
 	vmcs_write(VMCS_GUEST_CR4, crval);
+
+	/* Fable 054 §3: l'invalidazione che la MOV CR4 avrebbe fatto */
+	if (vmx_cr4_invalida(vecchio, crval)) {
+		atomic_add_long(&cr4_inval_emulato, 1);
+		vmx_cr_invvpid(vcpu);
+	}
 
 	return (HANDLED);
 }
@@ -4718,7 +4786,7 @@ static int
 vmx_setreg(void *vcpui, int reg, uint64_t val)
 {
 	int error, hostcpu, running, shadow;
-	uint64_t ctls;
+	uint64_t ctls, vecchio_cr;
 	pmap_t pmap;
 	struct vmx_vcpu *vcpu = vcpui;
 	struct vmx *vmx = vcpu->vmx;
@@ -4745,6 +4813,11 @@ vmx_setreg(void *vcpui, int reg, uint64_t val)
 	/* Do not permit user write access to VMCS fields by offset. */
 	if (reg < 0)
 		return (EINVAL);
+
+	/* Fable 054 §3: valore di prima di CR0/CR4, per l'invalidazione differita */
+	vecchio_cr = 0;
+	if (reg == VM_REG_GUEST_CR0 || reg == VM_REG_GUEST_CR4)
+		(void)vmcs_getreg(vcpu->vmcs, running, reg, &vecchio_cr);
 
 	error = vmcs_setreg(vcpu->vmcs, running, reg, val);
 
@@ -4783,6 +4856,14 @@ vmx_setreg(void *vcpui, int reg, uint64_t val)
 			 * XXX the processor retains global mappings when %cr3
 			 * is updated but vmx_invvpid() does not.
 			 */
+			pmap = vcpu->ctx.pmap;
+			vmx_invvpid(vmx, vcpu, pmap, running);
+		}
+
+		/* Fable 054 §3: CR0.PG o i bit di CR4 cambiati da userspace (es. INIT/SIPI/reset di QEMU) */
+		if ((reg == VM_REG_GUEST_CR0 && ((vecchio_cr ^ val) & CR0_PG) != 0) ||
+		    (reg == VM_REG_GUEST_CR4 && vmx_cr4_invalida(vecchio_cr, val))) {
+			atomic_add_long(&cr_inval_setreg, 1);
 			pmap = vcpu->ctx.pmap;
 			vmx_invvpid(vmx, vcpu, pmap, running);
 		}
