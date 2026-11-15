@@ -2457,10 +2457,25 @@ vmx_set_guest_reg(struct vmx_vcpu *vcpu, int ident, uint64_t regval)
 	}
 }
 
+/*
+ * claude 15/11/2026 (diagnosi Fable 054, prova A): la MOV CR0 che L0 emula al posto del guest non esegue nessuna MOV
+ * CR0 sull'hardware, quindi non invalida nulla. Quando accende PG, le traduzioni messe in cache a paginazione spenta
+ * (di tipo utente) restano: col trampolino d'avvio degli AP di Windows (SMEP gia' acceso) il primo prelievo da' #PF
+ * 0x11 e il triple fault. Contatore delle MOV CR0 emulate che cambiano PG e interruttore sperimentale: 0 niente (come
+ * prima), 1 INVVPID del VPID01, 2 INVEPT dell'EPT01. Si cambia a caldo.
+ */
+static u_long cr0_pg_emulato;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, cr0_pg_emulato, CTLFLAG_RD, &cr0_pg_emulato, 0,
+    "MOV CR0 emulate da L0 che cambiano CR0.PG (Fable 054)");
+static int cr0_pg_inval = 0;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, cr0_pg_inval, CTLFLAG_RWTUN, &cr0_pg_inval, 0,
+    "prova Fable 054: invalidazione alla MOV CR0 emulata che cambia PG: 0 niente, 1 INVVPID VPID01, 2 INVEPT EPT01");
+
 static int
 vmx_emulate_cr0_access(struct vmx_vcpu *vcpu, uint64_t exitqual)
 {
-	uint64_t crval, efer, entry_ctls, regval;
+	uint64_t crval, efer, entry_ctls, regval, vecchio;
+	struct invvpid_desc dv;
 
 	/* We only handle mov to %cr0 at this time */
 	if ((exitqual & 0xf0) != 0x00)
@@ -2472,7 +2487,29 @@ vmx_emulate_cr0_access(struct vmx_vcpu *vcpu, uint64_t exitqual)
 
 	crval = regval | cr0_ones_mask;
 	crval &= ~cr0_zeros_mask;
+	vecchio = vmcs_read(VMCS_GUEST_CR0);
 	vmcs_write(VMCS_GUEST_CR0, crval);
+
+	/* Fable 054 §2: PG cambiato da un'emulazione (sezione critica di vmx_run: curcpu stabile) */
+	if (((vecchio ^ crval) & CR0_PG) != 0) {
+		atomic_add_long(&cr0_pg_emulato, 1);
+		if (vcpu->nested == NULL || !vcpu->nested->in_l2) {
+			if (cr0_pg_inval == 1 && vcpu->state.vpid != 0) {
+				dv._res1 = 0;
+				dv._res2 = 0;
+				dv.vpid = vcpu->state.vpid;
+				dv.linear_addr = 0;
+				invvpid(INVVPID_TYPE_SINGLE_CONTEXT, dv);
+				if (vcpu->nested != NULL)
+					vmx_nested_vpid01_flushed(vcpu);
+			} else if (cr0_pg_inval == 2) {
+				invept(INVEPT_TYPE_SINGLE_CONTEXT,
+				    (struct invept_desc){ .eptp = vcpu->vmx->eptp, ._res = 0 });
+				if (vcpu->nested != NULL)
+					vmx_nested_vpid01_flushed(vcpu);
+			}
+		}
+	}
 
 	/*
 	 * Keep EFER.LMA and the IA-32e guest VM-entry control in sync
