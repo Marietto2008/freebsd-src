@@ -69,6 +69,16 @@ vmxon(char *region)
 	return (error);
 }
 
+/*
+ * claude 15/11/2026 (Fable 050 §2): quale VMCS e' ATTIVO su quale CPU (da VMPTRLD a VMCLEAR, SDM 25.11). Liberare la
+ * pagina di un VMCS ancora attivo permette al processore di riscriverci quando e' gia' di altri. vmx.c tiene una
+ * tabella per CPU e i contatori vmcs_liberato_attivo / vmcs_clear_altra_cpu / vmcs_attivi_pieno: devono restare a zero.
+ */
+struct vmcs;
+void	vmcs_attivo_carica(struct vmcs *vmcs);
+void	vmcs_attivo_pulisci(struct vmcs *vmcs);
+void	vmcs_controlla_libero(struct vmcs *vmcs, const char *chi);
+
 /* returns 0 on success and non-zero on failure */
 static __inline int
 vmclear(struct vmcs *vmcs)
@@ -77,11 +87,15 @@ vmclear(struct vmcs *vmcs)
 	uint64_t addr;
 
 	addr = vtophys(vmcs);
+	critical_enter();	/* istruzione e tabella sulla stessa CPU */
 	__asm __volatile("vmclear %[addr];"
 			 VMX_SET_ERROR_CODE
 			 : [error] "=r" (error)
 			 : [addr] "m" (*(uint64_t *)&addr)
 			 : "memory");
+	if (error == 0)
+		vmcs_attivo_pulisci(vmcs);
+	critical_exit();
 	return (error);
 }
 
@@ -106,11 +120,15 @@ vmptrld(struct vmcs *vmcs)
 	uint64_t addr;
 
 	addr = vtophys(vmcs);
+	critical_enter();
 	__asm __volatile("vmptrld %[addr];"
 			 VMX_SET_ERROR_CODE
 			 : [error] "=r" (error)
 			 : [addr] "m" (*(uint64_t *)&addr)
 			 : "memory");
+	if (error == 0)
+		vmcs_attivo_carica(vmcs);
+	critical_exit();
 	return (error);
 }
 

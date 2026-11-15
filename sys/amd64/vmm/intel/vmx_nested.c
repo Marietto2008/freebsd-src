@@ -1430,8 +1430,10 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 
 	for (i = 0; i < VMX_NESTED_MAX_VMCS12; i++) {
 		nested_bitmaps_unmap(&n->cache[i]);
-		if (n->cache[i].vmcs02 != NULL)
+		if (n->cache[i].vmcs02 != NULL) {
+			vmcs_controlla_libero(n->cache[i].vmcs02, "VMCS02");	/* Fable 050 §2 */
 			free(n->cache[i].vmcs02, M_VMX_NESTED);
+		}
 	}
 	vmx_vept_flush(n);
 	if (n->vpid02_flush_pending)
@@ -1440,9 +1442,11 @@ vmx_nested_free(struct vmx_vcpu *vcpu)
 		vpid_free(n->vpid2);
 	if (n->msr_bitmap != NULL)
 		free(n->msr_bitmap, M_VMX_NESTED);
-	/* lo shadow non e' attivo da nessuna parte: vmx_run lo chiude sempre */
-	if (n->sh_vmcs != NULL)
+	/* lo shadow non e' attivo da nessuna parte: vmx_run lo chiude sempre (Fable 050 §2: ora si controlla) */
+	if (n->sh_vmcs != NULL) {
+		vmcs_controlla_libero(n->sh_vmcs, "VMCS shadow");
 		free(n->sh_vmcs, M_VMX_NESTED);
+	}
 	if (n->diag_simp_ck != NULL)
 		vm_gpa_release(n->diag_simp_ck);
 	nested_apic_pages_release(n);
