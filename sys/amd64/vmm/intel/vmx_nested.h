@@ -616,6 +616,17 @@ struct vmx_nested {
 		bool		nokeep;		/* foglia non wired o MMIO */
 		bool		force_full;	/* il prossimo INVEPT svuota tutto */
 		bool		wipe_now;	/* walk: svuotare prima di rientrare */
+		/*
+		 * claude 16/11, diagnosi 059 (hw.vmm.vmx.vept_keep_rientro): dopo
+		 * un INVEPT l'L1 puo' cambiare l'EPT12 senza un altro INVEPT su
+		 * questo LP finche' l'LP non rientra nella partizione (SDM: un
+		 * LP mette in cache traduzioni di X solo mentre esegue X). La
+		 * radice conservata va quindi rivalidata al primo ingresso.
+		 */
+		bool		da_validare;	/* INVEPT visto, rientro non validato */
+		sbintime_t	t_invept;	/* istante dell'ultimo INVEPT su questo slot */
+		uint64_t	altro_eptp12;	/* ultimo altro EPTP12 eseguito nel frattempo */
+		uint32_t	altri_n;	/* ingressi in altri slot dal suo INVEPT */
 		/* verifica HPA (parere #31): reservoir di L2-GPA di foglie
 		 * installate dall'ultimo svuotamento, niente puntatori */
 #define	VEPT_VS_N	128

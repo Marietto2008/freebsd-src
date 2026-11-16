@@ -114,6 +114,21 @@ static int vept_keep = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_keep, CTLFLAG_RWTUN, &vept_keep, 0,
     "nested: B1, conserva la shadow EPT all'INVEPT (letto alla creazione "
     "del vCPU nested)");
+/*
+ * claude 16/11, diagnosi 059: B1 conserva all'INVEPT le foglie valide IN QUEL MOMENTO e le riusa al rientro senza
+ * ricontrollarle. Ma dopo un INVEPT su un LP l'L1 puo' cambiare l'EPT12 senza un altro INVEPT su quel LP finche' l'LP
+ * non rientra nella partizione (SDM: un LP mette in cache traduzioni di un EPTP solo mentre lo esegue). Un cambio fatto
+ * mentre il vCPU era altrove resta invisibile: foglia vecchia, scritture di L2 sul frame vecchio.
+ *   0: come prima (validazione solo all'INVEPT).
+ *   1: misura (e gia' protegge): come prima + seconda validazione al primo ingresso con la radice conservata; ogni voce
+ *      cambiata li' e' un cambio DOPO l'INVEPT mai invalidato su questo vCPU, classificato dannoso/innocuo.
+ *   2: correzione: all'INVEPT si marca soltanto lo slot, la validazione si fa al primo ingresso (come KVM, che libera le
+ *      radici in handle_invept e le risincronizza in kvm_mmu_load/kvm_mmu_sync_roots).
+ * Letto a ogni INVEPT; uno slot gia' marcato si valida al rientro qualunque sia il valore in quel momento.
+ */
+static int vept_keep_rientro = 2;	/* 6 giri amplificati su 6 puliti col 2; 1 resta per la misura; 0 solo prove */
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_keep_rientro, CTLFLAG_RWTUN, &vept_keep_rientro, 0,
+    "nested, B1: validazione della radice conservata al rientro in L2 (2 di base, 1 misura e protegge, 0 SOLO PROVE: buco aperto)");
 static int vept_verify_hpa = 0;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_verify_hpa, CTLFLAG_RWTUN,
     &vept_verify_hpa, 0,
@@ -168,6 +183,35 @@ VEPT_CTR(vept_memgen_roots_invalidated,
 VEPT_CTR(vept_stale_root_enters,
     "B1: ingressi in L2 con una radice di generazione vecchia (deve essere 0)");
 VEPT_CTR(vept_shadow_pages, "nested: pagine di tabelle shadow EPT allocate");
+/* claude 16/11, diagnosi 059 (vept_keep_rientro) */
+VEPT_CTR(vept_rientro_marcati, "rientro: slot marcati da validare all'INVEPT");
+VEPT_CTR(vept_rientro_validazioni, "rientro: validazioni al primo ingresso dopo un INVEPT");
+VEPT_CTR(vept_rientro_fallback, "rientro: validazioni finite in svuotamento completo");
+VEPT_CTR(vept_rientro_voci_dannose, "rientro: voci EPT12 cambiate dopo l'INVEPT, dannose (assente, indirizzo, permesso perso, memtype/IPAT/PS)");
+VEPT_CTR(vept_rientro_voci_innocue, "rientro: voci EPT12 cambiate dopo l'INVEPT, innocue (prima assente, permesso aggiunto, bit ignorati)");
+VEPT_CTR(vept_rientro_foglie_dannose, "rientro: foglie shadow vive sotto le voci dannose (sarebbero state usate vecchie)");
+VEPT_CTR(vept_rientro_non_validato, "rientro: ingressi in L2 con lo slot ancora da validare (deve essere 0)");
+static u_int vept_rientro_stampe;
+
+/*
+ * Diagnosi 059 par. 4.4: un cambio di voce EPT12 e' DANNOSO se una traduzione vecchia ancora in uso sarebbe sbagliata:
+ * il vecchio era presente e il nuovo no, l'indirizzo cambia, si perde un permesso R/W/X (W tolto = tracciamento delle
+ * pagine sporche), cambiano memtype (bit 5:3), IPAT (6) o PS (7). Innocuo: vecchio assente, solo permessi aggiunti,
+ * solo bit ignorati (8-11, 52-63: bit software di Hyper-V, per esempio 0x371 nei bit alti).
+ */
+static bool
+vept_voce_dannosa(uint64_t vecchio, uint64_t nuovo)
+{
+	if ((vecchio & EPT_RWX) == 0)
+		return (false);
+	if ((nuovo & EPT_RWX) == 0)
+		return (true);
+	if (EPT_ADDR(vecchio) != EPT_ADDR(nuovo))
+		return (true);
+	if (((vecchio & ~nuovo) & EPT_RWX) != 0)
+		return (true);
+	return (((vecchio ^ nuovo) & 0xf8) != 0);
+}
 /*
  * Parere #29 di Astra, §3: foglie shadow perse, per motivo. Ogni foglia tolta
  * finisce in UNA sola voce. partial = intervalli cambiati di un INVEPT che
@@ -1283,11 +1327,16 @@ vept_test_race_inject(struct vmx_vcpu *vcpu, struct vept_obs_ent *e, int j)
  *     vept_scan_retries volte, poi si svuota tutto;
  *  3. intervalli ordinati e uniti, foglie shadow azzerate, INVEPT hw dovuto;
  *  4. solo allora, nelle fotografie, le sole voci cambiate.
- * Una scrittura dopo la seconda passata la vedra' il prossimo INVEPT, che
- * l'L1 deve comunque fare per renderla visibile.
+ * NON vale piu' (diagnosi 059 par. 1.1, corretto 16/11): «una scrittura dopo la seconda passata la vedra' il prossimo
+ * INVEPT, che l'L1 deve comunque fare». Dopo un INVEPT su un LP quel LP non ha traduzioni per quell'EPTP, e l'L1 puo'
+ * cambiare l'EPT12 quante volte vuole senza un altro INVEPT su quel LP finche' l'LP non rientra nella partizione: un
+ * hypervisor che manda la shootdown solo agli LP che stanno eseguendo la partizione e' corretto per costruzione. Per
+ * questo la radice conservata si rivalida al primo ingresso (hw.vmm.vmx.vept_keep_rientro, vmx_vept_prepare): con 1 qui
+ * e al rientro, con 2 solo al rientro. Misurato il 16/11: ~8.100 foglie al minuto che il valore 0 avrebbe riusato vecchie.
  */
+/* rientro (diagnosi 059): 0 all'INVEPT; 1 al primo ingresso dopo un INVEPT (classifica le voci cambiate). */
 static bool
-vept_keep_invept(struct vmx_vcpu *vcpu, int i)
+vept_keep_invept(struct vmx_vcpu *vcpu, int i, int rientro)
 {
 	struct vmx_nested *n = vcpu->nested;
 	struct vept_slot *s = &n->vept_slot[i];
@@ -1471,6 +1520,36 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i)
 	    attempt == 1 ? &vept_scan_retry_1_success :
 	    &vept_scan_retry_2_success, 1);
 
+	/*
+	 * Diagnosi 059 par. 4.4: al rientro ogni voce cambiata e' un cambio fatto DOPO l'ultimo INVEPT su questo vCPU e
+	 * mai invalidato qui. Vecchio = fotografia (non ancora aggiornata, passo 4), nuovo = valore letto. Per le voci
+	 * dannose si contano le foglie shadow vive nel loro intervallo PRIMA di toglierle (passo 3): sono le foglie che il
+	 * VP avrebbe usato vecchie. Le prime otto si stampano.
+	 */
+	if (rientro) {
+		uint64_t vec, nuo, fd;
+
+		for (c = 0; c < nc; c++) {
+			e = &o->ent[o->chg[c].ent];
+			vec = e->snap[o->chg[c].j];
+			nuo = o->chg[c].val;
+			if (!vept_voce_dannosa(vec, nuo)) {
+				atomic_add_long(&vept_rientro_voci_innocue, 1);
+				continue;
+			}
+			atomic_add_long(&vept_rientro_voci_dannose, 1);
+			fd = vept_count_range(s->root, 3, 0, o->rng[c].start, o->rng[c].end);
+			atomic_add_long(&vept_rientro_foglie_dannose, fd);
+			if (atomic_fetchadd_int(&vept_rientro_stampe, 1) < 8)
+				printf("vept rientro: vcpu%d eptp12=%#lx tabella=%#lx liv=%d idx=%u vecchio=%#lx nuovo=%#lx "
+				    "l2gpa=[%#lx,%#lx) foglie_vive=%lu ms_da_invept=%ld ingressi_altrove=%u altro_eptp12=%#lx\n",
+				    vcpu->vcpuid, (u_long)s->eptp12, (u_long)e->gpa, e->level, o->chg[c].j, (u_long)vec,
+				    (u_long)nuo, (u_long)o->rng[c].start, (u_long)o->rng[c].end, (u_long)fd,
+				    (long)(sbttons(sbinuptime() - k->t_invept) / 1000000), k->altri_n,
+				    (u_long)k->altro_eptp12);
+		}
+	}
+
 	/* 3. intervalli uniti, foglie azzerate */
 	nr = nc;
 	if (nr > 1) {
@@ -1587,9 +1666,10 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 			if (pick == NULL || s->used < pick->used)
 				pick = s;
 		}
-		if (pick->root == NULL)
+		if (pick->root == NULL) {
 			pick->root = vept_page_alloc();
-		else {
+			n->vept_ks[pick - n->vept_slot].da_validare = false;	/* diagnosi 059 */
+		} else {
 			atomic_add_long(&vept_leaves_zapped_lru,
 			    n->vept_ks[pick - n->vept_slot].leaves);
 			vept_root_wipe(n, pick - n->vept_slot);
@@ -1608,6 +1688,28 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 	 * A/D diversa usa uno slot diverso.
 	 */
 	n->vept_ad = vcpu->vmx->nested_ad && (eptp12 & EPT_PG_AD_ENABLE) != 0;
+	/*
+	 * Diagnosi 059: primo ingresso in L2 con una radice che un INVEPT ha conservato -> validazione (le due passate di
+	 * vept_keep_invept con rientro=1: ogni voce cambiata e' un cambio avvenuto dopo l'INVEPT). Si e' nello slow path,
+	 * prima del VMPTRLD: si puo' dormire. Gli altri slot ancora da validare contano questo ingresso altrove.
+	 */
+	if (n->vept_keep) {
+		int pi = (int)(pick - n->vept_slot), j;
+		struct vept_kslot *pk = &n->vept_ks[pi];
+
+		for (j = 0; j < VEPT_NROOTS; j++) {
+			if (j != pi && n->vept_ks[j].da_validare) {
+				n->vept_ks[j].altri_n++;
+				n->vept_ks[j].altro_eptp12 = eptp12;
+			}
+		}
+		if (pk->da_validare) {
+			pk->da_validare = false;
+			atomic_add_long(&vept_rientro_validazioni, 1);
+			if (!vept_keep_invept(vcpu, pi, 1))
+				atomic_add_long(&vept_rientro_fallback, 1);
+		}
+	}
 }
 
 /* Shadow EPTP (radice) da scrivere nel VMCS02: WB, 4 livelli. Non dorme:
@@ -1658,6 +1760,7 @@ vept_root_wipe(struct vmx_nested *n, int i)
 	n->vept_ks[i].nokeep = false;
 	n->vept_ks[i].force_full = false;
 	n->vept_ks[i].wipe_now = false;
+	n->vept_ks[i].da_validare = false;	/* diagnosi 059: radice vuota, niente da validare */
 	n->vept_ks[i].vs_n = 0;		/* reservoir della verifica */
 	n->vept_ks[i].vs_start = 0;
 }
@@ -1702,12 +1805,35 @@ vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp, int *kept)
 			vept_obs_scan(vcpu, n->vept_obs[i], s->eptp12,
 			    s->root);
 		if (n->vept_keep) {	/* B1: conservata o svuotata */
-			if (!vept_keep_invept(vcpu, i)) {
+			/*
+			 * Diagnosi 059: con vept_keep_rientro=2 all'INVEPT si marca soltanto lo slot; la validazione la fa
+			 * vmx_vept_prepare al primo ingresso. Con 1 si valida qui come prima e si marca per la seconda
+			 * validazione (misura). Lo slot marcato resta valido per l'hardware: vmx_run fa comunque INVEPT
+			 * della radice shadow a ogni ingresso in L2.
+			 */
+			if (vept_keep_rientro == 2) {
+				n->vept_ks[i].da_validare = true;
+				n->vept_ks[i].t_invept = sbinuptime();
+				n->vept_ks[i].altri_n = 0;
+				n->vept_ks[i].altro_eptp12 = 0;
+				atomic_add_long(&vept_rientro_marcati, 1);
+				(*kept)++;
+				atomic_add_long(&vept_invept_roots_kept, 1);
+				continue;
+			}
+			if (!vept_keep_invept(vcpu, i, 0)) {
 				wiped++;
 				atomic_add_long(&vept_invept_roots_fallback, 1);
 			} else {
 				(*kept)++;
 				atomic_add_long(&vept_invept_roots_kept, 1);
+				if (vept_keep_rientro == 1) {
+					n->vept_ks[i].da_validare = true;
+					n->vept_ks[i].t_invept = sbinuptime();
+					n->vept_ks[i].altri_n = 0;
+					n->vept_ks[i].altro_eptp12 = 0;
+					atomic_add_long(&vept_rientro_marcati, 1);
+				}
 			}
 			continue;
 		}
@@ -2675,6 +2801,12 @@ vmx_vept_hw_flushed(struct vmx_vcpu *vcpu)
 void
 vmx_vept_enter_check(struct vmx_vcpu *vcpu)
 {
+	int i;
+
 	if (vmx_vept_memgen_stale(vcpu))
 		atomic_add_long(&vept_stale_root_enters, 1);
+	/* diagnosi 059 par. 4.3: ingresso hardware con lo slot corrente ancora da validare */
+	i = vmx_vept_cur_slot(vcpu->nested);
+	if (i >= 0 && vcpu->nested->vept_ks[i].da_validare)
+		atomic_add_long(&vept_rientro_non_validato, 1);
 }
