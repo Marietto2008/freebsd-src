@@ -178,6 +178,16 @@ struct vmx {
 	 * (hw.vmm.vmx.nested_qual_kvm).
 	 */
 	bool		nested_qualkvm;
+	/*
+	 * claude 16/11, prova (b): sincronizzazione delle scritture IA32_TSC dell'ospite, come kvm_synchronize_tsc.
+	 * Offset comune della VM: una scrittura il cui offset (valore - rdtsc all'emulazione) dista meno di 1 s da
+	 * questo riceve QUESTO, cosi' la latenza d'uscita di ogni vCPU non diventa uno sfasamento permanente fra i
+	 * vCPU (misurato 15/11: un vCPU ~1.580 cicli indietro -> TSC non monotono nell'L2 -> salti di 2^32 x 100 ns
+	 * nel timecounter Hyper-V-TSC). vmx_tsc_sync() in vmx_msr.c.
+	 */
+	struct mtx	tsc_sync_mtx;		/* spin */
+	bool		tsc_sync_valid;
+	uint64_t	tsc_sync_off;
 };
 
 extern bool vmx_have_msr_tsc_aux;
@@ -207,6 +217,7 @@ u_long	vmx_fix_cr0(u_long cr0);
 u_long	vmx_fix_cr4(u_long cr4);
 
 int	vmx_set_tsc_offset(struct vmx_vcpu *vcpu, uint64_t offset);
+uint64_t vmx_tsc_sync(struct vmx_vcpu *vcpu, uint64_t offset);
 
 extern char	vmx_exit_guest[];
 extern char	vmx_exit_guest_flush_rsb[];
