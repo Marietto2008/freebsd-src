@@ -191,6 +191,43 @@ VEPT_CTR(vept_rientro_voci_dannose, "rientro: voci EPT12 cambiate dopo l'INVEPT,
 VEPT_CTR(vept_rientro_voci_innocue, "rientro: voci EPT12 cambiate dopo l'INVEPT, innocue (prima assente, permesso aggiunto, bit ignorati)");
 VEPT_CTR(vept_rientro_foglie_dannose, "rientro: foglie shadow vive sotto le voci dannose (sarebbero state usate vecchie)");
 VEPT_CTR(vept_rientro_non_validato, "rientro: ingressi in L2 con lo slot ancora da validare (deve essere 0)");
+/* claude 16/11, diagnosi 061 par. 3: accessi dell'L2 che con il valore 0 avrebbero usato una foglia vecchia */
+VEPT_CTR(vept_vecchia_inserite, "vecchia: pagine con foglia tolta al rientro (valore 1) sotto una voce dannosa");
+VEPT_CTR(vept_vecchia_trabocco, "vecchia: pagine non registrate (insieme pieno)");
+VEPT_CTR(vept_vecchia_letture, "vecchia: letture che col valore 0 avrebbero usato la foglia vecchia");
+VEPT_CTR(vept_vecchia_esecuzioni, "vecchia: esecuzioni che col valore 0 avrebbero usato la foglia vecchia");
+VEPT_CTR(vept_vecchia_scritture_indirizzo, "vecchia: scritture che col valore 0 sarebbero finite nel frame vecchio (indirizzo cambiato o voce tolta)");
+VEPT_CTR(vept_vecchia_scritture_w_tolto, "vecchia: scritture che col valore 0 Hyper-V non avrebbe visto (W tolto)");
+VEPT_CTR(vept_vecchia_scritture_altro, "vecchia: scritture su pagine con altro cambio (R/X tolti, memtype, PS)");
+VEPT_CTR(vept_vecchia_scadute, "vecchia: pagine mai toccate prima del prossimo INVEPT o svuotamento");
+VEPT_CTR(vept_vecchia_acc_lt1ms, "vecchia: accessi entro 1 ms dal rientro");
+VEPT_CTR(vept_vecchia_acc_1_10ms, "vecchia: accessi fra 1 e 10 ms dal rientro");
+VEPT_CTR(vept_vecchia_acc_10_100ms, "vecchia: accessi fra 10 e 100 ms dal rientro");
+VEPT_CTR(vept_vecchia_acc_100ms_1s, "vecchia: accessi fra 100 ms e 1 s dal rientro");
+VEPT_CTR(vept_vecchia_acc_gt1s, "vecchia: accessi oltre 1 s dal rientro");
+VEPT_CTR(vept_vecchia_fin_lt1ms, "vecchia: finestra rientro -> INVEPT successivo (col valore 0) sotto 1 ms");
+VEPT_CTR(vept_vecchia_fin_1_10ms, "vecchia: finestra rientro -> INVEPT fra 1 e 10 ms");
+VEPT_CTR(vept_vecchia_fin_10_100ms, "vecchia: finestra rientro -> INVEPT fra 10 e 100 ms");
+VEPT_CTR(vept_vecchia_fin_100ms_1s, "vecchia: finestra rientro -> INVEPT fra 100 ms e 1 s");
+VEPT_CTR(vept_vecchia_fin_gt1s, "vecchia: finestra rientro -> INVEPT oltre 1 s");
+/*
+ * Diagnosi 065 par. 2: un accesso a una pagina dell'insieme si classifica dopo il percorso nuovo, confrontando l'HPA
+ * della foglia vecchia con quello nuovo: a) frame diverso (o non piu' RAM): una scrittura col valore 0 sarebbe finita nel
+ * frame vecchio; b) pagina tolta: traduzione nuova assente; c) W tolto con lo stesso frame: scrittura nascosta a
+ * Hyper-V; d) innocua: stesso frame e permessi che coprono l'accesso. Divisi per livello della voce cambiata (PT / PD-PDPT).
+ */
+#define	VV_CTR4(pref, descr)							\
+	VEPT_CTR(pref##_pt, descr " (voce PT)");					\
+	VEPT_CTR(pref##_pd, descr " (voce PD o PDPT)")
+VV_CTR4(vept_vf_scr_frame, "vecchia: scritture, frame diverso");
+VV_CTR4(vept_vf_scr_tolta, "vecchia: scritture, pagina tolta");
+VV_CTR4(vept_vf_scr_wtolto, "vecchia: scritture, stesso frame ma W tolto");
+VV_CTR4(vept_vf_scr_innocua, "vecchia: scritture innocue (stesso frame, permessi ok)");
+VV_CTR4(vept_vf_let_frame, "vecchia: letture/esecuzioni, frame diverso");
+VV_CTR4(vept_vf_let_tolta, "vecchia: letture/esecuzioni, pagina tolta");
+VV_CTR4(vept_vf_let_wtolto, "vecchia: letture/esecuzioni, stesso frame ma W tolto");
+VV_CTR4(vept_vf_let_innocua, "vecchia: letture/esecuzioni innocue");
+static u_int vept_vf_stampe;
 static u_int vept_rientro_stampe;
 
 /*
@@ -459,7 +496,38 @@ struct vept_pk {
 	void		*cookie;
 };
 
+/*
+ * claude 16/11, diagnosi 061 par. 3: pagine (GPA di L2) le cui foglie shadow il valore 1 ha tolto al rientro perche'
+ * sotto una voce EPT12 cambiata dopo l'INVEPT (dannosa). Con il valore 0 quelle foglie vecchie sarebbero rimaste fino al
+ * prossimo INVEPT del vCPU su questa radice: ogni accesso dell'L2 a una di queste pagine prima di quell'INVEPT arriva ora
+ * in vmx_vept_fault e si conta come accesso che il valore 0 avrebbe fatto con una foglia vecchia.
+ */
+#define	VEPT_VV_HASH	16384		/* posti della tabella (potenza di 2); diagnosi 065: era 2048 */
+#define	VEPT_VV_MAX	8192		/* pagine vive al massimo; diagnosi 065: era 1024 (475.759 traboccate) */
+#define	VEPT_VV_TOMBA	1ULL		/* posto liberato (la GPA e' allineata: 1 non e' una pagina) */
+#define	VV_ASSENTE	1		/* voce non piu' presente */
+#define	VV_INDIRIZZO	2		/* indirizzo cambiato */
+#define	VV_W_TOLTO	3		/* W tolto (tracciamento delle pagine sporche) */
+#define	VV_ALTRO	4		/* R o X tolti, memtype, IPAT, PS */
+struct vept_vv_ent {
+	uint64_t	gpa;		/* 0 libero, VEPT_VV_TOMBA liberato */
+	sbintime_t	t_rientro;
+	sbintime_t	t_invept;	/* INVEPT precedente al rientro */
+	uint64_t	altro_eptp12;	/* ultimo altro EPTP12 eseguito fra INVEPT e rientro */
+	uint32_t	altri_n;	/* ingressi in altri slot fra INVEPT e rientro */
+	uint64_t	foglia;		/* diagnosi 065: foglia shadow EPT02 tolta (HPA e permessi) */
+	uint8_t		tipo;
+	uint8_t		letta;
+	uint8_t		livello;	/* diagnosi 065: livello della voce EPT12 cambiata (0 = PT) */
+};
+struct vept_vv {
+	struct vept_vv_ent ent[VEPT_VV_HASH];
+	int		n;		/* pagine vive */
+	sbintime_t	t_rientro;	/* ultimo riempimento */
+};
+
 struct vept_obs {
+	struct vept_vv	*vv;		/* diagnosi 061 par. 3, allocato al primo rientro col valore 1 */
 	/* diagnosi 063 par. 2.2: fotografie libere dello slot (il primo uint64_t di ogni pagina punta alla successiva) */
 	uint64_t	*libera;
 	int		nlibere;
@@ -565,6 +633,7 @@ vept_obs_free(struct vept_obs *o)
 	KASSERT(o->pk_live == 0, ("%s: %d riferimenti EPT12 ancora tenuti",
 	    __func__, o->pk_live));
 	vept_diag_free(o->pk, VEPT_OBS_HASH * sizeof(struct vept_pk));
+	vept_diag_free(o->vv, sizeof(struct vept_vv));	/* diagnosi 061 */
 	vept_diag_free(o, sizeof(struct vept_obs));
 }
 
@@ -756,6 +825,205 @@ vept_count_range(const uint64_t *tbl, int lvl, uint64_t tb, uint64_t s,
 			    MIN(e, lo + span));
 	}
 	return (n);
+}
+
+/* ---- diagnosi 061 par. 3: insieme delle pagine con foglia vecchia tolta al rientro ---- */
+static int
+vept_vv_classe(sbintime_t d)
+{
+	int64_t us = sbttous(d);
+
+	return (us < 1000 ? 0 : us < 10000 ? 1 : us < 100000 ? 2 : us < 1000000 ? 3 : 4);
+}
+
+static int
+vept_vv_tipo(uint64_t vecchio, uint64_t nuovo)
+{
+	if ((nuovo & EPT_RWX) == 0)
+		return (VV_ASSENTE);
+	if (EPT_ADDR(vecchio) != EPT_ADDR(nuovo))
+		return (VV_INDIRIZZO);
+	if ((vecchio & EPT_PG_WRITE) != 0 && (nuovo & EPT_PG_WRITE) == 0)
+		return (VV_W_TOLTO);
+	return (VV_ALTRO);
+}
+
+static struct vept_vv_ent *
+vept_vv_find(struct vept_vv *v, uint64_t gpa)
+{
+	uint32_t h = (uint32_t)((gpa >> 12) * 2654435761U);
+	struct vept_vv_ent *x;
+	int i;
+
+	for (i = 0; i < VEPT_VV_HASH; i++) {
+		x = &v->ent[(h + i) & (VEPT_VV_HASH - 1)];
+		if (x->gpa == gpa)
+			return (x);
+		if (x->gpa == 0)
+			return (NULL);
+	}
+	return (NULL);
+}
+
+static void
+vept_vv_add(struct vept_vv *v, uint64_t gpa, int tipo, struct vept_kslot *k, sbintime_t now, uint64_t foglia,
+    int livello)
+{
+	uint32_t h = (uint32_t)((gpa >> 12) * 2654435761U);
+	struct vept_vv_ent *x;
+	int i;
+
+	if (vept_vv_find(v, gpa) != NULL)
+		return;
+	if (v->n >= VEPT_VV_MAX) {
+		atomic_add_long(&vept_vecchia_trabocco, 1);
+		return;
+	}
+	for (i = 0; i < VEPT_VV_HASH; i++) {
+		x = &v->ent[(h + i) & (VEPT_VV_HASH - 1)];
+		if (x->gpa == 0 || x->gpa == VEPT_VV_TOMBA) {
+			x->gpa = gpa;
+			x->t_rientro = now;
+			x->t_invept = k->t_invept;
+			x->altro_eptp12 = k->altro_eptp12;
+			x->altri_n = k->altri_n;
+			x->tipo = (uint8_t)tipo;
+			x->letta = 0;
+			x->foglia = foglia;
+			x->livello = (uint8_t)livello;
+			v->n++;
+			atomic_add_long(&vept_vecchia_inserite, 1);
+			return;
+		}
+	}
+	atomic_add_long(&vept_vecchia_trabocco, 1);
+}
+
+/* Elenca le foglie 4K presenti della shadow in [s, e) (come vept_count_range) e le registra. */
+static void
+vept_vv_list_range(struct vept_vv *v, const uint64_t *tbl, int lvl, uint64_t tb, uint64_t s, uint64_t e, int tipo,
+    struct vept_kslot *k, sbintime_t now, int livello)
+{
+	uint64_t span = 1ULL << (12 + 9 * lvl), lo;
+	int i, i0, i1;
+
+	if (e <= tb)
+		return;
+	i0 = s > tb ? (int)((s - tb) / span) : 0;
+	i1 = (int)MIN((e - tb + span - 1) / span, 512);
+	for (i = i0; i < i1; i++) {
+		if ((tbl[i] & EPT_RWX) == 0)
+			continue;
+		lo = tb + (uint64_t)i * span;
+		if (lvl == 0)
+			vept_vv_add(v, lo, tipo, k, now, tbl[i], livello);
+		else
+			vept_vv_list_range(v, (const uint64_t *)PHYS_TO_DMAP(EPT_ADDR(tbl[i])), lvl - 1, lo, MAX(s, lo),
+			    MIN(e, lo + span), tipo, k, now, livello);
+	}
+}
+
+/* Svuota l'insieme: all'INVEPT su questo slot (invept = true: chiude la finestra del valore 0) o a uno svuotamento. */
+static void
+vept_vv_svuota(struct vept_vv *v, bool invept)
+{
+	static u_long *fin[5] = { &vept_vecchia_fin_lt1ms, &vept_vecchia_fin_1_10ms, &vept_vecchia_fin_10_100ms,
+	    &vept_vecchia_fin_100ms_1s, &vept_vecchia_fin_gt1s };
+	u_long scad = 0;
+	int i;
+
+	if (v == NULL || v->n == 0)
+		return;
+	for (i = 0; i < VEPT_VV_HASH; i++)
+		if (v->ent[i].gpa > VEPT_VV_TOMBA && !v->ent[i].letta)
+			scad++;
+	atomic_add_long(&vept_vecchia_scadute, scad);
+	if (invept)
+		atomic_add_long(fin[vept_vv_classe(sbinuptime() - v->t_rientro)], 1);
+	memset(v->ent, 0, sizeof(v->ent));
+	v->n = 0;
+}
+
+/*
+ * vmx_vept_fault: l'L2 accede a una pagina dell'insieme (con il valore 0 l'accesso avrebbe usato la foglia vecchia).
+ * Ritorna true per una lettura o un'esecuzione: il chiamante installa la foglia nuova SENZA W anche se l'EPT12 lo concede
+ * (diagnosi 063 par. 3), cosi' la scrittura successiva fa fault, si conta, e la foglia si reinstalla con W. Quel fault
+ * non si riflette mai all'L1: *perm resta quello vero, come per ad_clean_now.
+ */
+static struct vept_vv_ent *
+vept_vv_accesso(struct vmx_vcpu *vcpu, struct vept_vv *v, uint64_t l2gpa, uint64_t qual, uint64_t eptp12,
+    bool *senza_w)
+{
+	static u_long *acc[5] = { &vept_vecchia_acc_lt1ms, &vept_vecchia_acc_1_10ms, &vept_vecchia_acc_10_100ms,
+	    &vept_vecchia_acc_100ms_1s, &vept_vecchia_acc_gt1s };
+	static const char *nome[5] = { "?", "assente", "indirizzo", "W tolto", "altro" };
+	struct vept_vv_ent *x;
+	sbintime_t now;
+
+	x = vept_vv_find(v, l2gpa & ~(uint64_t)PAGE_MASK);
+	if (x == NULL)
+		return (NULL);
+	now = sbinuptime();
+	atomic_add_long(acc[vept_vv_classe(now - x->t_rientro)], 1);
+	if ((qual & 0x2) == 0) {
+		atomic_add_long((qual & 0x4) ? &vept_vecchia_esecuzioni : &vept_vecchia_letture, 1);
+		x->letta = 1;		/* resta: una scrittura dopo si conta anche lei */
+		*senza_w = true;
+		return (x);
+	}
+	atomic_add_long(x->tipo == VV_W_TOLTO ? &vept_vecchia_scritture_w_tolto :
+	    (x->tipo == VV_INDIRIZZO || x->tipo == VV_ASSENTE) ? &vept_vecchia_scritture_indirizzo :
+	    &vept_vecchia_scritture_altro, 1);
+	(void)nome;			/* diagnosi 065: le stampe sono in vept_vv_frame, solo per le classi a, b, c */
+	return (x);			/* la pagina esce in vept_vv_frame, dopo la classificazione */
+}
+
+/*
+ * Diagnosi 065 par. 2: classifica l'accesso dopo il percorso nuovo. esito 0 = traduzione nuova presente (hpa, perm
+ * validi), 1 = assente o illeggibile, 2 = non RAM. Una scrittura fa uscire la pagina dall'insieme.
+ */
+#define	VV_FRAME	0
+#define	VV_TOLTA	1
+#define	VV_WTOLTO	2
+#define	VV_INNOCUA	3
+static void
+vept_vv_frame(struct vmx_vcpu *vcpu, struct vept_vv *v, struct vept_vv_ent *x, uint64_t l2gpa, uint64_t qual,
+    int esito, uint64_t hpa, uint64_t perm, uint64_t eptp12)
+{
+	static const char *nome[4] = { "frame diverso", "pagina tolta", "W tolto", "innocua" };
+	static u_long *scr[4][2] = {
+	    { &vept_vf_scr_frame_pt, &vept_vf_scr_frame_pd }, { &vept_vf_scr_tolta_pt, &vept_vf_scr_tolta_pd },
+	    { &vept_vf_scr_wtolto_pt, &vept_vf_scr_wtolto_pd }, { &vept_vf_scr_innocua_pt, &vept_vf_scr_innocua_pd } };
+	static u_long *let[4][2] = {
+	    { &vept_vf_let_frame_pt, &vept_vf_let_frame_pd }, { &vept_vf_let_tolta_pt, &vept_vf_let_tolta_pd },
+	    { &vept_vf_let_wtolto_pt, &vept_vf_let_wtolto_pd }, { &vept_vf_let_innocua_pt, &vept_vf_let_innocua_pd } };
+	bool scrittura = (qual & 0x2) != 0;
+	int classe, lv;
+
+	/* la voce puo' essere stata azzerata da uno svuotamento dentro lo stesso fault */
+	if (v == NULL || x == NULL || x->gpa != (l2gpa & ~(uint64_t)PAGE_MASK))
+		return;
+	if (esito == 1)
+		classe = VV_TOLTA;
+	else if (esito == 2 || EPT_ADDR(x->foglia) != (hpa & ~(uint64_t)PAGE_MASK))
+		classe = VV_FRAME;
+	else if ((x->foglia & EPT_PG_WRITE) != 0 && (perm & EPT_PG_WRITE) == 0)
+		classe = VV_WTOLTO;
+	else
+		classe = VV_INNOCUA;
+	lv = x->livello == 0 ? 0 : 1;
+	atomic_add_long(scrittura ? scr[classe][lv] : let[classe][lv], 1);
+	if (!scrittura)
+		return;
+	if (classe != VV_INNOCUA && atomic_fetchadd_int(&vept_vf_stampe, 1) < 8)
+		printf("vept vecchia: scrittura %s vcpu%d eptp12=%#lx l2gpa=%#lx livello=%d hpa_vecchio=%#lx "
+		    "hpa_nuovo=%#lx perm_vecchi=%#lx perm_nuovi=%#lx ms_dal_rientro=%ld ingressi_altrove=%u\n",
+		    nome[classe], vcpu->vcpuid, (u_long)eptp12, (u_long)x->gpa, x->livello,
+		    (u_long)EPT_ADDR(x->foglia), (u_long)(esito == 0 ? (hpa & ~(uint64_t)PAGE_MASK) : 0),
+		    (u_long)(x->foglia & EPT_RWX), (u_long)(perm & EPT_RWX),
+		    (long)(sbttous(sbinuptime() - x->t_rientro) / 1000), x->altri_n);
+	x->gpa = VEPT_VV_TOMBA;		/* dopo una scrittura la pagina esce */
+	v->n--;
 }
 
 /* All'INVEPT su una radice: confronta e riporta. Non cambia nulla. */
@@ -1593,6 +1861,21 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i, int rientro)
 			atomic_add_long(&vept_rientro_voci_dannose, 1);
 			fd = vept_count_range(s->root, 3, 0, o->rng[c].start, o->rng[c].end);
 			atomic_add_long(&vept_rientro_foglie_dannose, fd);
+			/*
+			 * Diagnosi 061 par. 3: solo per uno slot marcato col valore 1 (validato anche all'INVEPT) un cambio
+			 * visto qui e' per forza successivo all'INVEPT. Le pagine delle foglie vive si registrano PRIMA di
+			 * toglierle (passo 3): i loro prossimi fault sono gli accessi che il valore 0 avrebbe fatto vecchi.
+			 */
+			if (rientro == 1 && fd != 0) {
+				if (o->vv == NULL)
+					o->vv = vept_diag_alloc(sizeof(struct vept_vv));
+				if (o->vv != NULL) {
+					o->vv->t_rientro = sbinuptime();
+					vept_vv_list_range(o->vv, s->root, 3, 0, o->rng[c].start, o->rng[c].end,
+					    vept_vv_tipo(vec, nuo), k, o->vv->t_rientro, e->level);
+				} else
+					atomic_add_long(&vept_vecchia_trabocco, fd);
+			}
 			if (atomic_fetchadd_int(&vept_rientro_stampe, 1) < 8)
 				printf("vept rientro: vcpu%d eptp12=%#lx tabella=%#lx liv=%d idx=%u vecchio=%#lx nuovo=%#lx "
 				    "l2gpa=[%#lx,%#lx) foglie_vive=%lu ms_da_invept=%ld ingressi_altrove=%u altro_eptp12=%#lx\n",
@@ -1768,7 +2051,7 @@ vmx_vept_prepare(struct vmx_vcpu *vcpu)
 		if (pk->da_validare) {
 			pk->da_validare = false;
 			atomic_add_long(&vept_rientro_validazioni, 1);
-			if (!vept_keep_invept(vcpu, pi, 1))
+			if (!vept_keep_invept(vcpu, pi, pk->marcato_modo == 2 ? 2 : 1))
 				atomic_add_long(&vept_rientro_fallback, 1);
 		}
 	}
@@ -1817,6 +2100,8 @@ static void
 vept_root_wipe(struct vmx_nested *n, int i)
 {
 	vept_wipe(n->vept_slot[i].root);
+	if (n->vept_obs[i] != NULL)	/* diagnosi 061: radice vuota, anche col valore 0 niente foglie vecchie */
+		vept_vv_svuota(n->vept_obs[i]->vv, false);
 	vept_obs_reset(n->vept_obs[i]);
 	n->vept_ks[i].leaves = 0;
 	n->vept_ks[i].nokeep = false;
@@ -1863,6 +2148,9 @@ vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp, int *kept)
 			continue;
 		}
 		atomic_add_long(&vept_invept_roots_matched, 1);
+		/* diagnosi 061 par. 3: l'INVEPT chiude la finestra che il valore 0 avrebbe avuto */
+		if (n->vept_obs[i] != NULL)
+			vept_vv_svuota(n->vept_obs[i]->vv, true);
 		if (vept_diag)		/* fase C: solo misura, PRIMA di svuotare */
 			vept_obs_scan(vcpu, n->vept_obs[i], s->eptp12,
 			    s->root);
@@ -1874,6 +2162,7 @@ vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp, int *kept)
 			 * della radice shadow a ogni ingresso in L2.
 			 */
 			if (vept_keep_rientro == 2) {
+				n->vept_ks[i].marcato_modo = 2;
 				n->vept_ks[i].da_validare = true;
 				n->vept_ks[i].t_invept = sbinuptime();
 				n->vept_ks[i].altri_n = 0;
@@ -1890,6 +2179,7 @@ vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp, int *kept)
 				(*kept)++;
 				atomic_add_long(&vept_invept_roots_kept, 1);
 				if (vept_keep_rientro == 1) {
+					n->vept_ks[i].marcato_modo = 1;
 					n->vept_ks[i].da_validare = true;
 					n->vept_ks[i].t_invept = sbinuptime();
 					n->vept_ks[i].altri_n = 0;
@@ -2169,6 +2459,8 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	void *p, *ck;
 	int r;
 	bool ad_clean_now = false;	/* A2: foglia EPT12 pulita -> shadow senza W */
+	bool vv_senza_w = false;	/* diagnosi 063 par. 3: pagina dell'insieme letta -> shadow senza W */
+	struct vept_vv_ent *x_vv = NULL;	/* diagnosi 065: pagina dell'insieme, da classificare */
 
 	/*
 	 * SLOW PATH (vCPU FROZEN, nessun VMCS caricato): qui si puo' dormire
@@ -2191,6 +2483,9 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 		if (obs == NULL && n->vept_keep)
 			k->force_full = true;
 	}
+	/* diagnosi 061 par. 3: prima di qualunque riflessione all'L1 (W tolto: adesso Hyper-V la vede) */
+	if (obs != NULL && obs->vv != NULL && obs->vv->n > 0)
+		x_vv = vept_vv_accesso(vcpu, obs->vv, l2gpa, qual, eptp12, &vv_senza_w);
 	r = ept12_translate(vcpu, eptp12, l2gpa, l1gpa, perm, obs);
 	if (k->wipe_now) {
 		/*
@@ -2213,9 +2508,13 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	}
 	if (r < 0) {
 		n->st_vept[VST_F_UNREAD]++;
+		if (x_vv != NULL)
+			vept_vv_frame(vcpu, obs->vv, x_vv, l2gpa, qual, 1, 0, 0, eptp12);
 		return (VEPT_VIOL);		/* tabella dell'L1 illeggibile */
 	}
 	if (r != VEPT_OK) {
+		if (x_vv != NULL)
+			vept_vv_frame(vcpu, obs->vv, x_vv, l2gpa, qual, 1, 0, 0, eptp12);
 		n->st_vept[r == VEPT_MISCONF ? VST_F_MISCONF : VST_F_VIOL_MISSING]++;
 		return (r);
 	}
@@ -2227,6 +2526,17 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	 */
 	access = qual & EPT_RWX;
 	if ((access & ~*perm) != 0) {
+		if (x_vv != NULL) {	/* diagnosi 065: HPA nuovo per il confronto */
+			void *pq, *cq;
+			uint64_t hq = 0;
+
+			pq = vept_hold(vcpu, *l1gpa & ~(uint64_t)PAGE_MASK, &cq, VST_H_L1PAGE);
+			if (pq != NULL) {
+				hq = DMAP_TO_PHYS((vm_offset_t)pq);
+				vept_rel(vcpu, cq);
+			}
+			vept_vv_frame(vcpu, obs->vv, x_vv, l2gpa, qual, pq != NULL ? 0 : 2, hq, *perm, eptp12);
+		}
 		n->st_vept[VST_F_VIOL_PERM]++;
 		return (VEPT_VIOL);
 	}
@@ -2276,8 +2586,10 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 			k->nokeep = true;
 		/* A2: foglia EPT12 ancora pulita -> shadow senza W (il memtype
 		 * resta dai permessi veri, vept_ram_attr usa *perm) */
-		ram_perm = ad_clean_now ? (*perm & ~(uint64_t)EPT_PG_WRITE) :
-		    *perm;
+		ram_perm = (ad_clean_now || vv_senza_w) ?
+		    (*perm & ~(uint64_t)EPT_PG_WRITE) : *perm;
+		if (x_vv != NULL)	/* diagnosi 065: confronto dei frame prima di installare */
+			vept_vv_frame(vcpu, obs->vv, x_vv, l2gpa, qual, 0, hpa, *perm, eptp12);
 		vept_install(n, k, l2gpa, hpa, ram_perm, vept_ram_attr(*perm));
 		return (VEPT_OK);
 	}
@@ -2295,6 +2607,8 @@ vmx_vept_fault(struct vmx_vcpu *vcpu, uint64_t l2gpa, uint64_t qual,
 	 * foglia EPT02 0x43 su c200a000, rapporto WSL2-FreeBSD 008 e parere di
 	 * Astra). Per questo anche l'indirizzo si allinea alla pagina.
 	 */
+	if (x_vv != NULL)	/* diagnosi 065: la traduzione nuova non e' RAM: frame diverso */
+		vept_vv_frame(vcpu, obs->vv, x_vv, l2gpa, qual, 2, 0, *perm, eptp12);
 	if (!ppt_is_mmio(vcpu->vmx->vm, *l1gpa)) {
 		n->st_vept[VST_F_EMUL]++;
 		return (VEPT_MMIO);		/* dispositivo emulato dell'L0 */
