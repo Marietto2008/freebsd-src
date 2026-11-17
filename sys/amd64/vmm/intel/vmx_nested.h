@@ -627,6 +627,7 @@ struct vmx_nested {
 		sbintime_t	t_invept;	/* istante dell'ultimo INVEPT su questo slot */
 		uint64_t	altro_eptp12;	/* ultimo altro EPTP12 eseguito nel frattempo */
 		uint32_t	altri_n;	/* ingressi in altri slot dal suo INVEPT */
+		uint8_t		marcato_modo;	/* valore di vept_keep_rientro alla marcatura (1 o 2) */
 		/* verifica HPA (parere #31): reservoir di L2-GPA di foglie
 		 * installate dall'ultimo svuotamento, niente puntatori */
 #define	VEPT_VS_N	128
