@@ -704,6 +704,7 @@ struct vmx_nested {
 #define	HCALL_ATTESE	4
 	struct nested_hcall_attesa {
 		uint64_t	vmcs12;		/* 0 = libero */
+		uint64_t	eptp12;		/* 069 par. 2: EPTP12 alla VMCALL (0 = L2 senza EPT) */
 		uint64_t	rcx, rdx, r8;
 		sbintime_t	t;
 	}		hcall_att[HCALL_ATTESE];

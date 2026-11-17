@@ -390,6 +390,18 @@ static u_long hcall_oltre, hcall_senza_ritorno, hcall_voci_totali;
 /* 17/11 v2: degli errori si registrano per intero solo i primi HCALL_ERR_VOCI per codice (0x49 riempiva l'anello) */
 #define	HCALL_ERR_VOCI	8
 static u_int hcall_err_reg[HCALL_CODICI], hcall_err_reg_oltre;
+/*
+ * 0x11/0x12 sono VtlCall/VtlReturn (VBS) e non hanno un ritorno di stato: ogni VTL ha il SUO VMCS12 (misurato il 17/11:
+ * 0x11 dal VMCS12 di VTL0, 0x12 da quelli di VTL1, con l'EPTP del proprio VTL), e la ripresa seguente sullo stesso
+ * VMCS12 arriva dopo il giro nell'altro VTL. Si contano a parte, fuori da errori e anello (071 par. 4.1; il controllo
+ * sull'EPTP al ritorno della 069 par. 2 non scattava mai ed e' tolto). Le VMCALL di un L2 senza EPT (il caricatore,
+ * prima che Hyper-V accenda l'EPT) restano fuori dall'anello degli errori.
+ */
+static u_long hcall_vtl, hcall_senza_ept;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_hcall_vtl, CTLFLAG_RD, &hcall_vtl, 0,
+    "nested: VtlCall/VtlReturn (0x11/0x12) dell'L2: niente ritorno di stato, fuori da errori e anello");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, nested_hcall_senza_ept, CTLFLAG_RD, &hcall_senza_ept, 0,
+    "nested: VMCALL da un L2 senza EPT (fuori dall'anello degli errori)");
 static int hcall_err_voci = HCALL_ERR_VOCI;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, nested_hcall_err_voci, CTLFLAG_RD, &hcall_err_voci, 0,
     "nested: voci complete registrate per codice d'errore (registratore v2)");
@@ -466,6 +478,7 @@ sysctl_hcall_azzera(SYSCTL_HANDLER_ARGS)
 	memset(hcall_errori, 0, sizeof(hcall_errori));
 	hcall_oltre = hcall_senza_ritorno = hcall_voci_totali = 0;
 	memset(hcall_err_reg, 0, sizeof(hcall_err_reg));
+	hcall_vtl = hcall_senza_ept = 0;
 	hcall_err_reg_oltre = 0;
 	hcall_testa = 0;
 	mtx_unlock(&hcall_mtx);
@@ -501,6 +514,7 @@ nested_hcall_uscita(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 		atomic_add_long(&hcall_senza_ritorno, 1);
 	}
 	a->vmcs12 = c->vmcs12_gpa;
+	a->eptp12 = (vmcs12_proc2(c) & PROCBASED2_ENABLE_EPT) != 0 ? vmcs12_read_field(c, VMCS_EPTP) : 0;
 	a->rcx = vcpu->ctx.guest_rcx;
 	a->rdx = vcpu->ctx.guest_rdx;
 	a->r8 = vcpu->ctx.guest_r8;
@@ -548,6 +562,16 @@ nested_hcall_ritorno(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	n->hcall_natt--;
 	rax = vcpu->ctx.guest_rax;
 	codice = a.rcx & 0xffff;
+	/* 071 par. 4.1: VtlCall/VtlReturn, niente ritorno di stato; L2 senza EPT contato a parte */
+	if (codice == 0x11 || codice == 0x12) {
+		atomic_add_long(&hcall_vtl, 1);
+		return;
+	}
+	if (a.eptp12 == 0) {
+		atomic_add_long(&hcall_senza_ept, 1);
+		if (!(codice >= 0x7c && codice <= 0x7e))
+			return;
+	}
 	if (codice < HCALL_CODICI) {
 		atomic_add_long(&hcall_conta[codice], 1);
 		if ((rax & 0xffff) != 0)
@@ -570,7 +594,7 @@ nested_hcall_ritorno(struct vmx_vcpu *vcpu, struct vmcs12_cache *c)
 	v.rax = rax;
 	v.us = (uint32_t)((sbinuptime() - a.t) / SBT_1US);
 	v.vcpu = vcpu->vcpuid;
-	v.eptp12 = (vmcs12_proc2(c) & PROCBASED2_ENABLE_EPT) != 0 ? vmcs12_read_field(c, VMCS_EPTP) : 0;
+	v.eptp12 = a.eptp12;
 	if (nested_hcall_eptp != 0 && (v.eptp12 & ~(uint64_t)PAGE_MASK) != (nested_hcall_eptp & ~(u_long)PAGE_MASK))
 		return;			/* 067 par. 5.3.3: anello limitato a un EPTP12 */
 	if ((a.rcx & (1ul << 16)) == 0) {	/* chiamata lenta: RDX e R8 sono le pagine */
