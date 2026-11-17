@@ -28,7 +28,10 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
 #include <sys/proc.h>
+#include <sys/sysctl.h>
 
 #include <machine/clock.h>
 #include <machine/cpufunc.h>
@@ -41,6 +44,80 @@
 #include "vmx_msr.h"
 #include "vmx_nested.h"
 #include "x86.h"
+
+/*
+ * claude 16/11/2026, prova (b): sincronizzazione delle scritture IA32_TSC dell'ospite. NON e' parita' con KVM
+ * (diagnosi 055 par. 3.1): KVM applica alla lettera le WRMSR IA32_TSC dell'OSPITE (adjust_tsc_offset_guest, aggiorna
+ * IA32_TSC_ADJUST); kvm_synchronize_tsc con la regola di 1 s vale solo per le scritture dell'host e alla creazione del
+ * vCPU, e le liste MSR annidate passano dal percorso dell'ospite. Qui e' una deviazione VOLUTA dalla semantica
+ * dell'hardware: le differenze sotto 1 s fra i vCPU si perdono (nessun sistema reale le chiede).
+ * bhyve trasforma una WRMSR IA32_TSC in offset = valore - rdtsc() all'istante dell'EMULAZIONE: ogni vCPU eredita la
+ * propria latenza d'uscita come sfasamento permanente. Quando l'ospite sincronizza i TSC dei suoi processori (Windows/
+ * Hyper-V all'avvio) i vCPU restano sfasati: misurato il 15/11 un vCPU ~1.580 cicli indietro agli altri sette (entro 80);
+ * un VP dell'L2 che vi passa vede il TSC tornare indietro, e il timecounter Hyper-V-TSC a 32 bit dell'L2 fa delta ~ 2^32
+ * -> sbinuptime +429,5 s -> nanosleep di 2 ms che dormono 429,5 s (claude-lag). Regola (diagnosi 055 par. 3.2, a due
+ * candidati): una scrittura il cui offset dista meno di 1 s (tsc_freq cicli) dall'offset comune della VM riceve l'offset
+ * comune; altrimenti, se dista meno di 1 s da 0 (l'offset di nascita dei vCPU), riceve 0 e il comune torna 0; altrimenti
+ * e' una scelta nuova dell'ospite e diventa l'offset comune (evento «new», stampato: e' un punto in cui uno sfasamento
+ * puo' nascere). Chiude «l'ultima scrittura lontana vince»: un vCPU che torna vicino al valore di prima non apre un
+ * comune nuovo con dentro la propria latenza. hw.vmm.vmx.tsc_sync=0 torna al comportamento di prima (offset per vCPU).
+ */
+SYSCTL_DECL(_hw_vmm_vmx);
+static int vmx_tsc_sync_on = 1;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, tsc_sync, CTLFLAG_RWTUN, &vmx_tsc_sync_on, 0,
+    "Scritture IA32_TSC entro 1 s dall'offset comune della VM (o da 0) lo ricevono; deviazione voluta, NON come KVM");
+static u_long vmx_tsc_sync_matched, vmx_tsc_sync_new, vmx_tsc_sync_maxcorr, vmx_tsc_sync_zero;
+static u_int vmx_tsc_sync_stampe;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, tsc_sync_zero, CTLFLAG_RD, &vmx_tsc_sync_zero, 0,
+    "Scritture IA32_TSC lontane dal comune ma entro 1 s da 0: ricevono 0 e il comune torna 0 (diagnosi 055 par. 3.2)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, tsc_sync_matched, CTLFLAG_RD, &vmx_tsc_sync_matched, 0,
+    "Scritture IA32_TSC ricondotte all'offset comune della VM");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, tsc_sync_new, CTLFLAG_RD, &vmx_tsc_sync_new, 0,
+    "Scritture IA32_TSC oltre 1 s dall'offset comune: diventano il nuovo offset comune (l'offset comune nasce a 0)");
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, tsc_sync_maxcorr, CTLFLAG_RD, &vmx_tsc_sync_maxcorr, 0,
+    "Correzione massima applicata da tsc_sync, in cicli (lo sfasamento che ci sarebbe stato)");
+
+uint64_t
+vmx_tsc_sync(struct vmx_vcpu *vcpu, uint64_t offset)
+{
+	struct vmx *vmx = vcpu->vmx;
+	uint64_t ret, corr, corr0, prima;
+	bool nuovo = false;
+
+	if (!vmx_tsc_sync_on)
+		return (offset);
+	mtx_lock_spin(&vmx->tsc_sync_mtx);
+	prima = vmx->tsc_sync_off;
+	corr = offset - vmx->tsc_sync_off;
+	if ((int64_t)corr < 0)
+		corr = -corr;
+	corr0 = ((int64_t)offset < 0) ? -offset : offset;
+	if (vmx->tsc_sync_valid && corr < tsc_freq) {
+		ret = vmx->tsc_sync_off;
+		vmx_tsc_sync_matched++;
+		if (corr > vmx_tsc_sync_maxcorr)
+			vmx_tsc_sync_maxcorr = corr;
+	} else if (corr0 < tsc_freq) {
+		/* secondo candidato: l'offset di nascita dei vCPU */
+		vmx->tsc_sync_off = 0;
+		vmx->tsc_sync_valid = true;
+		ret = 0;
+		vmx_tsc_sync_zero++;
+		if (corr0 > vmx_tsc_sync_maxcorr)
+			vmx_tsc_sync_maxcorr = corr0;
+	} else {
+		vmx->tsc_sync_off = offset;
+		vmx->tsc_sync_valid = true;
+		ret = offset;
+		vmx_tsc_sync_new++;
+		nuovo = true;
+	}
+	mtx_unlock_spin(&vmx->tsc_sync_mtx);
+	if (nuovo && atomic_fetchadd_int(&vmx_tsc_sync_stampe, 1) < 16)
+		printf("vmx_tsc_sync: vcpu%d offset nuovo %#lx (comune prima %#lx): nuovo offset comune della VM\n",
+		    vcpu->vcpuid, (u_long)offset, (u_long)prima);
+	return (ret);
+}
 
 static bool
 vmx_ctl_allows_one_setting(uint64_t msr_val, int bitpos)
@@ -518,7 +595,8 @@ vmx_wrmsr(struct vmx_vcpu *vcpu, u_int num, uint64_t val, bool *retu)
 			vm_inject_gp(vcpu->vcpu);
 		break;
 	case MSR_TSC:
-		error = vmx_set_tsc_offset(vcpu, val - rdtsc());
+		/* claude 16/11: offset comune della VM se e' una sincronizzazione (vmx_tsc_sync) */
+		error = vmx_set_tsc_offset(vcpu, vmx_tsc_sync(vcpu, val - rdtsc()));
 		break;
 	case MSR_TSC_AUX:
 		if (vmx_have_msr_tsc_aux)

@@ -1338,6 +1338,14 @@ vmx_init(struct vm *vm, pmap_t pmap)
 
 	vmx = malloc(sizeof(struct vmx), M_VMX, M_WAITOK | M_ZERO);
 	vmx->vm = vm;
+	mtx_init(&vmx->tsc_sync_mtx, "vmx tsc sync", NULL, MTX_SPIN);	/* claude 16/11, vmx_tsc_sync */
+	/*
+	 * v2 (16/11 03:5x): l'offset comune nasce VALIDO a 0, quello con cui nascono tutti i vCPU (TSC dell'host, come KVM
+	 * che sincronizza anche alla creazione del vCPU). Con la v1 il primo AP scritto da Windows apriva un offset nuovo
+	 * (-2742 = latenza d'emulazione) e il BSP, mai scritto, restava a 0: sfasamento di nuovo, misurato.
+	 */
+	vmx->tsc_sync_valid = true;
+	vmx->tsc_sync_off = 0;
 
 	vmx->eptp = eptp(vtophys((vm_offset_t)pmap->pm_pmltop));
 
@@ -1425,6 +1433,16 @@ vmx_vcpu_init(void *vmi, struct vcpu *vcpu1, int vcpuid)
 	vcpu->vmx = vmx;
 	vcpu->vcpu = vcpu1;
 	vcpu->vcpuid = vcpuid;
+	/*
+	 * claude 16/11 (vmx_tsc_sync v2): il vCPU nasce col TSC dell'host (offset 0). Quando si (ri)crea il vCPU 0 -- nascita
+	 * della VM o reset sul posto R2, che ricrea tutti i vCPU a offset 0 -- l'offset comune torna a 0.
+	 */
+	if (vcpuid == 0) {
+		mtx_lock_spin(&vmx->tsc_sync_mtx);
+		vmx->tsc_sync_valid = true;
+		vmx->tsc_sync_off = 0;
+		mtx_unlock_spin(&vmx->tsc_sync_mtx);
+	}
 	vcpu->vmcs = malloc_aligned(sizeof(*vmcs), PAGE_SIZE, M_VMX,
 	    M_WAITOK | M_ZERO);
 	vcpu->apic_page = malloc_aligned(PAGE_SIZE, PAGE_SIZE, M_VMX,
@@ -4362,6 +4380,8 @@ vmx_run(void *vcpui, register_t rip, pmap_t pmap, struct vm_eventinfo *evinfo)
 		if (vcpu->nested != NULL && vcpu->nested->in_l2 &&
 		    vcpu->nested->vept_keep)
 			vmx_vept_enter_check(vcpu);	/* B1: deve restare 0 */
+		if (vcpu->nested != NULL && vcpu->nested->in_l2)
+			vmx_nested_tsc_check(vcpu);	/* diagnosi 055 3.3: deve restare 0 */
 		if (vcpu->nested != NULL) {
 			entry_tsc = rdtsc();	/* parere #30: tempo in L1/L2 */
 			/* parere #41 §6: dal disable_intr() a qui */
@@ -4607,6 +4627,7 @@ vmx_cleanup(void *vmi)
 		vm_unmap_mmio(vmx->vm, DEFAULT_APIC_BASE, PAGE_SIZE);
 
 	free(vmx->msr_bitmap, M_VMX);
+	mtx_destroy(&vmx->tsc_sync_mtx);
 	free(vmx, M_VMX);
 
 	return;

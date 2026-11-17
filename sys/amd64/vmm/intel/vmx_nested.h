@@ -280,6 +280,7 @@ int	vmx_vept_cur_slot(struct vmx_nested *n);	/* parere #53 §8: slot corrente o 
 bool	vmx_vept_memgen_stale(struct vmx_vcpu *vcpu);	/* non dorme */
 void	vmx_vept_hw_flushed(struct vmx_vcpu *vcpu);	/* dopo l'INVEPT hw */
 void	vmx_vept_enter_check(struct vmx_vcpu *vcpu);	/* prima dell'ingresso */
+void	vmx_nested_tsc_check(struct vmx_vcpu *vcpu);	/* diagnosi 055 3.3, prima dell'ingresso in L2 */
 struct vmcs12_cache *nested_current_cache(struct vmx_nested *n);
 uint64_t vmcs12_read_field(struct vmcs12_cache *c, uint32_t enc);
 /* Secondari del VMCS12 come li vede la CPU: 0 se i primari non li attivano

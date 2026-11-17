@@ -244,6 +244,9 @@ VMM_STAT_INTEL(VMX_NESTED_SLOWPATH, "exit nested gestite nello slow path");
 #define	NESTED_CTR(name, descr)						\
 	static u_long name;						\
 	SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, name, CTLFLAG_RD, &name, 0, descr)
+/* diagnosi 055 3.3 (definiti piu' avanti, accanto a vmx_nested_tsc_check) */
+static int nested_tsc_offset_check;
+static void nested_tsc_offset_verify(struct vmx_vcpu *vcpu, uint64_t want, const char *dove);
 NESTED_CTR(nested_ept02_faults_l0, "nested: EPT violation dell'L2 risolte da L0");
 NESTED_CTR(nested_ept_mmio_emulated,
     "nested: EPT violation dell'L2 emulate come MMIO dell'L1");
@@ -4613,6 +4616,9 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	n->msr_phase = 2;
 	nested_msr_list_exit(vcpu, c, false);
 	n->msr_phase = 0;
+	/* diagnosi 055 par. 3.3: al ritorno in L1 il VMCS01 deve avere l'offset dell'L1 */
+	if (nested_tsc_offset_check)
+		nested_tsc_offset_verify(vcpu, n->l1_tsc_offset, "al ritorno in L1");
 
 	n->in_l2 = false;
 	n->emu_viol = false;		/* una violazione dell'emulatore non
@@ -4646,6 +4652,49 @@ nested_reflect_to_l1(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
  * Ritorna true se l'uscita e' stata fatta: vmx_run deve uscire
  * (VM_EXITCODE_NESTED + restart_only, come dopo una riflessione).
  */
+/*
+ * claude 16/11, diagnosi 055 par. 3.3: invariante del TSC_OFFSET, contato.
+ *   a ogni ingresso in L2 (VMCS02 corrente): offset effettivo == l1_tsc_offset + offset del VMCS12 (se acceso);
+ *   a ogni ritorno a L1 (VMCS01 corrente, dopo l'aggiornamento differito): offset effettivo == l1_tsc_offset.
+ * Effettivo = TSC_OFFSET se il controllo TSC offsetting e' acceso, altrimenti 0. Le prime otto violazioni si stampano.
+ */
+static int nested_tsc_offset_check = 1;
+SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, tsc_offset_check, CTLFLAG_RWTUN, &nested_tsc_offset_check, 0,
+    "nested: controlla a ogni ingresso in L2 e ritorno in L1 che il TSC_OFFSET sia quello atteso (diagnosi 055 3.3)");
+NESTED_CTR(tsc_offset_viol, "nested: ingressi/ritorni con TSC_OFFSET diverso da quello atteso (deve essere 0)");
+static u_int nested_tsc_offset_stampe;
+
+static void
+nested_tsc_offset_verify(struct vmx_vcpu *vcpu, uint64_t want, const char *dove)
+{
+	uint64_t eff = (vmcs_read(VMCS_PRI_PROC_BASED_CTLS) & PROCBASED_TSC_OFFSET) ?
+	    vmcs_read(VMCS_TSC_OFFSET) : 0;
+
+	if (eff == want)
+		return;
+	atomic_add_long(&tsc_offset_viol, 1);
+	if (atomic_fetchadd_int(&nested_tsc_offset_stampe, 1) < 8)
+		printf("nested: vcpu%d TSC_OFFSET %s effettivo %#lx atteso %#lx (l1_tsc_offset %#lx)\n",
+		    vcpu->vcpuid, dove, (u_long)eff, (u_long)want, (u_long)vcpu->nested->l1_tsc_offset);
+}
+
+/* Subito prima di un ingresso in L2 (vmx_run, VMCS02 corrente). */
+void
+vmx_nested_tsc_check(struct vmx_vcpu *vcpu)
+{
+	struct vmx_nested *n = vcpu->nested;
+	struct vmcs12_cache *c;
+	uint64_t want;
+
+	if (!nested_tsc_offset_check || n == NULL || !n->in_l2 ||
+	    (c = nested_current_cache(n)) == NULL)
+		return;
+	want = n->l1_tsc_offset;
+	if (vmcs12_read_field(c, VMCS_PRI_PROC_BASED_CTLS) & PROCBASED_TSC_OFFSET)
+		want += vmcs12_read_field(c, VMCS_TSC_OFFSET);
+	nested_tsc_offset_verify(vcpu, want, "all'ingresso in L2");
+}
+
 /*
  * Prima di ogni ingresso in L2 (vmx_run, interrupt spenti, VMCS02 corrente):
  * residuo del timer di preemption dell'L1 = scadenza assoluta - adesso.
@@ -4989,7 +5038,8 @@ nested_msr_rw(struct vmx_vcpu *vcpu, uint32_t idx, uint64_t *val, bool wr,
 			struct vmcs12_cache *cc = nested_current_cache(nn);
 			uint64_t off;
 
-			nn->l1_tsc_offset = *val - rdtsc();
+			/* claude 16/11: stessa sincronizzazione di vmx_wrmsr (vmx_tsc_sync) */
+			nn->l1_tsc_offset = vmx_tsc_sync(vcpu, *val - rdtsc());
 			if (nn->msr_phase == 2) {
 				vmx_set_tsc_offset(vcpu, nn->l1_tsc_offset);
 				nn->l1_tsc_dirty = false;
