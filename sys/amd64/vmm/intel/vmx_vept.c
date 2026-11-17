@@ -2296,6 +2296,20 @@ ept12_translate(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
 }
 
 /*
+ * 17/11 (Fable 067 par. 5.3.2): GPA dell'L2 -> GPA dell'L1 con un EPTP12 dato, per il registratore delle
+ * hypercall (pagine d'ingresso e d'uscita). Solo lettura dell'EPT12, nessuna fotografia; puo' dormire.
+ */
+int
+vmx_vept_l2_a_l1(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa, uint64_t *l1gpa)
+{
+	uint64_t perm;
+
+	if (ept12_translate(vcpu, eptp12, l2gpa, l1gpa, &perm, NULL) != VEPT_OK || (perm & EPT_PG_READ) == 0)
+		return (-1);
+	return (0);
+}
+
+/*
  * Fase A2 (parere Astra 012): accende i flag A/D nelle voci EPT12 dell'L1,
  * come fa l'hardware quando l'L1 attiva A/D nel suo EPTP (come KVM in
  * update_accessed_dirty_bits). Percorre le stesse tabelle di ept12_translate,

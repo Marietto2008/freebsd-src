@@ -944,6 +944,17 @@ vmx_modresume(void)
 		vmx_enable(NULL);
 }
 
+/*
+ * 17/11 (Fable 069 par. 4.4), per la riga d'avvio del lanciatore: ora del caricamento del modulo (secondi, come
+ * date +%s) e VM create da allora (0 = la prossima e' la prima dopo il caricamento).
+ */
+static long vmx_caricato;
+SYSCTL_LONG(_hw_vmm_vmx, OID_AUTO, caricato, CTLFLAG_RD, &vmx_caricato, 0,
+    "ora del caricamento del modulo (secondi dall'epoca)");
+static u_long vmx_vm_create;
+SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vm_create, CTLFLAG_RD, &vmx_vm_create, 0,
+    "VM create dal caricamento del modulo");
+
 static int
 vmx_modinit(int ipinum)
 {
@@ -951,6 +962,7 @@ vmx_modinit(int ipinum)
 	uint64_t basic, fixed0, fixed1, feature_control;
 	uint32_t tmp, procbased2_vid_bits;
 
+	vmx_caricato = time_second;
 	/* CPUID.1:ECX[bit 5] must be 1 for processor to support VMX */
 	if (!(cpu_feature2 & CPUID2_VMX)) {
 		printf("vmx_modinit: processor does not support VMX "
@@ -1338,6 +1350,7 @@ vmx_init(struct vm *vm, pmap_t pmap)
 
 	vmx = malloc(sizeof(struct vmx), M_VMX, M_WAITOK | M_ZERO);
 	vmx->vm = vm;
+	atomic_add_long(&vmx_vm_create, 1);	/* Fable 069 par. 4.4 */
 	mtx_init(&vmx->tsc_sync_mtx, "vmx tsc sync", NULL, MTX_SPIN);	/* claude 16/11, vmx_tsc_sync */
 	/*
 	 * v2 (16/11 03:5x): l'offset comune nasce VALIDO a 0, quello con cui nascono tutti i vCPU (TSC dell'host, come KVM
