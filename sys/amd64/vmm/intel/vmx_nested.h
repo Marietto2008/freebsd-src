@@ -213,6 +213,8 @@ void	vmx_vept_flush(struct vmx_nested *n);
 int	vmx_vept_invept(struct vmx_vcpu *vcpu, uint64_t type, uint64_t eptp,
 	    int *kept);
 void	vmx_vept_prepare(struct vmx_vcpu *vcpu);	/* puo' dormire */
+int	vmx_vept_l2_a_l1(struct vmx_vcpu *vcpu, uint64_t eptp12, uint64_t l2gpa,
+	    uint64_t *l1gpa);	/* 067 par. 5.3.2: registratore delle hypercall */
 uint64_t vmx_vept_eptp(struct vmx_vcpu *vcpu);	/* shadow EPTP per VMCS02 */
 /*
  * Parere #39: indici di vmx_nested.st_vept[] (contatori per vCPU del percorso
@@ -697,6 +699,15 @@ struct vmx_nested {
 	} e12w[NESTED_E12W];
 	u_int		e12w_reval;	/* Fable 023 §2.4.2: passaggi del percorso lento, per la riconvalida */
 	int		l2x_cpu;	/* Fable 034 §4.1: CPU fisica dell'ultima uscita dell'L2 (dentro vmx_run) */
+	/* 17/11 (Fable 042 par. 2.2): hypercall dell'L2 in attesa del ritorno (registratore delle hypercall) */
+	/* 17/11 v2: un posto per VMCS12 (sullo stesso vCPU girano la radice e i processori della VM di WSL) */
+#define	HCALL_ATTESE	4
+	struct nested_hcall_attesa {
+		uint64_t	vmcs12;		/* 0 = libero */
+		uint64_t	rcx, rdx, r8;
+		sbintime_t	t;
+	}		hcall_att[HCALL_ATTESE];
+	int		hcall_natt;		/* posti occupati */
 	int		mk_ret;		/* Fable 034 §4.3: CPU di partenza + 1 a cui tornare (0 = niente) */
 	bool		mk_slegare;	/* Mk: thread legato da sciogliere al prossimo percorso lento */
 	bool		mk_armato3;	/* Mk modo 3: spostamento fra la prossima uscita dell'L2 e la riflessione */
