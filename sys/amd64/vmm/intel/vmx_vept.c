@@ -126,7 +126,7 @@ SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_keep, CTLFLAG_RWTUN, &vept_keep, 0,
  *      radici in handle_invept e le risincronizza in kvm_mmu_load/kvm_mmu_sync_roots).
  * Letto a ogni INVEPT; uno slot gia' marcato si valida al rientro qualunque sia il valore in quel momento.
  */
-static int vept_keep_rientro = 2;	/* 6 giri amplificati su 6 puliti col 2; 1 resta per la misura; 0 solo prove */
+static int vept_keep_rientro = 2;	/* diagnosi 063 par. 4: il 2 e' provato (6 giri su 6); 1 resta per la misura; 0 solo prove */
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_keep_rientro, CTLFLAG_RWTUN, &vept_keep_rientro, 0,
     "nested, B1: validazione della radice conservata al rientro in L2 (2 di base, 1 misura e protegge, 0 SOLO PROVE: buco aperto)");
 static int vept_verify_hpa = 0;
@@ -225,7 +225,13 @@ VEPT_CTR(vept_leaves_zapped_partial, "B1: foglie tolte da INVEPT conservati");
 VEPT_CTR(vept_leaves_zapped_walk, "B1: foglie tolte da voci cambiate nei walk");
 VEPT_CTR(vept_leaves_zapped_race, "B1: foglie perse per corsa fra le passate");
 VEPT_CTR(vept_leaves_zapped_alias, "B1: foglie perse per tabella ambigua");
-VEPT_CTR(vept_leaves_zapped_capacity, "B1: foglie perse per tetti o memoria");
+VEPT_CTR(vept_leaves_zapped_capacity, "B1: foglie perse per tetti o memoria (somma di nomem, overflow, nrng)");
+/* claude 16/11, diagnosi 063 par. 2.3: le tre cause separate */
+VEPT_CTR(vept_leaves_zapped_nomem, "B1: foglie perse perche' una fotografia non si e' potuta allocare (tetto vept_diag_maxmb; deve restare 0)");
+VEPT_CTR(vept_leaves_zapped_overflow, "B1: foglie perse per piu' di VEPT_OBS_MAX tabelle tracciate (svuotamento giusto)");
+VEPT_CTR(vept_leaves_zapped_nrng, "B1: foglie perse per troppi intervalli cambiati");
+VEPT_CTR(vept_snap_allocate, "B1: fotografie di tabelle EPT12 allocate ora (valore istantaneo)");
+VEPT_CTR(vept_snap_libere, "B1: fotografie allocate ora nelle liste libere degli slot (valore istantaneo)");
 VEPT_CTR(vept_leaves_zapped_backing, "B1: foglie perse per MMIO o RAM non wired");
 VEPT_CTR(vept_leaves_zapped_force, "B1: foglie perse per walk non tracciato");
 VEPT_CTR(vept_leaves_zapped_walkfull,
@@ -353,9 +359,16 @@ vept_count_leaves(const uint64_t *tbl, int level)
  * M_NOWAIT: se il tetto e' raggiunto o l'allocazione fallisce, la misura
  * della radice diventa incompleta (overflow), l'INVEPT non cambia.
  */
-static int vept_diag_maxmb = 128;
+/*
+ * Diagnosi 063 par. 2.2: il nome inganna. Questa e' la memoria di LAVORO di B1 (le fotografie delle tabelle EPT12): senza
+ * fotografie B1 non conserva nulla e ogni validazione svuota la radice. Con il riuso delle fotografie (lista libera per
+ * slot, vept_obs_reset) per slot non ci sono mai piu' di VEPT_OBS_MAX fotografie (8 MB): 8 vCPU x 4 slot = 256 MB piu'
+ * le strutture. 320 MB: il tetto e' una sicura, non un limite di lavoro. Prima 128 MB, raggiunto per accumulo il 16/11
+ * (le fotografie restavano attaccate alle posizioni della tabella hash fino a 4096 per slot).
+ */
+static int vept_diag_maxmb = 320;
 SYSCTL_INT(_hw_vmm_vmx, OID_AUTO, vept_diag_maxmb, CTLFLAG_RWTUN,
-    &vept_diag_maxmb, 0, "nested: tetto della memoria della diagnostica EPT12 (MB)");
+    &vept_diag_maxmb, 0, "nested: tetto della memoria di lavoro di B1 e della diagnostica EPT12 (MB)");
 static u_long vept_diag_mem, vept_diag_mem_high;
 SYSCTL_ULONG(_hw_vmm_vmx, OID_AUTO, vept_diag_mem, CTLFLAG_RD,
     &vept_diag_mem, 0, "nested: memoria della diagnostica EPT12 (byte)");
@@ -447,6 +460,10 @@ struct vept_pk {
 };
 
 struct vept_obs {
+	/* diagnosi 063 par. 2.2: fotografie libere dello slot (il primo uint64_t di ogni pagina punta alla successiva) */
+	uint64_t	*libera;
+	int		nlibere;
+	bool		nomem;		/* una fotografia non si e' potuta allocare (tetto) */
 	struct vept_obs_ent ent[VEPT_OBS_HASH];
 	int		n;		/* tabelle tracciate */
 	uint64_t	walk_mismatch;	/* voce usata != fotografia */
@@ -492,11 +509,24 @@ vept_obs_reset(struct vept_obs *o)
 	for (i = 0; i < VEPT_OBS_HASH; i++) {
 		o->ent[i].gpa = 0;
 		o->ent[i].ambiguous = false;
+		/*
+		 * Diagnosi 063 par. 2.1: la fotografia restava attaccata alla posizione, e con tabelle EPT12 a GPA
+		 * diverse (Hyper-V spezza e ricompone le pagine da 2 MB) le posizioni con una fotografia crescevano fino a
+		 * tutte e 4096. Ora passa alla lista libera dello slot: per slot mai piu' di VEPT_OBS_MAX fotografie.
+		 */
+		if (o->ent[i].snap != NULL) {
+			*(uint64_t **)o->ent[i].snap = o->libera;
+			o->libera = o->ent[i].snap;
+			o->ent[i].snap = NULL;
+			o->nlibere++;
+			atomic_add_long(&vept_snap_libere, 1);
+		}
 	}
 	o->epoch++;		/* C2.1: l'insieme cumulativo resta */
 	o->n = 0;
 	o->walk_mismatch = 0;
 	o->overflow = false;
+	o->nomem = false;
 }
 
 /* C2.1: lo slot passa a un altro EPTP12: l'insieme cumulativo riparte. */
@@ -516,8 +546,19 @@ vept_obs_free(struct vept_obs *o)
 
 	if (o == NULL)
 		return;
-	for (i = 0; i < VEPT_OBS_HASH; i++)
+	for (i = 0; i < VEPT_OBS_HASH; i++) {
+		if (o->ent[i].snap != NULL)
+			atomic_subtract_long(&vept_snap_allocate, 1);
 		vept_diag_free(o->ent[i].snap, PAGE_SIZE);
+	}
+	while (o->libera != NULL) {		/* diagnosi 063: la lista libera */
+		uint64_t *pl = o->libera;
+
+		o->libera = *(uint64_t **)pl;
+		atomic_subtract_long(&vept_snap_libere, 1);
+		atomic_subtract_long(&vept_snap_allocate, 1);
+		vept_diag_free(pl, PAGE_SIZE);
+	}
 	vept_diag_free(o->rng, VEPT_RNG_MAX * sizeof(struct vept_rng));
 	vept_diag_free(o->chg, VEPT_RNG_MAX * sizeof(struct vept_chg));
 	vept_diag_free(o->dist, VEPT_DIST_HASH * sizeof(struct vept_dent));
@@ -634,9 +675,19 @@ vept_obs_note(struct vept_obs *o, uint64_t gpa, int level, const uint64_t *page,
 		o->overflow = true;
 		return;
 	}
-	if (e->snap == NULL && (e->snap = vept_diag_alloc(PAGE_SIZE)) == NULL) {
-		o->overflow = true;		/* tetto di memoria: incompleta */
-		return;
+	if (e->snap == NULL && o->libera != NULL) {	/* diagnosi 063: prima la lista libera */
+		e->snap = o->libera;
+		o->libera = *(uint64_t **)e->snap;
+		o->nlibere--;
+		atomic_subtract_long(&vept_snap_libere, 1);
+	}
+	if (e->snap == NULL) {
+		if ((e->snap = vept_diag_alloc(PAGE_SIZE)) == NULL) {
+			o->overflow = true;	/* tetto di memoria: incompleta */
+			o->nomem = true;	/* diagnosi 063 par. 2.3: contata a parte */
+			return;
+		}
+		atomic_add_long(&vept_snap_allocate, 1);
 	}
 	memcpy(e->snap, page, PAGE_SIZE);
 	/* B1: la voce che il walk usa e' quella letta UNA volta dal walk;
@@ -1360,7 +1411,9 @@ vept_keep_invept(struct vmx_vcpu *vcpu, int i, int rientro)
 		fb |= VEPT_FB_NOMEM;
 	else {
 		ntr = o->n;
-		if (o->overflow)
+		if (o->nomem)			/* diagnosi 063: tetto, non troppe tabelle */
+			fb |= VEPT_FB_NOMEM;
+		else if (o->overflow)
 			fb |= VEPT_FB_OVERFL;
 		if (o->rng == NULL)
 			o->rng = vept_diag_alloc(VEPT_RNG_MAX *
@@ -1609,6 +1662,15 @@ full:
 	    (fb & VEPT_FB_NOKEEP) ? &vept_leaves_zapped_backing :
 	    (fb & VEPT_FB_FORCE) ? &vept_leaves_zapped_force :
 	    &vept_leaves_zapped_other, live);
+	/* diagnosi 063 par. 2.3: la voce «capacity» divisa nelle sue tre cause */
+	if ((fb & (VEPT_FB_RACE | VEPT_FB_AMBIG)) == 0) {
+		if (fb & VEPT_FB_NOMEM)
+			atomic_add_long(&vept_leaves_zapped_nomem, live);
+		else if (fb & VEPT_FB_OVERFL)
+			atomic_add_long(&vept_leaves_zapped_overflow, live);
+		else if (fb & VEPT_FB_NRNG)
+			atomic_add_long(&vept_leaves_zapped_nrng, live);
+	}
 	SDT_PROBE6(vmm, vmx, nested, veptkeep, vcpu->vcpuid, s->eptp12, live,
 	    live, (uint64_t)nr | (uint64_t)nc << 32, VEPT_KEEP_A5(fb, ntr, t0));
 	tp = sbinuptime();
